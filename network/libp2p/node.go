@@ -43,12 +43,12 @@ const (
 
 // Node represents a libp2p node for OpenHashDB
 type Node struct {
-	host     host.Host
-	ctx      context.Context
-	cancel   context.CancelFunc
-	mdns     mdns.Service
-	dht      *dht.IpfsDHT
-	storage  *storage.Storage
+	host    host.Host
+	ctx     context.Context
+	cancel  context.CancelFunc
+	mdns    mdns.Service
+	dht     *dht.IpfsDHT
+	storage *storage.Storage
 
 	// Callbacks for handling different types of messages
 	ContentHandler        func(peer.ID, []byte) error
@@ -477,10 +477,7 @@ func (n *Node) GetNetworkStats() map[string]interface{} {
 
 // Default bootnodes for initial network connectivity
 var DefaultBootnodes = []string{
-	// Add hardcoded bootnode addresses here
-	// These should be stable, publicly accessible nodes
-	// Example: "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
-	// For now, we'll use empty list - in production, add real bootnode addresses
+	"/ip4/148.251.35.204/tcp/39081/p2p/QmPoaHtwYdii61T8UGXDM8RQFaivNPVLYHE5iJAj6GYL9s",
 }
 
 // connectToBootnodes connects to the provided bootnodes or default ones
