@@ -348,13 +348,14 @@ func (n *Node) handleContentStream(stream network.Stream) {
 		return
 	}
 
-	data, err := n.storage.GetData(hash)
+	dataStream, err := n.storage.GetDataStream(hash)
 	if err != nil {
 		log.Printf("Failed to get data for %s: %v", contentHashStr, err)
 		networkErrorsTotal.WithLabelValues("get_data").Inc()
 		stream.Reset()
 		return
 	}
+	defer dataStream.Close()
 
 	metaBytes, err := json.Marshal(metadata)
 	if err != nil {
@@ -377,7 +378,9 @@ func (n *Node) handleContentStream(stream network.Stream) {
 		return
 	}
 
-	if _, err := stream.Write(data); err != nil {
+	// Use io.Copy to stream the file data
+	stream.SetWriteDeadline(time.Time{}) // No deadline for content transfer
+	if _, err := io.Copy(stream, dataStream); err != nil {
 		log.Printf("Failed to write content: %v", err)
 		networkErrorsTotal.WithLabelValues("write_content").Inc()
 	} else {

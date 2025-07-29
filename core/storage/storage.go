@@ -230,10 +230,10 @@ func (s *Storage) GetChunk(hash hasher.Hash) (*ChunkMetadata, error) {
 	return &metadata, nil
 }
 
-// StoreData stores raw data (assumed immutable, no integrity check)
+// StoreData stores raw data to the filesystem
 func (s *Storage) StoreData(hash hasher.Hash, data []byte) error {
-	key := dataPrefix + hash.String()
-	if err := s.db.Put([]byte(key), data, &opt.WriteOptions{Sync: true}); err != nil {
+	filePath := filepath.Join(s.dataPath, hash.String())
+	if err := os.WriteFile(filePath, data, 0644); err != nil {
 		storageOperationsTotal.WithLabelValues("store_data", "error").Inc()
 		return fmt.Errorf("failed to store data for %s: %w", hash.String(), err)
 	}
@@ -247,12 +247,12 @@ func (s *Storage) StoreData(hash hasher.Hash, data []byte) error {
 	return nil
 }
 
-// GetData retrieves raw data
+// GetData retrieves raw data from the filesystem
 func (s *Storage) GetData(hash hasher.Hash) ([]byte, error) {
-	key := dataPrefix + hash.String()
-	data, err := s.db.Get([]byte(key), nil)
+	filePath := filepath.Join(s.dataPath, hash.String())
+	data, err := os.ReadFile(filePath)
 	if err != nil {
-		if err == leveldb.ErrNotFound {
+		if os.IsNotExist(err) {
 			storageOperationsTotal.WithLabelValues("get_data", "not_found").Inc()
 			return nil, fmt.Errorf("data not found: %s", hash.String())
 		}
@@ -262,6 +262,22 @@ func (s *Storage) GetData(hash hasher.Hash) ([]byte, error) {
 
 	storageOperationsTotal.WithLabelValues("get_data", "success").Inc()
 	return data, nil
+}
+
+// GetDataStream returns a reader for the raw data from the filesystem
+func (s *Storage) GetDataStream(hash hasher.Hash) (*os.File, error) {
+	filePath := filepath.Join(s.dataPath, hash.String())
+	file, err := os.Open(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			storageOperationsTotal.WithLabelValues("get_data_stream", "not_found").Inc()
+			return nil, fmt.Errorf("data not found: %s", hash.String())
+		}
+		storageOperationsTotal.WithLabelValues("get_data_stream", "error").Inc()
+		return nil, fmt.Errorf("failed to open data stream for %s: %w", hash.String(), err)
+	}
+	storageOperationsTotal.WithLabelValues("get_data_stream", "success").Inc()
+	return file, nil
 }
 
 // HasContent checks if content exists
@@ -288,10 +304,10 @@ func (s *Storage) HasChunk(hash hasher.Hash) bool {
 	return false
 }
 
-// HasData checks if data exists
+// HasData checks if data exists on the filesystem
 func (s *Storage) HasData(hash hasher.Hash) bool {
-	key := dataPrefix + hash.String()
-	_, err := s.db.Get([]byte(key), nil)
+	filePath := filepath.Join(s.dataPath, hash.String())
+	_, err := os.Stat(filePath)
 	if err == nil {
 		storageOperationsTotal.WithLabelValues("has_data", "success").Inc()
 		return true
@@ -447,12 +463,13 @@ func (s *Storage) GarbageCollect() error {
 
 		if metadata.RefCount == 0 {
 			contentKey := contentPrefix + hash.String()
-			dataKey := dataPrefix + hash.String()
 			if err := s.db.Delete([]byte(contentKey), nil); err != nil {
 				log.Printf("Failed to delete content metadata %s: %v", hash.String(), err)
 			}
-			if err := s.db.Delete([]byte(dataKey), nil); err != nil {
-				log.Printf("Failed to delete content data %s: %v", hash.String(), err)
+			// Also delete the data from the filesystem
+			filePath := filepath.Join(s.dataPath, hash.String())
+			if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
+				log.Printf("Failed to delete content data file %s: %v", filePath, err)
 			}
 			storageOperationsTotal.WithLabelValues("garbage_collect_content", "success").Inc()
 		}
@@ -473,12 +490,13 @@ func (s *Storage) GarbageCollect() error {
 
 		if metadata.RefCount == 0 {
 			chunkKey := chunkPrefix + hash.String()
-			dataKey := dataPrefix + hash.String()
 			if err := s.db.Delete([]byte(chunkKey), nil); err != nil {
 				log.Printf("Failed to delete chunk metadata %s: %v", hash.String(), err)
 			}
-			if err := s.db.Delete([]byte(dataKey), nil); err != nil {
-				log.Printf("Failed to delete chunk data %s: %v", hash.String(), err)
+			// Also delete the data from the filesystem
+			filePath := filepath.Join(s.dataPath, hash.String())
+			if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
+				log.Printf("Failed to delete chunk data file %s: %v", filePath, err)
 			}
 			storageOperationsTotal.WithLabelValues("garbage_collect_chunk", "success").Inc()
 		}

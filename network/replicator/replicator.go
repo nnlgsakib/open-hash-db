@@ -315,10 +315,10 @@ func (r *Replicator) handleGossipMessage(peerID peer.ID, data []byte) error {
 
 // handleContentAnnouncement handles content announcements
 func (r *Replicator) handleContentAnnouncement(peerID peer.ID, announcement *ContentAnnouncement) error {
-	log.Printf("Received content announcement from %s: %s", peerID.String(), announcement.Hash.String())
+	// log.Printf("Received content announcement from %s: %s", peerID.String(), announcement.Hash.String())
 
 	if r.storage.HasContent(announcement.Hash) {
-		log.Printf("Content %s already exists locally, skipping replication and announcement", announcement.Hash.String())
+		// log.Printf("Content %s already exists locally, skipping replication and announcement", announcement.Hash.String())
 		return nil
 	}
 
