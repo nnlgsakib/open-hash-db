@@ -110,10 +110,6 @@ func loadOrCreateIdentity(keyPath string) (crypto.PrivKey, error) {
 }
 
 // NewNode creates a new libp2p node
-func NewNode(ctx context.Context, bootnodes []string) (*Node, error) {
-	return NewNodeWithKeyPath(ctx, bootnodes, "")
-}
-
 // NewNodeWithKeyPath creates a new libp2p node with a specific key path
 func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string) (*Node, error) {
 	var privKey crypto.PrivKey

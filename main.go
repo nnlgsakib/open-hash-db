@@ -26,6 +26,7 @@ import (
 var (
 	// Global flags
 	dbPath     string
+	keyPath    string // New flag for key path
 	apiPort    int
 	p2pPort    int
 	verbose    bool
@@ -238,6 +239,7 @@ var daemonCmd = &cobra.Command{
 func init() {
 	// Global flags
 	rootCmd.PersistentFlags().StringVar(&dbPath, "db", "./openhash.db", "Database path")
+	rootCmd.PersistentFlags().StringVar(&keyPath, "key-path", "", "Path to the node's private key file (defaults to <db-path>/peer.key)")
 	rootCmd.PersistentFlags().IntVar(&apiPort, "api-port", 8080, "REST API port")
 	rootCmd.PersistentFlags().IntVar(&p2pPort, "p2p-port", 0, "P2P port (0 for random)")
 	rootCmd.PersistentFlags().BoolVar(&verbose, "verbose", false, "Verbose output")
@@ -278,7 +280,7 @@ func initAll() error {
 	if err := initStorage(); err != nil {
 		return err
 	}
-	
+
 	// Parse bootnode addresses
 	var bootnodeAddrs []string
 	if bootnodes != "" {
@@ -287,11 +289,17 @@ func initAll() error {
 			bootnodeAddrs[i] = strings.TrimSpace(addr)
 		}
 	}
-	
+
+	// Determine key path
+	actualKeyPath := keyPath
+	if actualKeyPath == "" {
+		actualKeyPath = filepath.Join(dbPath, "peer.key")
+	}
+
 	// Initialize libp2p node
 	ctx := context.Background()
 	var err error
-	node, err = libp2p.NewNode(ctx, bootnodeAddrs)
+	node, err = libp2p.NewNodeWithKeyPath(ctx, bootnodeAddrs, actualKeyPath)
 	if err != nil {
 		return fmt.Errorf("failed to initialize libp2p node: %w", err)
 	}
