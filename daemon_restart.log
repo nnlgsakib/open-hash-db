@@ -1,0 +1,15 @@
+nohup: ignoring input
+2025/07/28 13:37:11 Loaded existing identity from openhash_identity.key
+2025/07/28 13:37:11 Node started with ID: QmWBPkgSpBHS43fLem98ZPqgPr4CtjjUUaYR6MFsz5dvSL
+2025/07/28 13:37:11 Listening on addresses:
+2025/07/28 13:37:11   /ip4/127.0.0.1/tcp/36693/p2p/QmWBPkgSpBHS43fLem98ZPqgPr4CtjjUUaYR6MFsz5dvSL
+2025/07/28 13:37:11   /ip4/169.254.0.21/tcp/36693/p2p/QmWBPkgSpBHS43fLem98ZPqgPr4CtjjUUaYR6MFsz5dvSL
+2025/07/28 13:37:11 Bootstrapping DHT...
+2025/07/28 13:37:11 No bootnodes specified and no default bootnodes available
+OpenHashDB daemon started
+Node ID: QmWBPkgSpBHS43fLem98ZPqgPr4CtjjUUaYR6MFsz5dvSL
+Addresses:
+  /ip4/127.0.0.1/tcp/36693/p2p/QmWBPkgSpBHS43fLem98ZPqgPr4CtjjUUaYR6MFsz5dvSL
+  /ip4/169.254.0.21/tcp/36693/p2p/QmWBPkgSpBHS43fLem98ZPqgPr4CtjjUUaYR6MFsz5dvSL
+REST API available at: http://0.0.0.0:8080
+2025/07/28 13:37:11 Starting REST API server on 0.0.0.0:8080

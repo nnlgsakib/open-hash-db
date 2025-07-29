@@ -1,0 +1,13 @@
+2025/07/28 12:58:37 Node started with ID: 12D3KooWGFJrEGfC3XmNjWPF3saT1raqEzHGNDq14vwQ3eSuyyYr
+2025/07/28 12:58:37 Listening on addresses:
+2025/07/28 12:58:37   /ip4/127.0.0.1/tcp/46783/p2p/12D3KooWGFJrEGfC3XmNjWPF3saT1raqEzHGNDq14vwQ3eSuyyYr
+2025/07/28 12:58:37   /ip4/169.254.0.21/tcp/46783/p2p/12D3KooWGFJrEGfC3XmNjWPF3saT1raqEzHGNDq14vwQ3eSuyyYr
+2025/07/28 12:58:37 Bootstrapping DHT...
+2025/07/28 12:58:37 No bootnodes specified and no default bootnodes available
+OpenHashDB daemon started
+Node ID: 12D3KooWGFJrEGfC3XmNjWPF3saT1raqEzHGNDq14vwQ3eSuyyYr
+Addresses:
+  /ip4/127.0.0.1/tcp/46783/p2p/12D3KooWGFJrEGfC3XmNjWPF3saT1raqEzHGNDq14vwQ3eSuyyYr
+  /ip4/169.254.0.21/tcp/46783/p2p/12D3KooWGFJrEGfC3XmNjWPF3saT1raqEzHGNDq14vwQ3eSuyyYr
+REST API available at: http://0.0.0.0:8080
+2025/07/28 12:58:37 Starting REST API server on 0.0.0.0:8080
