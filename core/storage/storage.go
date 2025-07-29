@@ -82,6 +82,12 @@ const (
 
 // StoreContent stores content metadata
 func (s *Storage) StoreContent(metadata *ContentMetadata) error {
+	// Check for duplicates based on ContentHash
+	if s.HasContentByHash(metadata.ContentHash) {
+		log.Printf("Content with hash %s already exists, skipping store.", metadata.ContentHash.String())
+		return nil // Or return a specific error/status
+	}
+
 	key := contentPrefix + metadata.Hash.String()
 
 	data, err := json.Marshal(metadata)
@@ -90,6 +96,23 @@ func (s *Storage) StoreContent(metadata *ContentMetadata) error {
 	}
 
 	return s.db.Put([]byte(key), data, nil)
+}
+
+// HasContentByHash checks if content with a specific content hash already exists.
+func (s *Storage) HasContentByHash(contentHash hasher.Hash) bool {
+	iter := s.db.NewIterator(nil, nil)
+	defer iter.Release()
+
+	prefix := []byte(contentPrefix)
+	for iter.Seek(prefix); iter.Valid() && len(iter.Key()) > len(prefix); iter.Next() {
+		var metadata ContentMetadata
+		if err := json.Unmarshal(iter.Value(), &metadata); err == nil {
+			if metadata.ContentHash == contentHash {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // GetContent retrieves content metadata

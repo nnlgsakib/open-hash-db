@@ -342,6 +342,13 @@ func (n *Node) handleContentStream(stream network.Stream) {
 		return
 	}
 
+	// Check if we have the content before proceeding
+	if !n.storage.HasContent(hash) {
+		log.Printf("Content %s not found in local storage, cannot serve request", contentHashStr)
+		stream.Reset() // Signal that we can't fulfill the request
+		return
+	}
+
 	// Get metadata from storage
 	metadata, err := n.storage.GetContent(hash)
 	if err != nil {
@@ -534,28 +541,34 @@ func (n *Node) bootstrapDHT() error {
 }
 
 // AnnounceContent announces that this node provides the given content hash
-func (n *Node) AnnounceContent(contentHash string) error {
+func (n *Node) AnnounceContent(contentHashStr string) error {
 	if n.dht == nil {
 		return fmt.Errorf("DHT not initialized")
+	}
+
+	// Convert string hash to hasher.Hash
+	hash, err := hasher.HashFromString(contentHashStr)
+	if err != nil {
+		return fmt.Errorf("invalid content hash: %w", err)
+	}
+
+	// Check if content already exists in local storage
+	if n.storage != nil && n.storage.HasContent(hash) {
+		log.Printf("Content %s already exists locally, skipping announcement", contentHashStr)
+		return nil
 	}
 
 	ctx, cancel := context.WithTimeout(n.ctx, 30*time.Second)
 	defer cancel()
 
-	// Create CID from content hash
-	hash, err := multihash.FromHexString("1220" + contentHash) // SHA256 prefix + hex hash
+	// Create CID from content hash for DHT
+	mh, err := multihash.Sum([]byte(contentHashStr), multihash.SHA2_256, -1)
 	if err != nil {
-		// Try direct conversion from string
-		mh, err := multihash.Sum([]byte(contentHash), multihash.SHA2_256, -1)
-		if err != nil {
-			return fmt.Errorf("failed to create multihash: %w", err)
-		}
-		hash = mh
+		return fmt.Errorf("failed to create multihash: %w", err)
 	}
+	contentCID := cid.NewCidV1(cid.Raw, mh)
 
-	contentCID := cid.NewCidV1(cid.Raw, hash)
-
-	log.Printf("Announcing content provider for hash: %s", contentHash)
+	log.Printf("Announcing content provider for hash: %s", contentHashStr)
 	return n.dht.Provide(ctx, contentCID, true)
 }
 
@@ -655,6 +668,15 @@ func (n *Node) RequestContentFromPeer(peerID peer.ID, contentHash string) ([]byt
 	receivedContentHash := hasher.HashBytes(data)
 	if !bytes.Equal(receivedContentHash[:], metadata.ContentHash[:]) {
 		return nil, nil, fmt.Errorf("content hash mismatch: expected %s, got %s", metadata.ContentHash.String(), receivedContentHash.String())
+	}
+
+	// Check if data already exists before storing
+	if n.storage != nil && n.storage.HasData(metadata.ContentHash) {
+		log.Printf("Data for content hash %s already exists, skipping storage", metadata.ContentHash.String())
+	} else if n.storage != nil {
+		if err := n.storage.StoreData(metadata.Hash, data); err != nil {
+			log.Printf("Failed to store received data: %v", err)
+		}
 	}
 
 	return data, &metadata, nil
