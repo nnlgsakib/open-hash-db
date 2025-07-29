@@ -104,19 +104,50 @@ func (r *Replicator) Close() error {
 
 // AnnounceContent announces new content to the network
 func (r *Replicator) AnnounceContent(hash hasher.Hash, size int64) error {
+	// Announce to the DHT that we are a provider for this content
+	if err := r.node.AnnounceContent(hash.String()); err != nil {
+		log.Printf("Warning: failed to announce content to DHT: %v", err)
+	}
+
+	// Also send a gossip message for faster propagation to connected peers
 	announcement := ContentAnnouncement{
 		Hash:      hash,
 		Size:      size,
 		Timestamp: time.Now(),
 		PeerID:    r.node.ID().String(),
 	}
-	
+
 	data, err := json.Marshal(announcement)
 	if err != nil {
 		return fmt.Errorf("failed to marshal announcement: %w", err)
 	}
-	
+
 	return r.node.BroadcastGossip(r.ctx, data)
+}
+
+// ReannounceAll tells the network about all content stored locally.
+func (r *Replicator) ReannounceAll() {
+	log.Println("Re-announcing all local content to the network...")
+	hashes, err := r.storage.ListContent()
+	if err != nil {
+		log.Printf("Error listing content for re-announcement: %v", err)
+		return
+	}
+
+	for _, hash := range hashes {
+		// This can be slow if there are many hashes, so run in background
+		go func(h hasher.Hash) {
+			metadata, err := r.storage.GetContent(h)
+			if err != nil {
+				log.Printf("Could not get metadata for content %s: %v", h.String(), err)
+				return
+			}
+			if err := r.AnnounceContent(h, metadata.Size); err != nil {
+				log.Printf("Failed to re-announce content %s: %v", h.String(), err)
+			}
+		}(hash)
+	}
+	log.Printf("Finished re-announcing %d content hashes.", len(hashes))
 }
 
 // RequestChunk requests a chunk from the network

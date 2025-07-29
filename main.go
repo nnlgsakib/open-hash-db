@@ -295,6 +295,8 @@ func initAll() error {
 	if err != nil {
 		return fmt.Errorf("failed to initialize libp2p node: %w", err)
 	}
+	// Set storage for the node to handle content requests
+	node.SetStorage(store)
 	
 	// Initialize replicator
 	repl = replicator.NewReplicator(store, node, replicator.DefaultReplicationFactor)
@@ -435,7 +437,7 @@ func getContent(hash hasher.Hash) error {
 			return displayContent(metadata, data, hash)
 		}
 	}
-	
+
 	// Content not found locally, try DHT lookup if node is available
 	if node != nil {
 		log.Printf("Content not found locally, searching DHT...")
@@ -443,52 +445,39 @@ func getContent(hash hasher.Hash) error {
 		if err != nil {
 			return fmt.Errorf("failed to find content providers: %w", err)
 		}
-		
+
 		if len(providers) == 0 {
 			return fmt.Errorf("content not found: no providers available for hash %s", hash.String())
 		}
-		
+
 		// Try to retrieve content from providers
 		for _, provider := range providers {
+			if provider.ID == node.ID() {
+				continue // Skip self
+			}
 			log.Printf("Attempting to retrieve content from provider: %s", provider.ID.String())
-			data, err := node.RequestContentFromPeer(provider.ID, hash.String())
+			data, retrievedMetadata, err := node.RequestContentFromPeer(provider.ID, hash.String())
 			if err != nil {
 				log.Printf("Failed to retrieve from provider %s: %v", provider.ID.String(), err)
 				continue
 			}
-			
-				// Verify hash
-				if retrievedHash := hasher.HashBytes(data); retrievedHash != hash {
-					log.Printf("Hash mismatch from provider %s", provider.ID.String())
-					continue
-				}
-			
+
 			// Store locally for future use
-			metadata = &storage.ContentMetadata{
-				Hash:        hash,
-				Filename:    fmt.Sprintf("retrieved_%s", hash.String()[:8]),
-				MimeType:    "application/octet-stream",
-				Size:        int64(len(data)),
-				ModTime:     time.Now(),
-				IsDirectory: false,
-				CreatedAt:   time.Now(),
-				RefCount:    1,
-			}
-			
-			if err := store.StoreContent(metadata); err != nil {
+			if err := store.StoreContent(retrievedMetadata); err != nil {
 				log.Printf("Warning: failed to store retrieved metadata: %v", err)
 			}
-			
+
 			if err := store.StoreData(hash, data); err != nil {
 				log.Printf("Warning: failed to store retrieved data: %v", err)
 			}
-			
-			return displayContent(metadata, data, hash)
+
+			log.Printf("Successfully retrieved and stored content from %s", provider.ID.String())
+			return displayContent(retrievedMetadata, data, hash)
 		}
-		
+
 		return fmt.Errorf("failed to retrieve content from any provider")
 	}
-	
+
 	return fmt.Errorf("content not found: %w", err)
 }
 
