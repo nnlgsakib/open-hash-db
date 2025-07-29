@@ -379,12 +379,21 @@ func (n *Node) handleContentStream(stream network.Stream) {
 	}
 
 	// Use io.Copy to stream the file data
-	stream.SetWriteDeadline(time.Time{}) // No deadline for content transfer
-	if _, err := io.Copy(stream, dataStream); err != nil {
+	stream.SetWriteDeadline(time.Now().Add(5 * time.Minute)) // 5 minute deadline for content transfer
+	bytesSent, err := io.Copy(stream, dataStream)
+	if err != nil {
 		log.Printf("Failed to write content: %v", err)
 		networkErrorsTotal.WithLabelValues("write_content").Inc()
-	} else {
-		log.Printf("Sent content %s to %s", contentHashStr, stream.Conn().RemotePeer().String())
+		stream.Reset()
+		return
+	}
+	log.Printf("Sent %d bytes of content %s to %s", bytesSent, contentHashStr, stream.Conn().RemotePeer().String())
+
+	// Gracefully close the write side of the stream to signal end of transmission
+	if err := stream.CloseWrite(); err != nil {
+		log.Printf("Failed to close write stream gracefully: %v", err)
+		stream.Reset()
+		return
 	}
 }
 
