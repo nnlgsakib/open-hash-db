@@ -1,29 +1,38 @@
 package storage
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
-	"openhashdb/core/hasher"
+	"os"
 	"path/filepath"
 	"time"
 
+	"openhashdb/core/hasher"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/opt"
 )
 
-// ContentMetadata represents metadata for stored content
-// type ContentMetadata struct {
-// 	Hash        hasher.Hash `json:"hash"`
-// 	Filename    string      `json:"filename"`
-// 	MimeType    string      `json:"mime_type"`
-// 	Size        int64       `json:"size"`
-// 	ModTime     time.Time   `json:"mod_time"`
-// 	ChunkCount  int         `json:"chunk_count,omitempty"`
-// 	IsDirectory bool        `json:"is_directory"`
-// 	CreatedAt   time.Time   `json:"created_at"`
-// 	RefCount    int         `json:"ref_count"`
-// }
+// Metrics for storage operations
+var (
+	storageOperationsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "openhashdb_storage_operations_total",
+			Help: "Total number of storage operations",
+		},
+		[]string{"operation", "status"},
+	)
+	storageSpaceAvailable = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "openhashdb_storage_space_available_bytes",
+			Help: "Available storage space in bytes",
+		},
+	)
+)
 
 // ContentMetadata represents metadata for stored content
 type ContentMetadata struct {
@@ -56,21 +65,45 @@ type Storage struct {
 // NewStorage creates a new storage instance
 func NewStorage(dbPath string) (*Storage, error) {
 	db, err := leveldb.OpenFile(dbPath, &opt.Options{
-		WriteBuffer: 64 * 1024 * 1024, // 64MB write buffer
+		WriteBuffer:            64 * 1024 * 1024, // 64MB write buffer
+		CompactionTableSize:    8 * 1024 * 1024,  // 8MB table size for compaction
+		CompactionTotalSize:    64 * 1024 * 1024, // 64MB total size for compaction
+		OpenFilesCacheCapacity: 500,              // Cache for open files
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to open database: %w", err)
+		storageOperationsTotal.WithLabelValues("open_db", "error").Inc()
+		return nil, fmt.Errorf("failed to open database at %s: %w", dbPath, err)
 	}
 
-	return &Storage{
+	dataPath := filepath.Join(filepath.Dir(dbPath), "data")
+	if err := os.MkdirAll(dataPath, 0755); err != nil {
+		storageOperationsTotal.WithLabelValues("mkdir", "error").Inc()
+		return nil, fmt.Errorf("failed to create data directory %s: %w", dataPath, err)
+	}
+
+	s := &Storage{
 		db:       db,
-		dataPath: filepath.Join(filepath.Dir(dbPath), "data"),
-	}, nil
+		dataPath: dataPath,
+	}
+
+	// Update available space metric
+	if space, err := s.GetAvailableSpace(); err == nil {
+		storageSpaceAvailable.Set(float64(space))
+	}
+
+	storageOperationsTotal.WithLabelValues("open_db", "success").Inc()
+	return s, nil
 }
 
 // Close closes the storage
 func (s *Storage) Close() error {
-	return s.db.Close()
+	err := s.db.Close()
+	if err != nil {
+		storageOperationsTotal.WithLabelValues("close_db", "error").Inc()
+		return fmt.Errorf("failed to close database: %w", err)
+	}
+	storageOperationsTotal.WithLabelValues("close_db", "success").Inc()
+	return nil
 }
 
 // Key prefixes for different data types
@@ -82,35 +115,48 @@ const (
 
 // StoreContent stores content metadata
 func (s *Storage) StoreContent(metadata *ContentMetadata) error {
-	// Check for duplicates based on ContentHash
-	if s.HasContentByHash(metadata.ContentHash) {
-		log.Printf("Content with hash %s already exists, skipping store.", metadata.ContentHash.String())
-		return nil // Or return a specific error/status
+	if metadata == nil {
+		storageOperationsTotal.WithLabelValues("store_content", "error").Inc()
+		return fmt.Errorf("nil metadata provided")
 	}
 
+	// Always store metadata for the new random hash
 	key := contentPrefix + metadata.Hash.String()
-
 	data, err := json.Marshal(metadata)
 	if err != nil {
-		return fmt.Errorf("failed to marshal metadata: %w", err)
+		storageOperationsTotal.WithLabelValues("store_content", "error").Inc()
+		return fmt.Errorf("failed to marshal metadata for %s: %w", metadata.Hash.String(), err)
 	}
 
-	return s.db.Put([]byte(key), data, nil)
+	if err := s.db.Put([]byte(key), data, &opt.WriteOptions{Sync: true}); err != nil {
+		storageOperationsTotal.WithLabelValues("store_content", "error").Inc()
+		return fmt.Errorf("failed to store content metadata for %s: %w", metadata.Hash.String(), err)
+	}
+
+	log.Printf("Stored content metadata for random hash %s with content hash %s", metadata.Hash.String(), metadata.ContentHash.String())
+	storageOperationsTotal.WithLabelValues("store_content", "success").Inc()
+	return nil
 }
 
-// HasContentByHash checks if content with a specific content hash already exists.
+// HasContentByHash checks if content with a specific content hash exists
 func (s *Storage) HasContentByHash(contentHash hasher.Hash) bool {
 	iter := s.db.NewIterator(nil, nil)
 	defer iter.Release()
 
 	prefix := []byte(contentPrefix)
-	for iter.Seek(prefix); iter.Valid() && len(iter.Key()) > len(prefix); iter.Next() {
+	for iter.Seek(prefix); iter.Valid() && bytes.HasPrefix(iter.Key(), prefix); iter.Next() {
 		var metadata ContentMetadata
 		if err := json.Unmarshal(iter.Value(), &metadata); err == nil {
 			if metadata.ContentHash == contentHash {
+				storageOperationsTotal.WithLabelValues("has_content_by_hash", "success").Inc()
 				return true
 			}
 		}
+	}
+
+	if err := iter.Error(); err != nil {
+		log.Printf("Iterator error in HasContentByHash: %v", err)
+		storageOperationsTotal.WithLabelValues("has_content_by_hash", "error").Inc()
 	}
 	return false
 }
@@ -118,99 +164,103 @@ func (s *Storage) HasContentByHash(contentHash hasher.Hash) bool {
 // GetContent retrieves content metadata
 func (s *Storage) GetContent(hash hasher.Hash) (*ContentMetadata, error) {
 	key := contentPrefix + hash.String()
-
 	data, err := s.db.Get([]byte(key), nil)
 	if err != nil {
 		if err == leveldb.ErrNotFound {
+			storageOperationsTotal.WithLabelValues("get_content", "not_found").Inc()
 			return nil, fmt.Errorf("content not found: %s", hash.String())
 		}
-		return nil, fmt.Errorf("failed to get content: %w", err)
+		storageOperationsTotal.WithLabelValues("get_content", "error").Inc()
+		return nil, fmt.Errorf("failed to get content metadata for %s: %w", hash.String(), err)
 	}
 
 	var metadata ContentMetadata
 	if err := json.Unmarshal(data, &metadata); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal metadata: %w", err)
+		storageOperationsTotal.WithLabelValues("get_content", "error").Inc()
+		return nil, fmt.Errorf("failed to unmarshal metadata for %s: %w", hash.String(), err)
 	}
 
+	storageOperationsTotal.WithLabelValues("get_content", "success").Inc()
 	return &metadata, nil
 }
 
 // StoreChunk stores chunk metadata
 func (s *Storage) StoreChunk(metadata *ChunkMetadata) error {
-	key := chunkPrefix + metadata.Hash.String()
-
-	data, err := json.Marshal(metadata)
-	if err != nil {
-		return fmt.Errorf("failed to marshal chunk metadata: %w", err)
+	if metadata == nil {
+		storageOperationsTotal.WithLabelValues("store_chunk", "error").Inc()
+		return fmt.Errorf("nil chunk metadata provided")
 	}
 
-	return s.db.Put([]byte(key), data, nil)
+	key := chunkPrefix + metadata.Hash.String()
+	data, err := json.Marshal(metadata)
+	if err != nil {
+		storageOperationsTotal.WithLabelValues("store_chunk", "error").Inc()
+		return fmt.Errorf("failed to marshal chunk metadata for %s: %w", metadata.Hash.String(), err)
+	}
+
+	if err := s.db.Put([]byte(key), data, &opt.WriteOptions{Sync: true}); err != nil {
+		storageOperationsTotal.WithLabelValues("store_chunk", "error").Inc()
+		return fmt.Errorf("failed to store chunk metadata for %s: %w", metadata.Hash.String(), err)
+	}
+
+	storageOperationsTotal.WithLabelValues("store_chunk", "success").Inc()
+	return nil
 }
 
 // GetChunk retrieves chunk metadata
 func (s *Storage) GetChunk(hash hasher.Hash) (*ChunkMetadata, error) {
 	key := chunkPrefix + hash.String()
-
 	data, err := s.db.Get([]byte(key), nil)
 	if err != nil {
 		if err == leveldb.ErrNotFound {
+			storageOperationsTotal.WithLabelValues("get_chunk", "not_found").Inc()
 			return nil, fmt.Errorf("chunk not found: %s", hash.String())
 		}
-		return nil, fmt.Errorf("failed to get chunk: %w", err)
+		storageOperationsTotal.WithLabelValues("get_chunk", "error").Inc()
+		return nil, fmt.Errorf("failed to get chunk metadata for %s: %w", hash.String(), err)
 	}
 
 	var metadata ChunkMetadata
 	if err := json.Unmarshal(data, &metadata); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal chunk metadata: %w", err)
+		storageOperationsTotal.WithLabelValues("get_chunk", "error").Inc()
+		return nil, fmt.Errorf("failed to unmarshal chunk metadata for %s: %w", hash.String(), err)
 	}
 
+	storageOperationsTotal.WithLabelValues("get_chunk", "success").Inc()
 	return &metadata, nil
 }
 
-// StoreData stores raw data (chunk content)
+// StoreData stores raw data (assumed immutable, no integrity check)
 func (s *Storage) StoreData(hash hasher.Hash, data []byte) error {
-	// Verify content-based hash if metadata is available
-	metadata, err := s.GetContent(hash)
-	if err == nil && metadata.ContentHash != (hasher.Hash{}) {
-		// actualContentHash := hasher.HashBytes(data)
-		// log.Printf("Storing data for hash %s: expected ContentHash=%s, actual ContentHash=%s",
-		// 	hash.String(), metadata.ContentHash.String(), actualContentHash.String())
-		if !hasher.Verify(data, metadata.ContentHash) {
-			return fmt.Errorf("content integrity check failed for hash %s", hash.String())
-		}
-	} else {
-		log.Printf("No ContentHash verification for hash %s during storage", hash.String())
+	key := dataPrefix + hash.String()
+	if err := s.db.Put([]byte(key), data, &opt.WriteOptions{Sync: true}); err != nil {
+		storageOperationsTotal.WithLabelValues("store_data", "error").Inc()
+		return fmt.Errorf("failed to store data for %s: %w", hash.String(), err)
 	}
 
-	key := dataPrefix + hash.String()
-	return s.db.Put([]byte(key), data, nil)
+	// Update available space metric
+	if space, err := s.GetAvailableSpace(); err == nil {
+		storageSpaceAvailable.Set(float64(space))
+	}
+
+	storageOperationsTotal.WithLabelValues("store_data", "success").Inc()
+	return nil
 }
 
 // GetData retrieves raw data
 func (s *Storage) GetData(hash hasher.Hash) ([]byte, error) {
 	key := dataPrefix + hash.String()
-
 	data, err := s.db.Get([]byte(key), nil)
 	if err != nil {
 		if err == leveldb.ErrNotFound {
+			storageOperationsTotal.WithLabelValues("get_data", "not_found").Inc()
 			return nil, fmt.Errorf("data not found: %s", hash.String())
 		}
-		return nil, fmt.Errorf("failed to get data: %w", err)
+		storageOperationsTotal.WithLabelValues("get_data", "error").Inc()
+		return nil, fmt.Errorf("failed to get data for %s: %w", hash.String(), err)
 	}
 
-	// Verify content-based hash if metadata is available
-	metadata, err := s.GetContent(hash)
-	if err == nil && metadata.ContentHash != (hasher.Hash{}) {
-		actualContentHash := hasher.HashBytes(data)
-		log.Printf("Retrieving data for hash %s: expected ContentHash=%s, actual ContentHash=%s",
-			hash.String(), metadata.ContentHash.String(), actualContentHash.String())
-		if !hasher.Verify(data, metadata.ContentHash) {
-			return nil, fmt.Errorf("content integrity check failed for hash %s", hash.String())
-		}
-	} else {
-		log.Printf("No ContentHash verification for hash %s during retrieval", hash.String())
-	}
-
+	storageOperationsTotal.WithLabelValues("get_data", "success").Inc()
 	return data, nil
 }
 
@@ -218,171 +268,228 @@ func (s *Storage) GetData(hash hasher.Hash) ([]byte, error) {
 func (s *Storage) HasContent(hash hasher.Hash) bool {
 	key := contentPrefix + hash.String()
 	_, err := s.db.Get([]byte(key), nil)
-	return err == nil
+	if err == nil {
+		storageOperationsTotal.WithLabelValues("has_content", "success").Inc()
+		return true
+	}
+	storageOperationsTotal.WithLabelValues("has_content", "not_found").Inc()
+	return false
 }
 
 // HasChunk checks if chunk exists
 func (s *Storage) HasChunk(hash hasher.Hash) bool {
 	key := chunkPrefix + hash.String()
 	_, err := s.db.Get([]byte(key), nil)
-	return err == nil
+	if err == nil {
+		storageOperationsTotal.WithLabelValues("has_chunk", "success").Inc()
+		return true
+	}
+	storageOperationsTotal.WithLabelValues("has_chunk", "not_found").Inc()
+	return false
 }
 
 // HasData checks if data exists
 func (s *Storage) HasData(hash hasher.Hash) bool {
 	key := dataPrefix + hash.String()
 	_, err := s.db.Get([]byte(key), nil)
-	return err == nil
+	if err == nil {
+		storageOperationsTotal.WithLabelValues("has_data", "success").Inc()
+		return true
+	}
+	storageOperationsTotal.WithLabelValues("has_data", "not_found").Inc()
+	return false
 }
 
 // IncrementRefCount increments reference count for content
 func (s *Storage) IncrementRefCount(hash hasher.Hash) error {
 	metadata, err := s.GetContent(hash)
 	if err != nil {
+		storageOperationsTotal.WithLabelValues("increment_ref_count", "error").Inc()
 		return err
 	}
 
 	metadata.RefCount++
-	return s.StoreContent(metadata)
+	if err := s.StoreContent(metadata); err != nil {
+		storageOperationsTotal.WithLabelValues("increment_ref_count", "error").Inc()
+		return err
+	}
+
+	storageOperationsTotal.WithLabelValues("increment_ref_count", "success").Inc()
+	return nil
 }
 
 // DecrementRefCount decrements reference count for content
 func (s *Storage) DecrementRefCount(hash hasher.Hash) error {
 	metadata, err := s.GetContent(hash)
 	if err != nil {
+		storageOperationsTotal.WithLabelValues("decrement_ref_count", "error").Inc()
 		return err
 	}
 
 	if metadata.RefCount > 0 {
 		metadata.RefCount--
 	}
-	return s.StoreContent(metadata)
+	if err := s.StoreContent(metadata); err != nil {
+		storageOperationsTotal.WithLabelValues("decrement_ref_count", "error").Inc()
+		return err
+	}
+
+	storageOperationsTotal.WithLabelValues("decrement_ref_count", "success").Inc()
+	return nil
 }
 
 // IncrementChunkRefCount increments reference count for chunk
 func (s *Storage) IncrementChunkRefCount(hash hasher.Hash) error {
 	metadata, err := s.GetChunk(hash)
 	if err != nil {
+		storageOperationsTotal.WithLabelValues("increment_chunk_ref_count", "error").Inc()
 		return err
 	}
 
 	metadata.RefCount++
-	return s.StoreChunk(metadata)
+	if err := s.StoreChunk(metadata); err != nil {
+		storageOperationsTotal.WithLabelValues("increment_chunk_ref_count", "error").Inc()
+		return err
+	}
+
+	storageOperationsTotal.WithLabelValues("increment_chunk_ref_count", "success").Inc()
+	return nil
 }
 
 // DecrementChunkRefCount decrements reference count for chunk
 func (s *Storage) DecrementChunkRefCount(hash hasher.Hash) error {
 	metadata, err := s.GetChunk(hash)
 	if err != nil {
+		storageOperationsTotal.WithLabelValues("decrement_chunk_ref_count", "error").Inc()
 		return err
 	}
 
 	if metadata.RefCount > 0 {
 		metadata.RefCount--
 	}
-	return s.StoreChunk(metadata)
+	if err := s.StoreChunk(metadata); err != nil {
+		storageOperationsTotal.WithLabelValues("decrement_chunk_ref_count", "error").Inc()
+		return err
+	}
+
+	storageOperationsTotal.WithLabelValues("decrement_chunk_ref_count", "success").Inc()
+	return nil
 }
 
 // ListContent returns all content hashes
 func (s *Storage) ListContent() ([]hasher.Hash, error) {
 	var hashes []hasher.Hash
-
 	iter := s.db.NewIterator(nil, nil)
 	defer iter.Release()
 
 	prefix := []byte(contentPrefix)
-	for iter.Seek(prefix); iter.Valid() && len(iter.Key()) > len(prefix); iter.Next() {
+	for iter.Seek(prefix); iter.Valid() && bytes.HasPrefix(iter.Key(), prefix); iter.Next() {
 		key := string(iter.Key())
-		if len(key) <= len(contentPrefix) {
-			continue
-		}
-
 		hashStr := key[len(contentPrefix):]
 		hash, err := hasher.HashFromString(hashStr)
 		if err != nil {
-			continue // Skip invalid hashes
+			log.Printf("Invalid hash in database: %s", hashStr)
+			continue
 		}
-
 		hashes = append(hashes, hash)
 	}
 
-	return hashes, iter.Error()
+	if err := iter.Error(); err != nil {
+		storageOperationsTotal.WithLabelValues("list_content", "error").Inc()
+		return nil, fmt.Errorf("iterator error while listing content: %w", err)
+	}
+
+	storageOperationsTotal.WithLabelValues("list_content", "success").Inc()
+	return hashes, nil
 }
 
 // ListChunks returns all chunk hashes
 func (s *Storage) ListChunks() ([]hasher.Hash, error) {
 	var hashes []hasher.Hash
-
 	iter := s.db.NewIterator(nil, nil)
 	defer iter.Release()
 
 	prefix := []byte(chunkPrefix)
-	for iter.Seek(prefix); iter.Valid() && len(iter.Key()) > len(prefix); iter.Next() {
+	for iter.Seek(prefix); iter.Valid() && bytes.HasPrefix(iter.Key(), prefix); iter.Next() {
 		key := string(iter.Key())
-		if len(key) <= len(chunkPrefix) {
-			continue
-		}
-
 		hashStr := key[len(chunkPrefix):]
 		hash, err := hasher.HashFromString(hashStr)
 		if err != nil {
-			continue // Skip invalid hashes
+			log.Printf("Invalid chunk hash in database: %s", hashStr)
+			continue
 		}
-
 		hashes = append(hashes, hash)
 	}
 
-	return hashes, iter.Error()
+	if err := iter.Error(); err != nil {
+		storageOperationsTotal.WithLabelValues("list_chunks", "error").Inc()
+		return nil, fmt.Errorf("iterator error while listing chunks: %w", err)
+	}
+
+	storageOperationsTotal.WithLabelValues("list_chunks", "success").Inc()
+	return hashes, nil
 }
 
 // GarbageCollect removes content and chunks with zero reference count
 func (s *Storage) GarbageCollect() error {
-	// Collect content with zero ref count
 	contentHashes, err := s.ListContent()
 	if err != nil {
+		storageOperationsTotal.WithLabelValues("garbage_collect", "error").Inc()
 		return fmt.Errorf("failed to list content: %w", err)
 	}
 
 	for _, hash := range contentHashes {
 		metadata, err := s.GetContent(hash)
 		if err != nil {
+			log.Printf("Failed to get content metadata for %s: %v", hash.String(), err)
 			continue
 		}
 
 		if metadata.RefCount == 0 {
-			// Delete content metadata
 			contentKey := contentPrefix + hash.String()
-			s.db.Delete([]byte(contentKey), nil)
-
-			// Delete associated data
 			dataKey := dataPrefix + hash.String()
-			s.db.Delete([]byte(dataKey), nil)
+			if err := s.db.Delete([]byte(contentKey), nil); err != nil {
+				log.Printf("Failed to delete content metadata %s: %v", hash.String(), err)
+			}
+			if err := s.db.Delete([]byte(dataKey), nil); err != nil {
+				log.Printf("Failed to delete content data %s: %v", hash.String(), err)
+			}
+			storageOperationsTotal.WithLabelValues("garbage_collect_content", "success").Inc()
 		}
 	}
 
-	// Collect chunks with zero ref count
 	chunkHashes, err := s.ListChunks()
 	if err != nil {
+		storageOperationsTotal.WithLabelValues("garbage_collect", "error").Inc()
 		return fmt.Errorf("failed to list chunks: %w", err)
 	}
 
 	for _, hash := range chunkHashes {
 		metadata, err := s.GetChunk(hash)
 		if err != nil {
+			log.Printf("Failed to get chunk metadata for %s: %v", hash.String(), err)
 			continue
 		}
 
 		if metadata.RefCount == 0 {
-			// Delete chunk metadata
 			chunkKey := chunkPrefix + hash.String()
-			s.db.Delete([]byte(chunkKey), nil)
-
-			// Delete associated data
 			dataKey := dataPrefix + hash.String()
-			s.db.Delete([]byte(dataKey), nil)
+			if err := s.db.Delete([]byte(chunkKey), nil); err != nil {
+				log.Printf("Failed to delete chunk metadata %s: %v", hash.String(), err)
+			}
+			if err := s.db.Delete([]byte(dataKey), nil); err != nil {
+				log.Printf("Failed to delete chunk data %s: %v", hash.String(), err)
+			}
+			storageOperationsTotal.WithLabelValues("garbage_collect_chunk", "success").Inc()
 		}
 	}
 
+	// Update available space metric
+	if space, err := s.GetAvailableSpace(); err == nil {
+		storageSpaceAvailable.Set(float64(space))
+	}
+
+	storageOperationsTotal.WithLabelValues("garbage_collect", "success").Inc()
 	return nil
 }
 
@@ -390,18 +497,28 @@ func (s *Storage) GarbageCollect() error {
 func (s *Storage) GetStats() (map[string]interface{}, error) {
 	contentHashes, err := s.ListContent()
 	if err != nil {
-		return nil, err
+		storageOperationsTotal.WithLabelValues("get_stats", "error").Inc()
+		return nil, fmt.Errorf("failed to list content: %w", err)
 	}
 
 	chunkHashes, err := s.ListChunks()
 	if err != nil {
-		return nil, err
+		storageOperationsTotal.WithLabelValues("get_stats", "error").Inc()
+		return nil, fmt.Errorf("failed to list chunks: %w", err)
+	}
+
+	availableSpace, err := s.GetAvailableSpace()
+	if err != nil {
+		storageOperationsTotal.WithLabelValues("get_stats", "error").Inc()
+		return nil, fmt.Errorf("failed to get available space: %w", err)
 	}
 
 	stats := map[string]interface{}{
-		"content_count": len(contentHashes),
-		"chunk_count":   len(chunkHashes),
+		"content_count":   len(contentHashes),
+		"chunk_count":     len(chunkHashes),
+		"available_space": availableSpace,
 	}
 
+	storageOperationsTotal.WithLabelValues("get_stats", "success").Inc()
 	return stats, nil
 }
