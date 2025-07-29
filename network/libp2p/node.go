@@ -102,15 +102,22 @@ func NewNode(ctx context.Context, bootnodes []string) (*Node, error) {
 
 // NewNodeWithKeyPath creates a new libp2p node with a specific key path
 func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string) (*Node, error) {
-	// Set default key path if not provided
-	if keyPath == "" {
-		keyPath = filepath.Join(".", "openhash_identity.key")
-	}
+	var privKey crypto.PrivKey
+	var err error
 
-	// Load or create persistent identity
-	privKey, err := loadOrCreateIdentity(keyPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load identity: %w", err)
+	if keyPath != "" {
+		// Load or create persistent identity
+		privKey, err = loadOrCreateIdentity(keyPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load identity: %w", err)
+		}
+	} else {
+		// Generate new ephemeral identity
+		log.Println("Warning: keyPath not provided, generating ephemeral identity. Node ID will change on restart.")
+		privKey, _, err = crypto.GenerateKeyPairWithReader(crypto.RSA, 2048, rand.Reader)
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate ephemeral key pair: %w", err)
+		}
 	}
 
 	// Create a new libp2p host with persistent identity

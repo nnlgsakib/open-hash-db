@@ -1,6 +1,6 @@
 =============== Jul 29, 2025 (+06) ===============
-08:06:19.102243 log@legend F·NumFile S·FileSize N·Entry C·BadEntry B·BadBlock Ke·KeyError D·DroppedEntry L·Level Q·SeqNum T·TimeElapsed
-08:06:19.103965 db@open opening
-08:06:19.104481 version@stat F·[] S·0B[] Sc·[]
-08:06:19.105795 db@janitor F·2 G·0
-08:06:19.105795 db@open done T·1.8297ms
+08:13:16.376292 log@legend F·NumFile S·FileSize N·Entry C·BadEntry B·BadBlock Ke·KeyError D·DroppedEntry L·Level Q·SeqNum T·TimeElapsed
+08:13:16.377954 db@open opening
+08:13:16.379002 version@stat F·[] S·0B[] Sc·[]
+08:13:16.380073 db@janitor F·2 G·0
+08:13:16.380073 db@open done T·2.1187ms
