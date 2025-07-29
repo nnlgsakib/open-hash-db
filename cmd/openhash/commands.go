@@ -80,7 +80,7 @@ var addCmd = &cobra.Command{
 			}
 
 			if info.IsDir() {
-				return fmt.Errorf("folder upload via API not yet implemented, use daemon mode")
+				return uploadFolderViaAPI(path)
 			}
 
 			return uploadFileViaAPI(path)
@@ -682,6 +682,78 @@ func uploadFileViaAPI(filePath string) error {
 	// Display result
 	if hash, ok := result["hash"].(string); ok {
 		fmt.Printf("✅ File uploaded: %s\n", hash)
+		if size, ok := result["size"].(float64); ok {
+			fmt.Printf("   Size: %.0f bytes\n", size)
+		}
+		if filename, ok := result["filename"].(string); ok {
+			fmt.Printf("   Name: %s\n", filename)
+		}
+	}
+
+	return nil
+}
+
+// uploadFolderViaAPI uploads a folder via REST API
+func uploadFolderViaAPI(dirPath string) error {
+	baseURL := getAPIURL()
+
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+
+	err := filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			file, err := os.Open(path)
+			if err != nil {
+				return err
+			}
+			defer file.Close()
+
+			relPath, err := filepath.Rel(dirPath, path)
+			if err != nil {
+				return err
+			}
+
+			part, err := writer.CreateFormFile("files", relPath)
+			if err != nil {
+				return err
+			}
+			_, err = io.Copy(part, file)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("failed to walk directory: %w", err)
+	}
+
+	writer.Close()
+
+	resp, err := http.Post(baseURL+"/upload/folder", writer.FormDataContentType(), &buf)
+	if err != nil {
+		return fmt.Errorf("failed to upload folder: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		if errMsg, ok := result["error"].(string); ok {
+			return fmt.Errorf("upload failed: %s", errMsg)
+		}
+		return fmt.Errorf("upload failed with status: %d", resp.StatusCode)
+	}
+
+	if hash, ok := result["hash"].(string); ok {
+		fmt.Printf("✅ Folder uploaded: %s\n", hash)
 		if size, ok := result["size"].(float64); ok {
 			fmt.Printf("   Size: %.0f bytes\n", size)
 		}

@@ -1,6 +1,8 @@
 package rest
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -183,9 +185,83 @@ func (s *Server) uploadFile(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, response)
 }
 
-// uploadFolder handles folder uploads (not fully implemented)
+// uploadFolder handles folder uploads by accepting multiple files, zipping them in-memory, and storing the zip.
 func (s *Server) uploadFolder(w http.ResponseWriter, r *http.Request) {
-	s.writeError(w, http.StatusNotImplemented, "Folder upload not yet implemented", nil)
+	if err := r.ParseMultipartForm(32 << 20); err != nil { // 32MB max memory
+		s.writeError(w, http.StatusBadRequest, "Failed to parse multipart form", err)
+		return
+	}
+
+	form := r.MultipartForm
+	files := form.File["files"]
+	if len(files) == 0 {
+		s.writeError(w, http.StatusBadRequest, "No files provided for folder upload", nil)
+		return
+	}
+
+	// Create a buffer to write our archive to.
+	buf := new(bytes.Buffer)
+	zipWriter := zip.NewWriter(buf)
+
+	// Add files to the archive.
+	for _, fileHeader := range files {
+		file, err := fileHeader.Open()
+		if err != nil {
+			s.writeError(w, http.StatusInternalServerError, "Failed to open a file for zipping", err)
+			return
+		}
+		defer file.Close()
+
+		writer, err := zipWriter.Create(fileHeader.Filename)
+		if err != nil {
+			s.writeError(w, http.StatusInternalServerError, "Failed to create zip entry", err)
+			return
+		}
+
+		if _, err := io.Copy(writer, file); err != nil {
+			s.writeError(w, http.StatusInternalServerError, "Failed to copy file content to zip", err)
+			return
+		}
+	}
+
+	// Close the zip writer to finalize the archive.
+	if err := zipWriter.Close(); err != nil {
+		s.writeError(w, http.StatusInternalServerError, "Failed to finalize zip archive", err)
+		return
+	}
+
+	// Determine the folder name from the common base path of the files.
+	folderName := "archive.zip"
+	if len(files) > 0 {
+		// A simple approach to name the zip file: use the directory of the first file.
+		// This assumes a 'directory/file.txt' structure in the form submission.
+		commonPath := filepath.Dir(files[0].Filename)
+		if commonPath != "." && commonPath != "/" {
+			folderName = commonPath + ".zip"
+		}
+	}
+
+	// Store the zipped content.
+	zipData := buf.Bytes()
+	hash, err := s.storeFile(folderName, zipData)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "Failed to store zipped folder", err)
+		return
+	}
+
+	// Announce to network.
+	if err := s.replicator.AnnounceContent(hash, int64(len(zipData))); err != nil {
+		log.Printf("Failed to announce content: %v", err)
+	}
+
+	response := UploadResponse{
+		Hash:     hash.String(),
+		Size:     int64(len(zipData)),
+		Filename: folderName,
+		Message:  "Folder uploaded and zipped successfully",
+	}
+
+	s.writeJSON(w, http.StatusOK, response)
 }
 
 // downloadContent handles content downloads, fetching from the network if not available locally.

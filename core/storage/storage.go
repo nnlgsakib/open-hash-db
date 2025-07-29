@@ -149,9 +149,9 @@ func (s *Storage) StoreData(hash hasher.Hash, data []byte) error {
 	// Verify content-based hash if metadata is available
 	metadata, err := s.GetContent(hash)
 	if err == nil && metadata.ContentHash != (hasher.Hash{}) {
-		actualContentHash := hasher.HashBytes(data)
-		log.Printf("Storing data for hash %s: expected ContentHash=%s, actual ContentHash=%s",
-			hash.String(), metadata.ContentHash.String(), actualContentHash.String())
+		// actualContentHash := hasher.HashBytes(data)
+		// log.Printf("Storing data for hash %s: expected ContentHash=%s, actual ContentHash=%s",
+		// 	hash.String(), metadata.ContentHash.String(), actualContentHash.String())
 		if !hasher.Verify(data, metadata.ContentHash) {
 			return fmt.Errorf("content integrity check failed for hash %s", hash.String())
 		}
