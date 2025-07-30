@@ -4,12 +4,18 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/binary"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
+
+	"openhashdb/core/hasher"
+	"openhashdb/core/storage"
 
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
@@ -27,17 +33,24 @@ import (
 )
 
 const (
-	ServiceTag     = "openhashdb"
-	ProtocolGossip = protocol.ID("/openhashdb/gossip/1.0.0")
+	ServiceTag              = "openhashdb"
+	ProtocolGossip          = protocol.ID("/openhashdb/gossip/1.0.0")
+	ProtocolContentExchange = protocol.ID("/openhashdb/content/1.0.0")
 )
 
 // BootNode represents a libp2p boot node.
 type BootNode struct {
-	host   host.Host
-	ctx    context.Context
-	cancel context.CancelFunc
-	dht    *dht.IpfsDHT
-	mdns   mdns.Service
+	host    host.Host
+	ctx     context.Context
+	cancel  context.CancelFunc
+	dht     *dht.IpfsDHT
+	mdns    mdns.Service
+	storage *storage.Storage
+}
+
+// SetStorage sets the storage backend for the boot node.
+func (bn *BootNode) SetStorage(s *storage.Storage) {
+	bn.storage = s
 }
 
 // loadOrCreateIdentity loads or creates a private key.
@@ -159,23 +172,25 @@ func NewBootNode(ctx context.Context, keyPath string, bootnodes []string, p2pPor
 		return nil, fmt.Errorf("failed to create libp2p host: %w", err)
 	}
 
-	// Accept gossip streams but do nothing with them
-	h.SetStreamHandler(ProtocolGossip, func(s network.Stream) {
-		log.Printf("Received gossip stream from %s, closing.", s.Conn().RemotePeer())
-		s.Reset()
-	})
-
-	_, err = relayv2.New(h)
-	if err != nil {
-		log.Printf("Warning: failed to enable relay service: %v", err)
-	}
-
 	nodeCtx, cancel := context.WithCancel(ctx)
 	bootNode := &BootNode{
 		host:   h,
 		ctx:    nodeCtx,
 		cancel: cancel,
 		dht:    nodeDHT,
+	}
+
+	// Accept gossip streams but do nothing with them
+	h.SetStreamHandler(ProtocolGossip, func(s network.Stream) {
+		log.Printf("Received gossip stream from %s, closing.", s.Conn().RemotePeer())
+		s.Reset()
+	})
+
+	h.SetStreamHandler(ProtocolContentExchange, bootNode.handleContentStream)
+
+	_, err = relayv2.New(h)
+	if err != nil {
+		log.Printf("Warning: failed to enable relay service: %v", err)
 	}
 
 	// Set up mDNS with a proper handler
@@ -324,4 +339,90 @@ func (bn *BootNode) bootstrapDHT() error {
 		return fmt.Errorf("failed to bootstrap DHT: %w", err)
 	}
 	return nil
+}
+
+// handleContentStream handles content streams
+func (bn *BootNode) handleContentStream(stream network.Stream) {
+	defer stream.Close()
+
+	remotePeer := stream.Conn().RemotePeer()
+	log.Printf("Handling content stream from %s", remotePeer.String())
+
+	stream.SetReadDeadline(time.Now().Add(30 * time.Second))
+	buf := make([]byte, 256)
+	bytesRead, err := stream.Read(buf)
+	if err != nil && err != io.EOF && err != context.Canceled {
+		log.Printf("Failed to read content request from %s: %v", remotePeer.String(), err)
+		_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: failed to read content request: %v", err)))
+		return
+	}
+	contentHashStr := string(buf[:bytesRead])
+	log.Printf("Received content request for %s from %s", contentHashStr, remotePeer.String())
+
+	if bn.storage == nil {
+		log.Printf("Error: storage not configured for %s", remotePeer.String())
+		_, _ = stream.Write([]byte("ERROR: storage not configured"))
+		return
+	}
+
+	hash, err := hasher.HashFromString(contentHashStr)
+	if err != nil {
+		log.Printf("Invalid hash %s from %s: %v", contentHashStr, remotePeer.String(), err)
+		_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: invalid hash: %v", err)))
+		return
+	}
+
+	if err := bn.storage.ValidateContent(hash); err != nil {
+		log.Printf("Content validation failed for %s from %s: %v", contentHashStr, remotePeer.String(), err)
+		_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: %v", err)))
+		return
+	}
+
+	metadata, err := bn.storage.GetContent(hash)
+	if err != nil {
+		log.Printf("Failed to get metadata for %s from %s: %v", contentHashStr, remotePeer.String(), err)
+		_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: failed to get metadata: %v", err)))
+		return
+	}
+
+	dataStream, err := bn.storage.GetDataStream(hash)
+	if err != nil {
+		log.Printf("Failed to get data stream for %s from %s: %v", contentHashStr, remotePeer.String(), err)
+		_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: failed to get data: %v", err)))
+		return
+	}
+	defer dataStream.Close()
+
+	metaBytes, err := json.Marshal(metadata)
+	if err != nil {
+		log.Printf("Failed to marshal metadata for %s from %s: %v", contentHashStr, remotePeer.String(), err)
+		_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: failed to marshal metadata: %v", err)))
+		return
+	}
+
+	stream.SetWriteDeadline(time.Now().Add(60 * time.Second))
+	if err := binary.Write(stream, binary.BigEndian, uint32(len(metaBytes))); err != nil {
+		log.Printf("Failed to write metadata length for %s to %s: %v", contentHashStr, remotePeer.String(), err)
+		_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: failed to write metadata length: %v", err)))
+		return
+	}
+
+	if _, err := stream.Write(metaBytes); err != nil {
+		log.Printf("Failed to write metadata for %s to %s: %v", contentHashStr, remotePeer.String(), err)
+		_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: failed to write metadata: %v", err)))
+		return
+	}
+
+	stream.SetWriteDeadline(time.Now().Add(5 * time.Minute))
+	bytesSent, err := io.Copy(stream, dataStream)
+	if err != nil {
+		log.Printf("Failed to write content for %s to %s: %v", contentHashStr, remotePeer.String(), err)
+		_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: failed to write content: %v", err)))
+		return
+	}
+	log.Printf("Sent %d bytes of content %s to %s", bytesSent, contentHashStr, remotePeer.String())
+
+	if err := stream.CloseWrite(); err != nil {
+		log.Printf("Failed to close write stream for %s to %s: %v", contentHashStr, remotePeer.String(), err)
+	}
 }
