@@ -136,6 +136,7 @@ func NewBootNode(ctx context.Context, keyPath string, bootnodes []string, p2pPor
 	h, err := libp2p.New(
 		libp2p.Identity(privKey),
 		libp2p.ListenAddrStrings(listenAddrs...),
+		libp2p.EnableAutoRelayWithStaticRelays(addrInfos),
 		libp2p.EnableNATService(),
 		libp2p.EnableRelay(),
 		libp2p.EnableRelayService(),
