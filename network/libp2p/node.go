@@ -243,8 +243,21 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string)
 		),
 		libp2p.EnableNATService(),
 		libp2p.EnableRelay(),
-		libp2p.EnableAutoRelayWithStaticRelays(addrInfos),
-		libp2p.EnableRelayService(),
+		libp2p.EnableHolePunching(),
+		libp2p.EnableAutoRelayWithPeerSource(func(ctx context.Context, numPeers int) <-chan peer.AddrInfo {
+			peerChan := make(chan peer.AddrInfo, numPeers)
+			go func() {
+				defer close(peerChan)
+				for _, pi := range addrInfos {
+					select {
+					case peerChan <- pi:
+					case <-ctx.Done():
+						return
+					}
+				}
+			}()
+			return peerChan
+		}),
 		libp2p.Security(noise.ID, noise.New),
 		libp2p.Transport(tcp.NewTCPTransport),
 		libp2p.Transport(quic.NewTransport),
