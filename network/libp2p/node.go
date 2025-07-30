@@ -28,7 +28,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/core/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
-	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
+
+	// relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	quic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
@@ -275,12 +276,6 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string)
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create libp2p host: %w", err)
-	}
-
-	// Enable relay service
-	_, err = relayv2.New(h)
-	if err != nil {
-		log.Printf("Warning: failed to enable relay service: %v", err)
 	}
 
 	nodeCtx, cancel := context.WithCancel(ctx)

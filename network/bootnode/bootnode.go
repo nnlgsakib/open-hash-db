@@ -150,8 +150,20 @@ func NewBootNode(ctx context.Context, keyPath string, bootnodes []string, p2pPor
 		libp2p.Identity(privKey),
 		libp2p.ListenAddrStrings(listenAddrs...),
 		libp2p.EnableNATService(),
-		libp2p.EnableRelay(),
 		libp2p.EnableHolePunching(),
+		libp2p.EnableRelayService(relayv2.WithResources(relayv2.Resources{
+			Limit: &relayv2.RelayLimit{
+				Duration: 2 * time.Minute,
+				Data:     1 << 20, // 1MB
+			},
+			ReservationTTL: time.Hour,
+			MaxReservations: 128,
+			MaxCircuits: 16,
+			BufferSize: 2048,
+			MaxReservationsPerPeer: 4,
+			MaxReservationsPerIP: 8,
+			MaxReservationsPerASN: 8,
+		})),
 		libp2p.EnableAutoRelayWithPeerSource(func(ctx context.Context, numPeers int) <-chan peer.AddrInfo {
 			peerChan := make(chan peer.AddrInfo, numPeers)
 			go func() {
@@ -200,11 +212,6 @@ func NewBootNode(ctx context.Context, keyPath string, bootnodes []string, p2pPor
 	})
 
 	h.SetStreamHandler(ProtocolContentExchange, bootNode.handleContentStream)
-
-	_, err = relayv2.New(h)
-	if err != nil {
-		log.Printf("Warning: failed to enable relay service: %v", err)
-	}
 
 	// Set up mDNS with a proper handler
 	mdnsService := mdns.NewMdnsService(h, ServiceTag, &discoveryHandler{host: h})
