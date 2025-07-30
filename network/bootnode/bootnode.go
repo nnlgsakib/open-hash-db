@@ -26,8 +26,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/core/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
-	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
+	quic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
 )
 
@@ -135,6 +135,7 @@ func NewBootNode(ctx context.Context, keyPath string, bootnodes []string, p2pPor
 
 	listenAddrs := []string{
 		fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", p2pPort),
+		fmt.Sprintf("/ip4/0.0.0.0/udp/%d/quic-v1", p2pPort),
 	}
 
 	allBootnodes := append(DefaultBootnodes, bootnodes...)
@@ -147,38 +148,12 @@ func NewBootNode(ctx context.Context, keyPath string, bootnodes []string, p2pPor
 	h, err := libp2p.New(
 		libp2p.Identity(privKey),
 		libp2p.ListenAddrStrings(listenAddrs...),
-		libp2p.EnableNATService(),
-		libp2p.ForceReachabilityPublic(),
+		libp2p.EnableRelay(),
+		libp2p.EnableRelayService(),
 		libp2p.EnableHolePunching(),
-		libp2p.EnableRelayService(relayv2.WithResources(relayv2.Resources{
-			Limit: &relayv2.RelayLimit{
-				Duration: 2 * time.Minute,
-				Data:     1 << 20, // 1MB
-			},
-			ReservationTTL: time.Hour,
-			MaxReservations: 128,
-			MaxCircuits: 16,
-			BufferSize: 2048,
-			MaxReservationsPerPeer: 4,
-			MaxReservationsPerIP: 8,
-			MaxReservationsPerASN: 8,
-		})),
-		libp2p.EnableAutoRelayWithPeerSource(func(ctx context.Context, numPeers int) <-chan peer.AddrInfo {
-			peerChan := make(chan peer.AddrInfo, numPeers)
-			go func() {
-				defer close(peerChan)
-				for _, pi := range addrInfos {
-					select {
-					case peerChan <- pi:
-					case <-ctx.Done():
-						return
-					}
-				}
-			}()
-			return peerChan
-		}),
 		libp2p.Security(noise.ID, noise.New),
 		libp2p.Transport(tcp.NewTCPTransport),
+		libp2p.Transport(quic.NewTransport),
 		libp2p.Routing(func(h host.Host) (routing.PeerRouting, error) {
 			nodeDHT, err = dht.New(ctx, h,
 				dht.Mode(dht.ModeServer),
