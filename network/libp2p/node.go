@@ -243,7 +243,7 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string)
 		),
 		libp2p.EnableNATService(),
 		libp2p.EnableRelay(),
-		libp2p.EnableAutoRelay(),
+		libp2p.EnableAutoRelayWithStaticRelays(addrInfos),
 		libp2p.EnableRelayService(),
 		libp2p.Security(noise.ID, noise.New),
 		libp2p.Transport(tcp.NewTCPTransport),
