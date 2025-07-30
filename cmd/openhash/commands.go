@@ -247,12 +247,7 @@ var bootnodeCmd = &cobra.Command{
 		// Determine key path
 		actualKeyPath := keyPath
 		if actualKeyPath == "" {
-			// Use a different default key for bootnode to avoid conflicts with a regular daemon
-			home, err := os.UserHomeDir()
-			if err != nil {
-				return fmt.Errorf("failed to get user home dir: %w", err)
-			}
-			actualKeyPath = filepath.Join(home, ".openhash", "bootnode.key")
+			actualKeyPath = filepath.Join(dbPath, "peer.key")
 		}
 
 		// Parse bootnode addresses
