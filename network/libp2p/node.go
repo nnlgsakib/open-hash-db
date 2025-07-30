@@ -188,7 +188,7 @@ func loadOrCreateIdentity(keyPath string) (crypto.PrivKey, error) {
 
 // DefaultBootnodes is a list of bootstrap node multiaddresses
 var DefaultBootnodes = []string{
-	"/ip4/148.251.35.204/tcp/34465/p2p/QmNwQH2JdRrh9bGGEprm6QA7D2ErNJ3a8WRWZTCVYDS1NS",
+	"/ip4/148.251.35.204/tcp/35949/p2p/QmNwQH2JdRrh9bGGEprm6QA7D2ErNJ3a8WRWZTCVYDS1NS",
 }
 
 // convertBootnodesToAddrInfo converts string multiaddresses to peer.AddrInfo
