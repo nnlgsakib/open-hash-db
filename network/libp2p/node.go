@@ -27,6 +27,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/core/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	"github.com/multiformats/go-multihash"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -143,6 +144,9 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string)
 	h, err := libp2p.New(
 		libp2p.Identity(privKey),
 		libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"),
+		libp2p.EnableNATService(),
+		libp2p.EnableRelay(),
+		libp2p.Security(noise.ID, noise.New),
 		libp2p.Routing(func(h host.Host) (routing.PeerRouting, error) {
 			nodeDHT, err = dht.New(ctx, h, dht.Mode(dht.ModeServer))
 			if err != nil {
