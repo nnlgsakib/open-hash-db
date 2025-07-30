@@ -136,7 +136,6 @@ func NewBootNode(ctx context.Context, keyPath string, bootnodes []string, p2pPor
 
 	listenAddrs := []string{
 		fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", p2pPort),
-		fmt.Sprintf("/ip4/0.0.0.0/udp/%d/quic-v1", p2pPort),
 	}
 
 	allBootnodes := append(DefaultBootnodes, bootnodes...)
@@ -180,7 +179,6 @@ func NewBootNode(ctx context.Context, keyPath string, bootnodes []string, p2pPor
 		}),
 		libp2p.Security(noise.ID, noise.New),
 		libp2p.Transport(tcp.NewTCPTransport),
-		libp2p.Transport(quic.NewTransport),
 		libp2p.Routing(func(h host.Host) (routing.PeerRouting, error) {
 			nodeDHT, err = dht.New(ctx, h,
 				dht.Mode(dht.ModeServer),

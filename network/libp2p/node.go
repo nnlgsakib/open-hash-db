@@ -240,7 +240,6 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string)
 		libp2p.Identity(privKey),
 		libp2p.ListenAddrStrings(
 			"/ip4/0.0.0.0/tcp/0",
-			"/ip4/0.0.0.0/udp/0/quic-v1",
 		),
 		libp2p.EnableNATService(),
 		libp2p.EnableRelay(),
@@ -261,7 +260,6 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string)
 		}),
 		libp2p.Security(noise.ID, noise.New),
 		libp2p.Transport(tcp.NewTCPTransport),
-		libp2p.Transport(quic.NewTransport),
 		libp2p.Routing(func(h host.Host) (routing.PeerRouting, error) {
 			nodeDHT, err = dht.New(ctx, h,
 				dht.Mode(dht.ModeAutoServer),
