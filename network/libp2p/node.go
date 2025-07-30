@@ -241,6 +241,7 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string)
 			"/ip4/0.0.0.0/tcp/0",
 		),
 		libp2p.EnableNATService(),
+		libp2p.ForceReachabilityPrivate(),
 		libp2p.EnableRelay(),
 		libp2p.EnableHolePunching(),
 		libp2p.EnableAutoRelayWithPeerSource(func(ctx context.Context, numPeers int) <-chan peer.AddrInfo {
