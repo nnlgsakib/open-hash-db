@@ -584,7 +584,7 @@ func (n *Node) GetNetworkStats() map[string]interface{} {
 }
 
 var DefaultBootnodes = []string{
-	"/ip4/148.251.35.204/tcp/46395/p2p/QmNwQH2JdRrh9bGGEprm6QA7D2ErNJ3a8WRWZTCVYDS1NS",
+	"/ip4/148.251.35.204/tcp/39419/p2p/QmNwQH2JdRrh9bGGEprm6QA7D2ErNJ3a8WRWZTCVYDS1NS",
 }
 
 // connectToBootnodes connects to bootnodes
