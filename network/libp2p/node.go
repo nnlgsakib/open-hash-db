@@ -188,7 +188,7 @@ func loadOrCreateIdentity(keyPath string) (crypto.PrivKey, error) {
 
 // DefaultBootnodes is a list of bootstrap node multiaddresses
 var DefaultBootnodes = []string{
-	"/ip4/148.251.35.204/tcp/39807/p2p/QmNwQH2JdRrh9bGGEprm6QA7D2ErNJ3a8WRWZTCVYDS1NS",
+	"/ip4/148.251.35.204/tcp/34465/p2p/QmNwQH2JdRrh9bGGEprm6QA7D2ErNJ3a8WRWZTCVYDS1NS",
 }
 
 // convertBootnodesToAddrInfo converts string multiaddresses to peer.AddrInfo
@@ -827,7 +827,7 @@ func (n *Node) RequestContentFromPeer(peerID peer.ID, contentHash string) ([]byt
 		stream.CloseWrite()
 
 		stream.SetReadDeadline(time.Now().Add(60 * time.Second))
-		// First, try to read an error message
+		// First, try to read an error message, which might contain the start of the actual message.
 		buf := make([]byte, 256)
 		nBytes, err := stream.Read(buf)
 		if err == nil && nBytes > 0 && bytes.HasPrefix(buf[:nBytes], []byte("ERROR:")) {
@@ -842,9 +842,9 @@ func (n *Node) RequestContentFromPeer(peerID peer.ID, contentHash string) ([]byt
 			continue
 		}
 
-		// Reset buffer position if no error message
-		if err != io.EOF && err != nil {
-			log.Printf("Attempt %d/%d: Failed to read response from %s: %v", attempt, maxRetries, peerID.String(), err)
+		// If there was an error reading, but it wasn't EOF, it's a real error.
+		if err != nil && err != io.EOF {
+			log.Printf("Attempt %d/%d: Failed to read initial response from %s: %v", attempt, maxRetries, peerID.String(), err)
 			networkErrorsTotal.WithLabelValues("read_response").Inc()
 			stream.Close()
 			if attempt == maxRetries {
@@ -855,8 +855,11 @@ func (n *Node) RequestContentFromPeer(peerID peer.ID, contentHash string) ([]byt
 			continue
 		}
 
+		// Combine the initial read buffer with the rest of the stream
+		combinedReader := io.MultiReader(bytes.NewReader(buf[:nBytes]), stream)
+
 		var metaLen uint32
-		if err := binary.Read(stream, binary.BigEndian, &metaLen); err != nil {
+		if err := binary.Read(combinedReader, binary.BigEndian, &metaLen); err != nil {
 			log.Printf("Attempt %d/%d: Failed to read metadata length from %s: %v", attempt, maxRetries, peerID.String(), err)
 			networkErrorsTotal.WithLabelValues("read_metadata_length").Inc()
 			stream.Close()
@@ -869,7 +872,7 @@ func (n *Node) RequestContentFromPeer(peerID peer.ID, contentHash string) ([]byt
 		}
 
 		metaBytes := make([]byte, metaLen)
-		if _, err := io.ReadFull(stream, metaBytes); err != nil {
+		if _, err := io.ReadFull(combinedReader, metaBytes); err != nil {
 			log.Printf("Attempt %d/%d: Failed to read metadata from %s: %v", attempt, maxRetries, peerID.String(), err)
 			networkErrorsTotal.WithLabelValues("read_metadata").Inc()
 			stream.Close()
