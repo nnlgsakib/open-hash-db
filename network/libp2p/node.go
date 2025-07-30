@@ -189,7 +189,7 @@ func loadOrCreateIdentity(keyPath string) (crypto.PrivKey, error) {
 
 // DefaultBootnodes for the VPS-hosted default node
 var DefaultBootnodes = []string{
-	"/ip4/148.251.35.204/tcp/35949/p2p/QmNwQH2JdRrh9bGGEprm6QA7D2ErNJ3a8WRWZTCVYDS1NS",
+	// "/ip4/148.251.35.204/tcp/35949/p2p/QmNwQH2JdRrh9bGGEprm6QA7D2ErNJ3a8WRWZTCVYDS1NS",
 }
 
 // convertBootnodesToAddrInfo converts multiaddresses to peer.AddrInfo
@@ -409,6 +409,10 @@ func (n *Node) Connect(ctx context.Context, peerAddr string) error {
 
 	const maxRetries = 5
 	for attempt := 1; attempt <= maxRetries; attempt++ {
+		// Increase timeout for each attempt
+		ctx, cancel := context.WithTimeout(ctx, time.Duration(10+5*attempt)*time.Second)
+		defer cancel()
+
 		err = n.host.Connect(ctx, *maddr)
 		if err == nil {
 			log.Printf("Connected to peer: %s", maddr.ID.String())
@@ -654,8 +658,11 @@ func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := n.node.Connect(ctx, pi.String()); err != nil {
+	if err := n.node.host.Connect(ctx, pi); err != nil {
 		log.Printf("Failed to connect to discovered peer %s: %v", pi.ID.String(), err)
+		networkErrorsTotal.WithLabelValues("connect_discovered").Inc()
+	} else {
+		log.Printf("Successfully connected to discovered peer %s", pi.ID.String())
 	}
 }
 
