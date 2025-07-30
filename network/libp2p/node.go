@@ -189,7 +189,7 @@ func loadOrCreateIdentity(keyPath string) (crypto.PrivKey, error) {
 
 // DefaultBootnodes for the VPS-hosted default node
 var DefaultBootnodes = []string{
-	// "/ip4/148.251.35.204/tcp/35949/p2p/QmNwQH2JdRrh9bGGEprm6QA7D2ErNJ3a8WRWZTCVYDS1NS",
+	"/ip4/148.251.35.204/tcp/9090/p2p/QmYQMdZkvC4R7DHqSkCKNh89Hs7gDPLjx9j9xnPsUkkS2P",
 }
 
 // convertBootnodesToAddrInfo converts multiaddresses to peer.AddrInfo
