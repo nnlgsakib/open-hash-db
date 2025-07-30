@@ -13,6 +13,7 @@ import (
 	"openhashdb/core/dag"
 	"openhashdb/core/hasher"
 	"openhashdb/core/storage"
+	"openhashdb/network/bootnode"
 	"openhashdb/network/libp2p"
 	"openhashdb/network/replicator"
 	"os"
@@ -236,6 +237,52 @@ var daemonCmd = &cobra.Command{
 	},
 }
 
+var bootnodeCmd = &cobra.Command{
+	Use:   "bootnode",
+	Short: "Run a standalone bootnode and relayer",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		// Determine key path
+		actualKeyPath := keyPath
+		if actualKeyPath == "" {
+			// Use a different default key for bootnode to avoid conflicts with a regular daemon
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return fmt.Errorf("failed to get user home dir: %w", err)
+			}
+			actualKeyPath = filepath.Join(home, ".openhash", "bootnode.key")
+		}
+
+		// Parse bootnode addresses
+		var bootnodeAddrs []string
+		if bootnodes != "" {
+			bootnodeAddrs = strings.Split(bootnodes, ",")
+			for i, addr := range bootnodeAddrs {
+				bootnodeAddrs[i] = strings.TrimSpace(addr)
+			}
+		}
+
+		// Initialize bootnode
+		node, err := bootnode.NewBootNode(ctx, actualKeyPath, bootnodeAddrs, p2pPort)
+		if err != nil {
+			return fmt.Errorf("failed to create bootnode: %w", err)
+		}
+		defer node.Close()
+
+		fmt.Println("Bootnode started successfully")
+		fmt.Printf("Node ID: %s\n", node.ID().String())
+		fmt.Printf("Addresses:\n")
+		for _, addr := range node.Addrs() {
+			fmt.Printf("  %s\n", addr)
+		}
+
+		// Wait for interrupt
+		select {}
+	},
+}
+
 func init() {
 	// Global flags
 	rootCmd.PersistentFlags().StringVar(&dbPath, "db", "./openhash.db", "Database path")
@@ -255,6 +302,7 @@ func init() {
 	rootCmd.AddCommand(viewCmd)
 	rootCmd.AddCommand(daemonCmd)
 	rootCmd.AddCommand(listCmd)
+	rootCmd.AddCommand(bootnodeCmd)
 }
 
 func main() {

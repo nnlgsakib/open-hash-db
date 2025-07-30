@@ -1,0 +1,326 @@
+package bootnode
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"github.com/libp2p/go-libp2p"
+	dht "github.com/libp2p/go-libp2p-kad-dht"
+	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/protocol"
+	"github.com/libp2p/go-libp2p/core/routing"
+	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
+	"github.com/libp2p/go-libp2p/p2p/security/noise"
+	quic "github.com/libp2p/go-libp2p/p2p/transport/quic"
+	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
+)
+
+const (
+	ServiceTag     = "openhashdb"
+	ProtocolGossip = protocol.ID("/openhashdb/gossip/1.0.0")
+)
+
+// BootNode represents a libp2p boot node.
+type BootNode struct {
+	host   host.Host
+	ctx    context.Context
+	cancel context.CancelFunc
+	dht    *dht.IpfsDHT
+	mdns   mdns.Service
+}
+
+// loadOrCreateIdentity loads or creates a private key.
+func loadOrCreateIdentity(keyPath string) (crypto.PrivKey, error) {
+	if err := os.MkdirAll(filepath.Dir(keyPath), 0755); err != nil {
+		return nil, fmt.Errorf("failed to create key directory: %w", err)
+	}
+
+	if keyData, err := os.ReadFile(keyPath); err == nil {
+		keyBytes, err := base64.StdEncoding.DecodeString(string(keyData))
+		if err != nil {
+			log.Printf("Warning: failed to decode key, creating new: %v", err)
+		} else {
+			privKey, err := crypto.UnmarshalPrivateKey(keyBytes)
+			if err == nil {
+				log.Printf("Loaded identity from %s", keyPath)
+				return privKey, nil
+			}
+			log.Printf("Warning: failed to unmarshal key, creating new: %v", err)
+		}
+	}
+
+	log.Printf("Generating new identity at %s", keyPath)
+	privKey, _, err := crypto.GenerateKeyPairWithReader(crypto.RSA, 2048, rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate key pair: %w", err)
+	}
+
+	keyBytes, err := crypto.MarshalPrivateKey(privKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal private key: %w", err)
+	}
+
+	if err := os.WriteFile(keyPath, []byte(base64.StdEncoding.EncodeToString(keyBytes)), 0600); err != nil {
+		return nil, fmt.Errorf("failed to save private key: %w", err)
+	}
+
+	return privKey, nil
+}
+
+// DefaultBootnodes for the VPS-hosted default node.
+var DefaultBootnodes = []string{
+	// "/ip4/148.251.35.204/tcp/35949/p2p/QmNwQH2JdRrh9bGGEprm6QA7D2ErNJ3a8WRWZTCVYDS1NS",
+}
+
+// convertBootnodesToAddrInfo converts multiaddresses to peer.AddrInfo.
+func convertBootnodesToAddrInfo(bootnodes []string) ([]peer.AddrInfo, error) {
+	var addrInfos []peer.AddrInfo
+	for _, addr := range bootnodes {
+		if addr == "" {
+			continue
+		}
+		addrInfo, err := peer.AddrInfoFromString(addr)
+		if err != nil {
+			log.Printf("Failed to parse bootnode address %s: %v", addr, err)
+			continue
+		}
+		addrInfos = append(addrInfos, *addrInfo)
+	}
+	return addrInfos, nil
+}
+
+// discoveryHandler implements the mdns.DiscoveryHandler interface.
+type discoveryHandler struct {
+	host host.Host
+}
+
+func (dh *discoveryHandler) HandlePeerFound(pi peer.AddrInfo) {
+	log.Printf("Discovered peer via mDNS: %s", pi.ID)
+	if err := dh.host.Connect(context.Background(), pi); err != nil {
+		log.Printf("Failed to connect to mDNS peer %s: %v", pi.ID, err)
+	} else {
+		log.Printf("Connected to mDNS peer %s", pi.ID)
+	}
+}
+
+// NewBootNode creates a new libp2p boot node.
+func NewBootNode(ctx context.Context, keyPath string, bootnodes []string, p2pPort int) (*BootNode, error) {
+	privKey, err := loadOrCreateIdentity(keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load identity: %w", err)
+	}
+
+	listenAddrs := []string{
+		fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", p2pPort),
+		fmt.Sprintf("/ip4/0.0.0.0/udp/%d/quic-v1", p2pPort),
+	}
+
+	allBootnodes := append(DefaultBootnodes, bootnodes...)
+	addrInfos, err := convertBootnodesToAddrInfo(allBootnodes)
+	if err != nil {
+		log.Printf("Warning: failed to parse some bootnode addresses: %v", err)
+	}
+
+	var nodeDHT *dht.IpfsDHT
+	h, err := libp2p.New(
+		libp2p.Identity(privKey),
+		libp2p.ListenAddrStrings(listenAddrs...),
+		libp2p.EnableNATService(),
+		libp2p.EnableRelay(),
+		libp2p.EnableRelayService(),
+		libp2p.Security(noise.ID, noise.New),
+		libp2p.Transport(tcp.NewTCPTransport),
+		libp2p.Transport(quic.NewTransport),
+		libp2p.Routing(func(h host.Host) (routing.PeerRouting, error) {
+			nodeDHT, err = dht.New(ctx, h,
+				dht.Mode(dht.ModeServer),
+				dht.BootstrapPeers(addrInfos...),
+				dht.BucketSize(20),
+			)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create DHT: %w", err)
+			}
+			return nodeDHT, nil
+		}),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create libp2p host: %w", err)
+	}
+
+	// Accept gossip streams but do nothing with them
+	h.SetStreamHandler(ProtocolGossip, func(s network.Stream) {
+		log.Printf("Received gossip stream from %s, closing.", s.Conn().RemotePeer())
+		s.Reset()
+	})
+
+	_, err = relayv2.New(h)
+	if err != nil {
+		log.Printf("Warning: failed to enable relay service: %v", err)
+	}
+
+	nodeCtx, cancel := context.WithCancel(ctx)
+	bootNode := &BootNode{
+		host:   h,
+		ctx:    nodeCtx,
+		cancel: cancel,
+		dht:    nodeDHT,
+	}
+
+	// Set up mDNS with a proper handler
+	mdnsService := mdns.NewMdnsService(h, ServiceTag, &discoveryHandler{host: h})
+	if err := mdnsService.Start(); err != nil {
+		log.Printf("Warning: failed to start mDNS: %v", err)
+	} else {
+		bootNode.mdns = mdnsService
+	}
+
+	log.Printf("BootNode started with ID: %s", h.ID().String())
+	log.Printf("Listening on addresses:")
+	for _, addr := range h.Addrs() {
+		log.Printf("  %s/p2p/%s", addr, h.ID().String())
+	}
+
+	// Start periodic DHT bootstrapping
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-nodeCtx.Done():
+				return
+			case <-ticker.C:
+				if err := bootNode.bootstrapDHT(); err != nil {
+					log.Printf("Failed to bootstrap DHT: %v", err)
+				}
+			}
+		}
+	}()
+
+	// Perform initial DHT bootstrap and bootnode connections
+	go func() {
+		if err := bootNode.bootstrapDHT(); err != nil {
+			log.Printf("Warning: failed to bootstrap DHT: %v", err)
+		}
+		if err := bootNode.connectToBootnodes(allBootnodes); err != nil {
+			log.Printf("Warning: failed to connect to some bootnodes: %v", err)
+		}
+	}()
+
+	return bootNode, nil
+}
+
+// Close shuts down the boot node.
+func (bn *BootNode) Close() error {
+	var errs []error
+	if bn.mdns != nil {
+		if err := bn.mdns.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("error closing mDNS: %w", err))
+		}
+	}
+	if bn.dht != nil {
+		if err := bn.dht.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("error closing DHT: %w", err))
+		}
+	}
+	if err := bn.host.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("error closing host: %w", err))
+	}
+	bn.cancel()
+
+	if len(errs) > 0 {
+		return fmt.Errorf("errors during shutdown: %v", errs)
+	}
+	return nil
+}
+
+// Addrs returns the node's addresses.
+func (bn *BootNode) Addrs() []string {
+	var addrs []string
+	for _, addr := range bn.host.Addrs() {
+		addrs = append(addrs, fmt.Sprintf("%s/p2p/%s", addr, bn.host.ID().String()))
+	}
+	return addrs
+}
+
+// ID returns the node's peer ID.
+func (bn *BootNode) ID() peer.ID {
+	return bn.host.ID()
+}
+
+// connectToBootnodes connects to bootnodes in parallel.
+func (bn *BootNode) connectToBootnodes(bootnodes []string) error {
+	if len(bootnodes) == 0 {
+		log.Println("No bootnodes specified")
+		return nil
+	}
+
+	log.Printf("Connecting to %d bootnode(s)...", len(bootnodes))
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	connectedCount := 0
+	var lastErr error
+
+	for _, bootnode := range bootnodes {
+		if bootnode == "" {
+			continue
+		}
+		wg.Add(1)
+		go func(addr string) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(bn.ctx, 30*time.Second)
+			defer cancel()
+
+			addrInfo, err := peer.AddrInfoFromString(addr)
+			if err != nil {
+				log.Printf("Failed to parse peer address %s: %v", addr, err)
+				mu.Lock()
+				lastErr = err
+				mu.Unlock()
+				return
+			}
+
+			if err := bn.host.Connect(ctx, *addrInfo); err != nil {
+				log.Printf("Failed to connect to bootnode %s: %v", addr, err)
+				mu.Lock()
+				lastErr = err
+				mu.Unlock()
+			} else {
+				mu.Lock()
+				connectedCount++
+				mu.Unlock()
+			}
+		}(bootnode)
+	}
+	wg.Wait()
+
+	log.Printf("Connected to %d out of %d bootnodes", connectedCount, len(bootnodes))
+	if connectedCount == 0 && len(bootnodes) > 0 {
+		return fmt.Errorf("failed to connect to any bootnodes: %w", lastErr)
+	}
+	return nil
+}
+
+// bootstrapDHT bootstraps the DHT.
+func (bn *BootNode) bootstrapDHT() error {
+	if bn.dht == nil {
+		return fmt.Errorf("DHT not initialized")
+	}
+	log.Println("Bootstrapping DHT...")
+	ctx, cancel := context.WithTimeout(bn.ctx, 30*time.Second)
+	defer cancel()
+	if err := bn.dht.Bootstrap(ctx); err != nil {
+		return fmt.Errorf("failed to bootstrap DHT: %w", err)
+	}
+	return nil
+}
