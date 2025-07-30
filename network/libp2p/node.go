@@ -28,6 +28,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/core/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	quic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
@@ -37,7 +38,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
-// Metrics for monitoring
+// Metrics
 var (
 	networkMessagesTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
@@ -78,18 +79,18 @@ const (
 	ProtocolChunkExchange   = protocol.ID("/openhashdb/chunk/1.0.0")
 	ProtocolGossip          = protocol.ID("/openhashdb/gossip/1.0.0")
 	ServiceTag              = "openhashdb"
-	MaxPeerEventLogs        = 100 // Maximum number of peer events to store
+	MaxPeerEventLogs        = 100
 )
 
 // PeerEvent represents a peer discovery, connection, or disconnection event
 type PeerEvent struct {
 	PeerID    peer.ID   `json:"peer_id"`
-	Type      string    `json:"type"` // "discovered", "connected", or "disconnected"
+	Type      string    `json:"type"`
 	Timestamp time.Time `json:"timestamp"`
 	Addresses []string  `json:"addresses"`
 }
 
-// Node represents a libp2p node for OpenHashDB
+// Node represents a libp2p node
 type Node struct {
 	host                  host.Host
 	ctx                   context.Context
@@ -110,7 +111,7 @@ func (n *Node) SetStorage(s *storage.Storage) {
 	n.storage = s
 }
 
-// logPeerEvent logs a peer event and stores it
+// logPeerEvent logs a peer event
 func (n *Node) logPeerEvent(peerID peer.ID, eventType string, addrs []string) {
 	n.peerEventsMu.Lock()
 	defer n.peerEventsMu.Unlock()
@@ -186,12 +187,12 @@ func loadOrCreateIdentity(keyPath string) (crypto.PrivKey, error) {
 	return privKey, nil
 }
 
-// DefaultBootnodes is a list of bootstrap node multiaddresses
+// DefaultBootnodes for the VPS-hosted default node
 var DefaultBootnodes = []string{
 	"/ip4/148.251.35.204/tcp/35949/p2p/QmNwQH2JdRrh9bGGEprm6QA7D2ErNJ3a8WRWZTCVYDS1NS",
 }
 
-// convertBootnodesToAddrInfo converts string multiaddresses to peer.AddrInfo
+// convertBootnodesToAddrInfo converts multiaddresses to peer.AddrInfo
 func convertBootnodesToAddrInfo(bootnodes []string) ([]peer.AddrInfo, error) {
 	var addrInfos []peer.AddrInfo
 	for _, addr := range bootnodes {
@@ -226,7 +227,7 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string)
 		}
 	}
 
-	// Combine provided bootnodes with default bootnodes
+	// Combine bootnodes
 	allBootnodes := append(DefaultBootnodes, bootnodes...)
 	addrInfos, err := convertBootnodesToAddrInfo(allBootnodes)
 	if err != nil {
@@ -238,15 +239,20 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string)
 		libp2p.Identity(privKey),
 		libp2p.ListenAddrStrings(
 			"/ip4/0.0.0.0/tcp/0",
-			"/ip4/0.0.0.0/udp/0/quic",
+			"/ip4/0.0.0.0/udp/0/quic-v1",
 		),
 		libp2p.EnableNATService(),
 		libp2p.EnableRelay(),
+		libp2p.EnableRelayService(),
 		libp2p.Security(noise.ID, noise.New),
 		libp2p.Transport(tcp.NewTCPTransport),
 		libp2p.Transport(quic.NewTransport),
 		libp2p.Routing(func(h host.Host) (routing.PeerRouting, error) {
-			nodeDHT, err = dht.New(ctx, h, dht.Mode(dht.ModeServer), dht.BootstrapPeers(addrInfos...))
+			nodeDHT, err = dht.New(ctx, h,
+				dht.Mode(dht.ModeAutoServer),
+				dht.BootstrapPeers(addrInfos...),
+				dht.BucketSize(20),
+			)
 			if err != nil {
 				return nil, fmt.Errorf("failed to create DHT: %w", err)
 			}
@@ -255,6 +261,12 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string)
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create libp2p host: %w", err)
+	}
+
+	// Enable relay service
+	_, err = relayv2.New(h)
+	if err != nil {
+		log.Printf("Warning: failed to enable relay service: %v", err)
 	}
 
 	nodeCtx, cancel := context.WithCancel(ctx)
@@ -267,14 +279,16 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string)
 		PeerConnectedCallback: func(p peer.ID) {},
 	}
 
-	// Set up network notifiee for connection and disconnection events
+	// Set up network notifiee
 	n := &networkNotifiee{node: node}
 	h.Network().Notify(n)
 
+	// Set stream handlers
 	h.SetStreamHandler(ProtocolContentExchange, node.handleContentStream)
 	h.SetStreamHandler(ProtocolChunkExchange, node.handleChunkStream)
 	h.SetStreamHandler(ProtocolGossip, node.handleGossipStream)
 
+	// Setup mDNS
 	if err := node.setupMDNS(); err != nil {
 		log.Printf("Warning: failed to setup mDNS: %v", err)
 	}
@@ -285,7 +299,7 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string)
 		log.Printf("  %s/p2p/%s", addr, h.ID().String())
 	}
 
-	// Periodically bootstrap DHT
+	// Periodic DHT bootstrap
 	go func() {
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
@@ -301,18 +315,20 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string)
 		}
 	}()
 
-	if err := node.bootstrapDHT(); err != nil {
-		log.Printf("Warning: failed to bootstrap DHT: %v", err)
-	}
-
-	if err := node.connectToBootnodes(bootnodes); err != nil {
-		log.Printf("Warning: failed to connect to some bootnodes: %v", err)
-	}
+	// Initial bootstrap
+	go func() {
+		if err := node.bootstrapDHT(); err != nil {
+			log.Printf("Warning: failed to bootstrap DHT: %v", err)
+		}
+		if err := node.connectToBootnodes(allBootnodes); err != nil {
+			log.Printf("Warning: failed to connect to some bootnodes: %v", err)
+		}
+	}()
 
 	return node, nil
 }
 
-// networkNotifiee handles connection and disconnection events
+// networkNotifiee handles connection events
 type networkNotifiee struct {
 	node *Node
 }
@@ -384,18 +400,29 @@ func (n *Node) ConnectedPeers() []peer.ID {
 	return n.host.Network().Peers()
 }
 
-// Connect connects to a peer
+// Connect connects to a peer with exponential backoff
 func (n *Node) Connect(ctx context.Context, peerAddr string) error {
 	maddr, err := peer.AddrInfoFromString(peerAddr)
 	if err != nil {
 		return fmt.Errorf("failed to parse peer address %s: %w", peerAddr, err)
 	}
-	if err := n.host.Connect(ctx, *maddr); err != nil {
-		return fmt.Errorf("failed to connect to peer %s: %w", maddr.ID.String(), err)
+
+	const maxRetries = 5
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		err = n.host.Connect(ctx, *maddr)
+		if err == nil {
+			log.Printf("Connected to peer: %s", maddr.ID.String())
+			n.PeerConnectedCallback(maddr.ID)
+			return nil
+		}
+		log.Printf("Attempt %d/%d: Failed to connect to peer %s: %v", attempt, maxRetries, maddr.ID.String(), err)
+		networkErrorsTotal.WithLabelValues("connect").Inc()
+		if attempt < maxRetries {
+			networkRetriesTotal.Inc()
+			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond) // Exponential backoff
+		}
 	}
-	log.Printf("Connected to peer: %s", maddr.ID.String())
-	n.PeerConnectedCallback(maddr.ID)
-	return nil
+	return fmt.Errorf("failed to connect to peer %s after %d attempts: %w", maddr.ID.String(), maxRetries, err)
 }
 
 // SendContent sends content to a peer
@@ -425,10 +452,13 @@ func (n *Node) BroadcastGossip(ctx context.Context, data []byte) error {
 	return nil
 }
 
-// sendData sends data to a peer
+// sendData sends data to a peer with exponential backoff
 func (n *Node) sendData(ctx context.Context, peerID peer.ID, protocolID protocol.ID, data []byte) error {
-	const maxRetries = 3
+	const maxRetries = 5
 	for attempt := 1; attempt <= maxRetries; attempt++ {
+		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+
 		stream, err := n.host.NewStream(ctx, peerID, protocolID)
 		if err != nil {
 			log.Printf("Attempt %d/%d: Failed to open stream to %s: %v", attempt, maxRetries, peerID.String(), err)
@@ -437,7 +467,7 @@ func (n *Node) sendData(ctx context.Context, peerID peer.ID, protocolID protocol
 				return fmt.Errorf("failed to open stream to %s after %d attempts: %w", peerID.String(), maxRetries, err)
 			}
 			networkRetriesTotal.Inc()
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
 			continue
 		}
 		defer stream.Close()
@@ -450,7 +480,7 @@ func (n *Node) sendData(ctx context.Context, peerID peer.ID, protocolID protocol
 				return fmt.Errorf("failed to write data to %s after %d attempts: %w", peerID.String(), maxRetries, err)
 			}
 			networkRetriesTotal.Inc()
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
 			continue
 		}
 		return nil
@@ -466,6 +496,7 @@ func (n *Node) handleContentStream(stream network.Stream) {
 	remotePeer := stream.Conn().RemotePeer()
 	log.Printf("Handling content stream from %s", remotePeer.String())
 
+	stream.SetReadDeadline(time.Now().Add(30 * time.Second))
 	buf := make([]byte, 256)
 	bytesRead, err := stream.Read(buf)
 	if err != nil && err != io.EOF && err != context.Canceled {
@@ -550,9 +581,8 @@ func (n *Node) handleContentStream(stream network.Stream) {
 	log.Printf("Sent %d bytes of content %s to %s", bytesSent, contentHashStr, remotePeer.String())
 
 	if err := stream.CloseWrite(); err != nil {
-		log.Printf("Failed to close write stream gracefully for %s to %s: %v", contentHashStr, remotePeer.String(), err)
+		log.Printf("Failed to close write stream for %s to %s: %v", contentHashStr, remotePeer.String(), err)
 		networkErrorsTotal.WithLabelValues("close_write_stream").Inc()
-		return
 	}
 }
 
@@ -624,8 +654,8 @@ func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := n.node.host.Connect(ctx, pi); err != nil {
-		log.Printf("Failed to connect to peer %s: %v", pi.ID.String(), err)
+	if err := n.node.Connect(ctx, pi.String()); err != nil {
+		log.Printf("Failed to connect to discovered peer %s: %v", pi.ID.String(), err)
 	}
 }
 
@@ -658,7 +688,7 @@ func (n *Node) GetNetworkStats() map[string]interface{} {
 	return stats
 }
 
-// connectToBootnodes connects to bootnodes
+// connectToBootnodes connects to bootnodes in parallel
 func (n *Node) connectToBootnodes(bootnodes []string) error {
 	nodesToConnect := bootnodes
 	if len(nodesToConnect) == 0 {
@@ -670,22 +700,33 @@ func (n *Node) connectToBootnodes(bootnodes []string) error {
 	}
 
 	log.Printf("Connecting to %d bootnode(s)...", len(nodesToConnect))
+	var wg sync.WaitGroup
 	connectedCount := 0
 	var lastErr error
+	mu := sync.Mutex{}
 
 	for _, bootnode := range nodesToConnect {
 		if bootnode == "" {
 			continue
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		if err := n.Connect(ctx, bootnode); err != nil {
-			log.Printf("Failed to connect to bootnode %s: %v", bootnode, err)
-			lastErr = err
-		} else {
-			connectedCount++
-		}
-		cancel()
+		wg.Add(1)
+		go func(addr string) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := n.Connect(ctx, addr); err != nil {
+				mu.Lock()
+				lastErr = err
+				mu.Unlock()
+				log.Printf("Failed to connect to bootnode %s: %v", addr, err)
+			} else {
+				mu.Lock()
+				connectedCount++
+				mu.Unlock()
+			}
+		}(bootnode)
 	}
+	wg.Wait()
 
 	log.Printf("Connected to %d out of %d bootnodes", connectedCount, len(nodesToConnect))
 	if connectedCount == 0 && len(nodesToConnect) > 0 {
@@ -700,7 +741,9 @@ func (n *Node) bootstrapDHT() error {
 		return fmt.Errorf("DHT not initialized")
 	}
 	log.Printf("Bootstrapping DHT...")
-	return n.dht.Bootstrap(n.ctx)
+	ctx, cancel := context.WithTimeout(n.ctx, 30*time.Second)
+	defer cancel()
+	return n.dht.Bootstrap(ctx)
 }
 
 // AnnounceContent announces content availability
@@ -714,7 +757,6 @@ func (n *Node) AnnounceContent(contentHashStr string) error {
 		return fmt.Errorf("invalid content hash: %w", err)
 	}
 
-	// Validate both metadata and data exist
 	if n.storage == nil {
 		log.Printf("Storage not configured for content %s", contentHashStr)
 		return fmt.Errorf("storage not configured")
@@ -724,7 +766,7 @@ func (n *Node) AnnounceContent(contentHashStr string) error {
 		return err
 	}
 
-	const maxRetries = 3
+	const maxRetries = 5
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		ctx, cancel := context.WithTimeout(n.ctx, 30*time.Second)
 		defer cancel()
@@ -735,7 +777,8 @@ func (n *Node) AnnounceContent(contentHashStr string) error {
 			if attempt == maxRetries {
 				return fmt.Errorf("failed to create multihash: %w", err)
 			}
-			time.Sleep(100 * time.Millisecond)
+			networkRetriesTotal.Inc()
+			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
 			continue
 		}
 		contentCID := cid.NewCidV1(cid.Raw, mh)
@@ -747,7 +790,7 @@ func (n *Node) AnnounceContent(contentHashStr string) error {
 				return fmt.Errorf("failed to announce content after %d attempts: %w", maxRetries, err)
 			}
 			networkRetriesTotal.Inc()
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
 			continue
 		}
 		return nil
@@ -792,9 +835,7 @@ func (n *Node) FindContentProviders(contentHash string) ([]peer.AddrInfo, error)
 
 // RequestContentFromPeer requests content from a peer
 func (n *Node) RequestContentFromPeer(peerID peer.ID, contentHash string) ([]byte, *storage.ContentMetadata, error) {
-	const maxRetries = 3
-	const retryDelay = 100 * time.Millisecond
-
+	const maxRetries = 5
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		ctx, cancel := context.WithTimeout(n.ctx, 60*time.Second)
 		defer cancel()
@@ -808,7 +849,7 @@ func (n *Node) RequestContentFromPeer(peerID peer.ID, contentHash string) ([]byt
 				return nil, nil, fmt.Errorf("failed to open stream to %s after %d attempts: %w", peerID.String(), maxRetries, err)
 			}
 			networkRetriesTotal.Inc()
-			time.Sleep(retryDelay)
+			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
 			continue
 		}
 
@@ -821,13 +862,12 @@ func (n *Node) RequestContentFromPeer(peerID peer.ID, contentHash string) ([]byt
 				return nil, nil, fmt.Errorf("failed to send content request to %s after %d attempts: %w", peerID.String(), maxRetries, err)
 			}
 			networkRetriesTotal.Inc()
-			time.Sleep(retryDelay)
+			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
 			continue
 		}
 		stream.CloseWrite()
 
 		stream.SetReadDeadline(time.Now().Add(60 * time.Second))
-		// First, try to read an error message, which might contain the start of the actual message.
 		buf := make([]byte, 256)
 		nBytes, err := stream.Read(buf)
 		if err == nil && nBytes > 0 && bytes.HasPrefix(buf[:nBytes], []byte("ERROR:")) {
@@ -838,11 +878,10 @@ func (n *Node) RequestContentFromPeer(peerID peer.ID, contentHash string) ([]byt
 				return nil, nil, fmt.Errorf("remote error from %s: %s", peerID.String(), string(buf[:nBytes]))
 			}
 			networkRetriesTotal.Inc()
-			time.Sleep(retryDelay)
+			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
 			continue
 		}
 
-		// If there was an error reading, but it wasn't EOF, it's a real error.
 		if err != nil && err != io.EOF {
 			log.Printf("Attempt %d/%d: Failed to read initial response from %s: %v", attempt, maxRetries, peerID.String(), err)
 			networkErrorsTotal.WithLabelValues("read_response").Inc()
@@ -851,13 +890,11 @@ func (n *Node) RequestContentFromPeer(peerID peer.ID, contentHash string) ([]byt
 				return nil, nil, fmt.Errorf("failed to read response from %s after %d attempts: %w", peerID.String(), maxRetries, err)
 			}
 			networkRetriesTotal.Inc()
-			time.Sleep(retryDelay)
+			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
 			continue
 		}
 
-		// Combine the initial read buffer with the rest of the stream
 		combinedReader := io.MultiReader(bytes.NewReader(buf[:nBytes]), stream)
-
 		var metaLen uint32
 		if err := binary.Read(combinedReader, binary.BigEndian, &metaLen); err != nil {
 			log.Printf("Attempt %d/%d: Failed to read metadata length from %s: %v", attempt, maxRetries, peerID.String(), err)
@@ -867,7 +904,7 @@ func (n *Node) RequestContentFromPeer(peerID peer.ID, contentHash string) ([]byt
 				return nil, nil, fmt.Errorf("failed to read metadata length from %s after %d attempts: %w", peerID.String(), maxRetries, err)
 			}
 			networkRetriesTotal.Inc()
-			time.Sleep(retryDelay)
+			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
 			continue
 		}
 
@@ -880,7 +917,7 @@ func (n *Node) RequestContentFromPeer(peerID peer.ID, contentHash string) ([]byt
 				return nil, nil, fmt.Errorf("failed to read metadata from %s after %d attempts: %w", peerID.String(), maxRetries, err)
 			}
 			networkRetriesTotal.Inc()
-			time.Sleep(retryDelay)
+			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
 			continue
 		}
 
@@ -893,7 +930,7 @@ func (n *Node) RequestContentFromPeer(peerID peer.ID, contentHash string) ([]byt
 				return nil, nil, fmt.Errorf("failed to unmarshal metadata from %s after %d attempts: %w", peerID.String(), maxRetries, err)
 			}
 			networkRetriesTotal.Inc()
-			time.Sleep(retryDelay)
+			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
 			continue
 		}
 
@@ -906,7 +943,7 @@ func (n *Node) RequestContentFromPeer(peerID peer.ID, contentHash string) ([]byt
 				return nil, nil, fmt.Errorf("failed to read content from %s after %d attempts: %w", peerID.String(), maxRetries, err)
 			}
 			networkRetriesTotal.Inc()
-			time.Sleep(retryDelay)
+			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
 			continue
 		}
 
@@ -924,7 +961,7 @@ func (n *Node) RequestContentFromPeer(peerID peer.ID, contentHash string) ([]byt
 				return nil, nil, fmt.Errorf("content hash mismatch from %s: expected %s, got %s", peerID.String(), metadata.ContentHash.String(), receivedContentHash.String())
 			}
 			networkRetriesTotal.Inc()
-			time.Sleep(retryDelay)
+			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
 			continue
 		}
 
