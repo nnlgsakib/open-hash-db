@@ -244,11 +244,7 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string)
 		libp2p.EnableNATService(),
 		libp2p.EnableRelay(),
 		libp2p.EnableAutoRelayWithStaticRelays(addrInfos),
-		// libp2p.EnableRelayService(),
-		libp2p.EnableRelayService(
-			relayv2.WithLimit(nil), // no limit
-			relayv2.WithACL(nil),   // allow all peers to use this node as a relay
-		),
+		libp2p.EnableRelayService(),
 		libp2p.Security(noise.ID, noise.New),
 		libp2p.Transport(tcp.NewTCPTransport),
 		libp2p.Transport(quic.NewTransport),
@@ -268,11 +264,11 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string)
 		return nil, fmt.Errorf("failed to create libp2p host: %w", err)
 	}
 
-	// Relay service is now enabled via libp2p.EnableRelayService
-	// _, err = relayv2.New(h)
-	// if err != nil {
-	// 	log.Printf("Warning: failed to enable relay service: %v", err)
-	// }
+	// Enable relay service
+	_, err = relayv2.New(h)
+	if err != nil {
+		log.Printf("Warning: failed to enable relay service: %v", err)
+	}
 
 	nodeCtx, cancel := context.WithCancel(ctx)
 	node := &Node{
