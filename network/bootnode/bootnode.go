@@ -398,15 +398,15 @@ func NewBootNode(ctx context.Context, keyPath string, bootnodes []string, p2pPor
 			hash := hasher.HashBytes(append(pmsg.Data, []byte(peer.ID(pmsg.GetFrom()).String())...))
 			return base64.StdEncoding.EncodeToString(hash[:])
 		}),
-		pubsub.WithGossipSubParams(pubsub.GossipSubParams{
-			D:                 6,
-			Dlo:               4,
-			Dhi:               8,
-			Dlazy:             4,
-			HeartbeatInterval: 700 * time.Millisecond, // Fix for non-positive ticker
-			// Dscore:            0,
-			// FanoutTTL:         60 * time.Second,
-		}),
+		// pubsub.WithGossipSubParams(pubsub.GossipSubParams{
+		// 	D:                 6,
+		// 	Dlo:               4,
+		// 	Dhi:               8,
+		// 	Dlazy:             4,
+		// 	HeartbeatInterval: 700 * time.Millisecond, // Fix for non-positive ticker
+		// 	// Dscore:            0,
+		// 	// FanoutTTL:         60 * time.Second,
+		// }),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize pubsub: %w", err)

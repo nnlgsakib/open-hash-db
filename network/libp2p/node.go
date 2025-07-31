@@ -347,15 +347,15 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string)
 			hash := hasher.HashBytes(append(pmsg.Data, []byte(peer.ID(pmsg.GetFrom()).String())...))
 			return base64.StdEncoding.EncodeToString(hash[:])
 		}),
-		pubsub.WithGossipSubParams(pubsub.GossipSubParams{
-			D:                 6,
-			Dlo:               4,
-			Dhi:               8,
-			Dlazy:             4,
-			HeartbeatInterval: 700 * time.Millisecond, // Fix for non-positive ticker
-			// Dscore:            0,
-			// FanoutTTL:         60 * time.Second, // Fix for divide by zero
-		}),
+		// pubsub.WithGossipSubParams(pubsub.GossipSubParams{
+		// 	D:                 6,
+		// 	Dlo:               4,
+		// 	Dhi:               8,
+		// 	Dlazy:             4,
+		// 	HeartbeatInterval: 700 * time.Millisecond, // Fix for non-positive ticker
+		// 	// Dscore:            0,
+		// 	// FanoutTTL:         60 * time.Second, // Fix for divide by zero
+		// }),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize pubsub: %w", err)
