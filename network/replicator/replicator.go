@@ -11,34 +11,33 @@ import (
 	"openhashdb/core/hasher"
 	"openhashdb/core/storage"
 	"openhashdb/network/libp2p"
+	"openhashdb/network/mtr"
 
 	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
 // Metrics for monitoring
-var (
-	replicationRequestsTotal = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "openhashdb_replication_requests_total",
-			Help: "Total number of replication requests",
-		},
-		[]string{"type"},
-	)
-	replicationSuccessTotal = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Name: "openhashdb_replication_success_total",
-			Help: "Total number of successful replications",
-		},
-	)
-	replicationFailuresTotal = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Name: "openhashdb_replication_failures_total",
-			Help: "Total number of failed replications",
-		},
-	)
-)
+// var (
+// 	mtr.ReplicationRequestsTotal = promauto.NewCounterVec(
+// 		prometheus.CounterOpts{
+// 			Name: "openhashdb_replication_requests_total",
+// 			Help: "Total number of replication requests",
+// 		},
+// 		[]string{"type"},
+// 	)
+// 	mtr.ReplicationSuccessTotal = promauto.NewCounter(
+// 		prometheus.CounterOpts{
+// 			Name: "openhashdb_replication_success_total",
+// 			Help: "Total number of successful replications",
+// 		},
+// 	)
+// 	mtr.ReplicationFailuresTotal = promauto.NewCounter(
+// 		prometheus.CounterOpts{
+// 			Name: "openhashdb_replication_failures_total",
+// 			Help: "Total number of failed replications",
+// 		},
+// 	)
+// )
 
 // ReplicationFactor represents the desired number of replicas
 type ReplicationFactor int
@@ -115,8 +114,11 @@ func NewReplicator(storage *storage.Storage, node *libp2p.Node, replicationFacto
 		cancel:            cancel,
 	}
 
-	node.GossipHandler = r.handleGossipMessage
+	// Set the ChunkHandler for chunk messages
 	node.ChunkHandler = r.handleChunkMessage
+
+	// The Node already handles content announcements via readContentAnnounceLoop
+	// No need for a separate GossipHandler; content announcements are processed there
 	go r.announceContentPeriodically()
 	go r.cleanupPendingRequests()
 
@@ -137,23 +139,13 @@ func (r *Replicator) AnnounceContent(hash hasher.Hash, size int64) error {
 		return fmt.Errorf("content %s not found locally", hash.String())
 	}
 
+	// Use Node's AnnounceContent to publish to DHT and PubSub
 	if err := r.node.AnnounceContent(hash.String()); err != nil {
-		log.Printf("Warning: failed to announce content to DHT: %v", err)
+		log.Printf("Failed to announce content %s: %v", hash.String(), err)
+		return fmt.Errorf("failed to announce content: %w", err)
 	}
 
-	announcement := ContentAnnouncement{
-		Hash:      hash,
-		Size:      size,
-		Timestamp: time.Now(),
-		PeerID:    r.node.ID().String(),
-	}
-
-	data, err := json.Marshal(announcement)
-	if err != nil {
-		return fmt.Errorf("failed to marshal announcement: %w", err)
-	}
-
-	return r.node.BroadcastGossip(r.ctx, data)
+	return nil
 }
 
 // ReannounceAll re-announces all local content
@@ -236,12 +228,12 @@ func (r *Replicator) RequestChunk(hash hasher.Hash) ([]byte, error) {
 
 	// On-demand replication
 	if shouldReplicate {
-		replicationRequestsTotal.WithLabelValues("on_demand").Inc()
+		mtr.ReplicationRequestsTotal.WithLabelValues("on_demand").Inc()
 		if err := r.storage.StoreData(hash, data); err != nil {
-			replicationFailuresTotal.Inc()
+			mtr.ReplicationFailuresTotal.Inc()
 			log.Printf("Failed to replicate content %s: %v", hash.String(), err)
 		} else {
-			replicationSuccessTotal.Inc()
+			mtr.ReplicationSuccessTotal.Inc()
 			log.Printf("Replicated content %s locally after %d requests", hash.String(), tracker.Count)
 			if err := r.AnnounceContent(hash, metadata.Size); err != nil {
 				log.Printf("Failed to announce replicated content %s: %v", hash.String(), err)
@@ -297,28 +289,12 @@ func (r *Replicator) GetPinnedContent() map[string]int {
 	return result
 }
 
-// handleGossipMessage handles incoming gossip messages
-func (r *Replicator) handleGossipMessage(peerID peer.ID, data []byte) error {
-	var announcement ContentAnnouncement
-	if err := json.Unmarshal(data, &announcement); err == nil {
-		return r.handleContentAnnouncement(peerID, &announcement)
-	}
-
-	var request ChunkRequest
-	if err := json.Unmarshal(data, &request); err == nil {
-		return r.handleChunkRequest(peerID, &request)
-	}
-
-	log.Printf("Unknown gossip message from peer %s", peerID.String())
-	return nil
-}
-
 // handleContentAnnouncement handles content announcements
 func (r *Replicator) handleContentAnnouncement(peerID peer.ID, announcement *ContentAnnouncement) error {
-	// log.Printf("Received content announcement from %s: %s", peerID.String(), announcement.Hash.String())
+	log.Printf("Received content announcement from %s: %s", peerID.String(), announcement.Hash.String())
 
 	if r.storage.HasContent(announcement.Hash) {
-		// log.Printf("Content %s already exists locally, skipping replication and announcement", announcement.Hash.String())
+		log.Printf("Content %s already exists locally, skipping replication", announcement.Hash.String())
 		return nil
 	}
 
@@ -346,24 +322,24 @@ func (r *Replicator) handleContentAnnouncement(peerID peer.ID, announcement *Con
 
 	data, metadata, err := r.node.RequestContentFromPeer(peerID, announcement.Hash.String())
 	if err != nil {
-		replicationFailuresTotal.Inc()
+		mtr.ReplicationFailuresTotal.Inc()
 		log.Printf("Failed to fetch content %s from %s: %v", announcement.Hash.String(), peerID.String(), err)
 		return nil
 	}
 
 	if err := r.storage.StoreData(announcement.Hash, data); err != nil {
-		replicationFailuresTotal.Inc()
+		mtr.ReplicationFailuresTotal.Inc()
 		log.Printf("Failed to store replicated content %s: %v", announcement.Hash.String(), err)
 		return nil
 	}
 
 	if err := r.storage.StoreContent(metadata); err != nil {
-		replicationFailuresTotal.Inc()
+		mtr.ReplicationFailuresTotal.Inc()
 		log.Printf("Failed to store replicated metadata %s: %v", announcement.Hash.String(), err)
 		return nil
 	}
 
-	replicationSuccessTotal.Inc()
+	mtr.ReplicationSuccessTotal.Inc()
 	log.Printf("Successfully replicated content %s from %s", announcement.Hash.String(), peerID.String())
 	if err := r.AnnounceContent(announcement.Hash, metadata.Size); err != nil {
 		log.Printf("Failed to announce replicated content %s: %v", announcement.Hash.String(), err)
