@@ -20,6 +20,7 @@ import (
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	kbucket "github.com/libp2p/go-libp2p-kbucket"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
@@ -32,6 +33,7 @@ import (
 	quic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
 	"github.com/multiformats/go-multiaddr"
+	"github.com/patrickmn/go-cache"
 )
 
 // Constants
@@ -51,6 +53,8 @@ const (
 	ValidateBufferSize        = 1024
 	SubscribeOutputBufferSize = 1024
 	DefaultBucketSize         = 20
+	AnnouncementCacheTTL      = 5 * time.Minute
+	AnnouncementCacheCleanup  = 10 * time.Minute
 )
 
 // PeerEvent represents a peer discovery, connection, or disconnection event
@@ -77,6 +81,7 @@ type BootNode struct {
 	temporaryDials        sync.Map
 	peerEvents            []PeerEvent
 	peerEventsMu          sync.RWMutex
+	announcementCache     *cache.Cache
 	PeerConnectedCallback func(peer.ID)
 }
 
@@ -368,12 +373,16 @@ func NewBootNode(ctx context.Context, keyPath string, bootnodes []string, p2pPor
 		return nil, fmt.Errorf("failed to create libp2p host: %w", err)
 	}
 
-	// Initialize PubSub
+	// Initialize PubSub with message deduplication
 	ps, err := pubsub.NewGossipSub(
 		ctx,
 		h,
 		pubsub.WithPeerOutboundQueueSize(PeerOutboundBufferSize),
 		pubsub.WithValidateQueueSize(ValidateBufferSize),
+		pubsub.WithMessageIdFn(func(pmsg *pb.Message) string {
+			// Use content hash and sender ID for message ID to prevent duplicates
+			return fmt.Sprintf("%s:%s", string(pmsg.Data), peer.ID(pmsg.GetFrom()).String())
+		}),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize pubsub: %w", err)
@@ -398,6 +407,7 @@ func NewBootNode(ctx context.Context, keyPath string, bootnodes []string, p2pPor
 		connectionCounts:      NewBlankConnectionInfo(MaxInboundPeers, MaxOutboundPeers),
 		bootnodes:             &bootnodesWrapper{bootnodeArr: bootnodeArr, bootnodesMap: bootnodesMap},
 		peerEvents:            make([]PeerEvent, 0, MaxPeerEventLogs),
+		announcementCache:     cache.New(AnnouncementCacheTTL, AnnouncementCacheCleanup),
 		PeerConnectedCallback: func(p peer.ID) {},
 	}
 
@@ -614,14 +624,21 @@ func (bn *BootNode) readContentAnnounceLoop(sub *pubsub.Subscription) {
 			mtr.NetworkErrorsTotal.WithLabelValues("read_content_announce").Inc()
 			continue
 		}
-		log.Printf("Forwarding content announcement from %s", msg.GetFrom().String())
-		addrs := bn.host.Peerstore().Addrs(msg.GetFrom())
+		hashStr := string(msg.Data)
+		peerID := msg.GetFrom()
+		cacheKey := fmt.Sprintf("%s:%s", hashStr, peerID.String())
+		if _, found := bn.announcementCache.Get(cacheKey); found {
+			continue // Skip duplicate announcement
+		}
+		bn.announcementCache.Set(cacheKey, true, AnnouncementCacheTTL)
+		log.Printf("Forwarding content announcement for %s from %s", hashStr, peerID.String())
+		addrs := bn.host.Peerstore().Addrs(peerID)
 		if len(addrs) > 0 {
-			bn.host.Peerstore().AddAddr(msg.GetFrom(), addrs[0], peerstore.TempAddrTTL)
+			bn.host.Peerstore().AddAddr(peerID, addrs[0], peerstore.TempAddrTTL)
 		}
 		// Re-publish the announcement to ensure propagation
 		if err := bn.contentAnnounceTopic.Publish(bn.ctx, msg.Data); err != nil {
-			log.Printf("Failed to forward content announcement: %v", err)
+			log.Printf("Failed to forward content announcement for %s: %v", hashStr, err)
 			mtr.NetworkErrorsTotal.WithLabelValues("publish_content_announce").Inc()
 		} else {
 			mtr.NetworkMessagesTotal.WithLabelValues("content_announce").Inc()

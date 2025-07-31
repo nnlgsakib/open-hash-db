@@ -20,7 +20,6 @@ import (
 
 	"openhashdb/core/hasher"
 	"openhashdb/core/storage"
-
 	"openhashdb/network/mtr"
 
 	"github.com/ipfs/go-cid"
@@ -28,6 +27,7 @@ import (
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	kbucket "github.com/libp2p/go-libp2p-kbucket"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
@@ -41,43 +41,8 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/multiformats/go-multihash"
+	"github.com/patrickmn/go-cache"
 )
-
-// Metrics
-// var (
-// 	NetworkMessagesTotal = promauto.NewCounterVec(
-// 		prometheus.CounterOpts{
-// 			Name: "openhashdb_network_messages_total",
-// 			Help: "Total number of network messages",
-// 		},
-// 		[]string{"type"},
-// 	)
-// 	NetworkErrorsTotal = promauto.NewCounterVec(
-// 		prometheus.CounterOpts{
-// 			Name: "openhashdb_network_errors_total",
-// 			Help: "Total number of network errors",
-// 		},
-// 		[]string{"type"},
-// 	)
-// 	NetworkRetriesTotal = promauto.NewCounter(
-// 		prometheus.CounterOpts{
-// 			Name: "openhashdb_network_retries_total",
-// 			Help: "Total number of network operation retries",
-// 		},
-// 	)
-// 	peerConnectionsTotal = promauto.NewCounter(
-// 		prometheus.CounterOpts{
-// 			Name: "openhashdb_peer_connections_total",
-// 			Help: "Total number of peer connections",
-// 		},
-// 	)
-// 	peerDisconnectionsTotal = promauto.NewCounter(
-// 		prometheus.CounterOpts{
-// 			Name: "openhashdb_peer_disconnections_total",
-// 			Help: "Total number of peer disconnections",
-// 		},
-// 	)
-// )
 
 const (
 	ProtocolContentExchange   = protocol.ID("/openhashdb/content/1.0.0")
@@ -95,6 +60,8 @@ const (
 	ValidateBufferSize        = 1024
 	SubscribeOutputBufferSize = 1024
 	DefaultBucketSize         = 20
+	AnnouncementCacheTTL      = 5 * time.Minute
+	AnnouncementCacheCleanup  = 10 * time.Minute
 )
 
 // PeerEvent represents a peer discovery, connection, or disconnection event
@@ -122,6 +89,7 @@ type Node struct {
 	temporaryDials        sync.Map
 	peerEvents            []PeerEvent
 	peerEventsMu          sync.RWMutex
+	announcementCache     *cache.Cache
 	ContentHandler        func(peer.ID, []byte) error
 	ChunkHandler          func(peer.ID, []byte) error
 	PeerConnectedCallback func(peer.ID)
@@ -367,17 +335,20 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string)
 		return nil, fmt.Errorf("failed to create libp2p host: %w", err)
 	}
 
-	// Initialize PubSub
+	// Initialize PubSub with message deduplication
 	ps, err := pubsub.NewGossipSub(
 		ctx,
 		h,
 		pubsub.WithPeerOutboundQueueSize(PeerOutboundBufferSize),
 		pubsub.WithValidateQueueSize(ValidateBufferSize),
+		pubsub.WithMessageIdFn(func(pmsg *pb.Message) string {
+			// Use content hash and sender ID for message ID to prevent duplicates
+			return fmt.Sprintf("%s:%s", string(pmsg.Data), peer.ID(pmsg.GetFrom()).String())
+		}),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize pubsub: %w", err)
 	}
-
 	// Join content announcement topic
 	contentAnnounceTopic, err := ps.Join(TopicContentAnnounce)
 	if err != nil {
@@ -386,20 +357,18 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string)
 
 	nodeCtx, cancel := context.WithCancel(ctx)
 	node := &Node{
-		host:                 h,
-		ctx:                  nodeCtx,
-		cancel:               cancel,
-		dht:                  nodeDHT,
-		routingTable:         routingTable,
-		pubsub:               ps,
-		contentAnnounceTopic: contentAnnounceTopic,
-		dialQueue:            NewDialQueue(),
-		connectionCounts:     NewBlankConnectionInfo(MaxInboundPeers, MaxOutboundPeers),
-		bootnodes: &bootnodesWrapper{
-			bootnodeArr:  bootnodeArr,
-			bootnodesMap: bootnodesMap,
-		},
+		host:                  h,
+		ctx:                   nodeCtx,
+		cancel:                cancel,
+		dht:                   nodeDHT,
+		routingTable:          routingTable,
+		pubsub:                ps,
+		contentAnnounceTopic:  contentAnnounceTopic,
+		dialQueue:             NewDialQueue(),
+		connectionCounts:      NewBlankConnectionInfo(MaxInboundPeers, MaxOutboundPeers),
+		bootnodes:             &bootnodesWrapper{bootnodeArr: bootnodeArr, bootnodesMap: bootnodesMap},
 		peerEvents:            make([]PeerEvent, 0, MaxPeerEventLogs),
+		announcementCache:     cache.New(AnnouncementCacheTTL, AnnouncementCacheCleanup),
 		PeerConnectedCallback: func(p peer.ID) {},
 	}
 
@@ -480,7 +449,7 @@ func loadOrCreateIdentity(keyPath string) (crypto.PrivKey, error) {
 
 // DefaultBootnodes for the VPS-hosted default node
 var DefaultBootnodes = []string{
-	// "/ip4/148.251.35.204/tcp/9090/p2p/QmYQMdZkvC4R7DHqSkCKNh89Hs7gDPLjx9j9xnPsUkkS2P",
+	"/ip4/148.251.35.204/tcp/9090/p2p/QmYQMdZkvC4R7DHqSkCKNh89Hs7gDPLjx9j9xnPsUkkS2P",
 }
 
 // convertBootnodesToAddrInfo converts multiaddresses to peer.AddrInfo
@@ -976,10 +945,28 @@ func (n *Node) readContentAnnounceLoop(sub *pubsub.Subscription) {
 			continue
 		}
 		hashStr := string(msg.Data)
-		log.Printf("Received content announcement for %s from %s", hashStr, msg.GetFrom().String())
-		addrs := n.host.Peerstore().Addrs(msg.GetFrom())
+		peerID := msg.GetFrom()
+		cacheKey := fmt.Sprintf("%s:%s", hashStr, peerID.String())
+		if _, found := n.announcementCache.Get(cacheKey); found {
+			continue // Skip duplicate announcement
+		}
+		n.announcementCache.Set(cacheKey, true, AnnouncementCacheTTL)
+		log.Printf("Received content announcement for %s from %s", hashStr, peerID.String())
+		addrs := n.host.Peerstore().Addrs(peerID)
 		if len(addrs) > 0 {
-			n.host.Peerstore().AddAddr(msg.GetFrom(), addrs[0], peerstore.TempAddrTTL)
+			n.host.Peerstore().AddAddr(peerID, addrs[0], peerstore.TempAddrTTL)
+		}
+		// Automatically attempt to fetch content if not already stored
+		if n.storage != nil {
+			hash, err := hasher.HashFromString(hashStr)
+			if err == nil && n.storage.ValidateContent(hash) != nil {
+				go func() {
+					_, _, err := n.RequestContentFromPeer(peerID, hashStr)
+					if err != nil {
+						log.Printf("Failed to fetch content %s from %s: %v", hashStr, peerID.String(), err)
+					}
+				}()
+			}
 		}
 	}
 }
@@ -1024,7 +1011,13 @@ func (n *Node) AnnounceContent(contentHashStr string) error {
 			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
 			continue
 		}
-		// Announce via PubSub
+		// Announce via PubSub with throttling
+		cacheKey := fmt.Sprintf("%s:%s", contentHashStr, n.ID().String())
+		if _, found := n.announcementCache.Get(cacheKey); found {
+			log.Printf("Skipping duplicate announcement for %s", contentHashStr)
+			return nil
+		}
+		n.announcementCache.Set(cacheKey, true, AnnouncementCacheTTL)
 		if err := n.contentAnnounceTopic.Publish(n.ctx, []byte(contentHashStr)); err != nil {
 			log.Printf("Failed to publish content announcement for %s: %v", contentHashStr, err)
 			mtr.NetworkErrorsTotal.WithLabelValues("publish_content_announce").Inc()
@@ -1074,6 +1067,17 @@ func (n *Node) RequestContentFromPeer(peerID peer.ID, contentHash string) ([]byt
 		ctx, cancel := context.WithTimeout(n.ctx, 60*time.Second)
 		defer cancel()
 		log.Printf("Attempt %d/%d: Requesting content %s from %s", attempt, maxRetries, contentHash, peerID.String())
+		// Ensure connectivity
+		if n.host.Network().Connectedness(peerID) != network.Connected {
+			if err := n.host.Connect(ctx, peer.AddrInfo{ID: peerID, Addrs: n.host.Peerstore().Addrs(peerID)}); err != nil {
+				log.Printf("Attempt %d/%d: Failed to connect to %s: %v", attempt, maxRetries, peerID.String(), err)
+				if attempt == maxRetries {
+					return nil, nil, fmt.Errorf("failed to connect to %s after %d attempts: %w", peerID.String(), maxRetries, err)
+				}
+				time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
+				continue
+			}
+		}
 		stream, err := n.host.NewStream(ctx, peerID, ProtocolContentExchange)
 		if err != nil {
 			log.Printf("Attempt %d/%d: Failed to open stream to %s: %v", attempt, maxRetries, peerID.String(), err)
