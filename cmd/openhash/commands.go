@@ -342,7 +342,7 @@ func initAll() error {
 	// Initialize libp2p node
 	ctx := context.Background()
 	var err error
-	node, err = libp2p.NewNodeWithKeyPath(ctx, bootnodeAddrs, actualKeyPath)
+	node, err = libp2p.NewNodeWithKeyPath(ctx, bootnodeAddrs, actualKeyPath, p2pPort)
 	if err != nil {
 		return fmt.Errorf("failed to initialize libp2p node: %w", err)
 	}

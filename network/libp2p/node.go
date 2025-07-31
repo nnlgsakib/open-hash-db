@@ -36,6 +36,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/core/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	quic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
@@ -62,7 +63,9 @@ const (
 	DefaultBucketSize         = 20
 	AnnouncementCacheTTL      = 5 * time.Minute
 	AnnouncementCacheCleanup  = 10 * time.Minute
-	AnnouncementRateLimit     = 1 * time.Second // New: Rate limit for processing announcements
+	AnnouncementRateLimit     = 1 * time.Second
+	RelayReservationTTL       = 2 * time.Hour
+	MaxRelayReservations      = 100
 )
 
 // PeerEvent represents a peer discovery, connection, or disconnection event
@@ -94,8 +97,9 @@ type Node struct {
 	ContentHandler        func(peer.ID, []byte) error
 	ChunkHandler          func(peer.ID, []byte) error
 	PeerConnectedCallback func(peer.ID)
-	announceRateLimit     map[string]time.Time // New: Track last announcement time per peer
+	announceRateLimit     map[string]time.Time
 	announceRateLimitMu   sync.Mutex
+	relayService          *relayv2.Relay
 }
 
 // ConnectionInfo tracks connection limits and counts
@@ -253,8 +257,64 @@ type bootnodesWrapper struct {
 	bootnodesMap map[peer.ID]*peer.AddrInfo
 }
 
+// DefaultBootnodes for the VPS-hosted default node
+var DefaultBootnodes = []string{
+	"/ip4/148.251.35.204/tcp/9090/p2p/QmYQMdZkvC4R7DHqSkCKNh89Hs7gDPLjx9j9xnPsUkkS2P",
+}
+
+// loadOrCreateIdentity loads or creates a private key
+func loadOrCreateIdentity(keyPath string) (crypto.PrivKey, error) {
+	if err := os.MkdirAll(filepath.Dir(keyPath), 0755); err != nil {
+		return nil, fmt.Errorf("failed to create key directory: %w", err)
+	}
+	if keyData, err := os.ReadFile(keyPath); err == nil {
+		keyBytes, err := base64.StdEncoding.DecodeString(string(keyData))
+		if err != nil {
+			log.Printf("Warning: failed to decode key, creating new: %v", err)
+		} else {
+			privKey, err := crypto.UnmarshalPrivateKey(keyBytes)
+			if err == nil {
+				log.Printf("Loaded identity from %s", keyPath)
+				return privKey, nil
+			}
+			log.Printf("Warning: failed to unmarshal key, creating new: %v", err)
+		}
+	}
+	log.Printf("Generating new identity at %s", keyPath)
+	privKey, _, err := crypto.GenerateKeyPairWithReader(crypto.RSA, 2048, rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate key pair: %w", err)
+	}
+	keyBytes, err := crypto.MarshalPrivateKey(privKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal private key: %w", err)
+	}
+	keyData := base64.StdEncoding.EncodeToString(keyBytes)
+	if err := os.WriteFile(keyPath, []byte(keyData), 0600); err != nil {
+		return nil, fmt.Errorf("failed to save private key: %w", err)
+	}
+	return privKey, nil
+}
+
+// convertBootnodesToAddrInfo converts multiaddresses to peer.AddrInfo
+func convertBootnodesToAddrInfo(bootnodes []string) ([]peer.AddrInfo, error) {
+	var addrInfos []peer.AddrInfo
+	for _, addr := range bootnodes {
+		if addr == "" {
+			continue
+		}
+		addrInfo, err := peer.AddrInfoFromString(addr)
+		if err != nil {
+			log.Printf("Failed to parse bootnode address %s: %v", addr, err)
+			continue
+		}
+		addrInfos = append(addrInfos, *addrInfo)
+	}
+	return addrInfos, nil
+}
+
 // NewNodeWithKeyPath creates a new libp2p node
-func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string) (*Node, error) {
+func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string, p2pPort int) (*Node, error) {
 	var privKey crypto.PrivKey
 	var err error
 	if keyPath != "" {
@@ -268,6 +328,11 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string)
 		if err != nil {
 			return nil, fmt.Errorf("failed to generate ephemeral key: %w", err)
 		}
+	}
+
+	listenAddrs := []string{
+		fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", p2pPort),
+		fmt.Sprintf("/ip4/0.0.0.0/udp/%d/quic-v1", p2pPort),
 	}
 
 	// Combine bootnodes
@@ -286,13 +351,13 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string)
 
 	var nodeDHT *dht.IpfsDHT
 	var routingTable *kbucket.RoutingTable
+	var relayService *relayv2.Relay
 	h, err := libp2p.New(
 		libp2p.Identity(privKey),
-		libp2p.ListenAddrStrings(
-			"/ip4/0.0.0.0/tcp/0",
-			"/ip4/0.0.0.0/udp/0/quic-v1",
-		),
+		libp2p.ListenAddrStrings(listenAddrs...),
 		libp2p.EnableRelay(),
+		libp2p.EnableRelayService(relayv2.WithResources(relayv2.DefaultResources())),
+		libp2p.EnableHolePunching(),
 		libp2p.EnableAutoRelayWithPeerSource(func(ctx context.Context, numPeers int) <-chan peer.AddrInfo {
 			peerChan := make(chan peer.AddrInfo, numPeers)
 			go func() {
@@ -337,7 +402,13 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string)
 		return nil, fmt.Errorf("failed to create libp2p host: %w", err)
 	}
 
-	// Initialize PubSub with enhanced message deduplication
+	// Initialize circuit relay v2 service
+	relayService, err = relayv2.New(h, relayv2.WithResources(relayv2.DefaultResources()))
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize relay service: %w", err)
+	}
+
+	// Initialize PubSub with message deduplication consistent with bootnode.go
 	ps, err := pubsub.NewGossipSub(
 		ctx,
 		h,
@@ -347,19 +418,7 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string)
 			hash := hasher.HashBytes(append(pmsg.Data, []byte(peer.ID(pmsg.GetFrom()).String())...))
 			return base64.StdEncoding.EncodeToString(hash[:])
 		}),
-		// pubsub.WithGossipSubParams(pubsub.GossipSubParams{
-		// 	D:                 6,
-		// 	Dlo:               4,
-		// 	Dhi:               8,
-		// 	Dlazy:             4,
-		// 	HeartbeatInterval: 700 * time.Millisecond, // Fix for non-positive ticker
-		// 	// Dscore:            0,
-		// 	// FanoutTTL:         60 * time.Second, // Fix for divide by zero
-		// }),
 	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize pubsub: %w", err)
-	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize pubsub: %w", err)
 	}
@@ -385,6 +444,7 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string)
 		peerEvents:            make([]PeerEvent, 0, MaxPeerEventLogs),
 		announcementCache:     cache.New(AnnouncementCacheTTL, AnnouncementCacheCleanup),
 		announceRateLimit:     make(map[string]time.Time),
+		relayService:          relayService,
 		PeerConnectedCallback: func(p peer.ID) {},
 	}
 
@@ -427,62 +487,6 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string)
 	}()
 
 	return node, nil
-}
-
-// loadOrCreateIdentity loads or creates a private key
-func loadOrCreateIdentity(keyPath string) (crypto.PrivKey, error) {
-	if err := os.MkdirAll(filepath.Dir(keyPath), 0755); err != nil {
-		return nil, fmt.Errorf("failed to create key directory: %w", err)
-	}
-	if keyData, err := os.ReadFile(keyPath); err == nil {
-		keyBytes, err := base64.StdEncoding.DecodeString(string(keyData))
-		if err != nil {
-			log.Printf("Warning: failed to decode key, creating new: %v", err)
-		} else {
-			privKey, err := crypto.UnmarshalPrivateKey(keyBytes)
-			if err == nil {
-				log.Printf("Loaded identity from %s", keyPath)
-				return privKey, nil
-			}
-			log.Printf("Warning: failed to unmarshal key, creating new: %v", err)
-		}
-	}
-	log.Printf("Generating new identity at %s", keyPath)
-	privKey, _, err := crypto.GenerateKeyPairWithReader(crypto.RSA, 2048, rand.Reader)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate key pair: %w", err)
-	}
-	keyBytes, err := crypto.MarshalPrivateKey(privKey)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal private key: %w", err)
-	}
-	keyData := base64.StdEncoding.EncodeToString(keyBytes)
-	if err := os.WriteFile(keyPath, []byte(keyData), 0600); err != nil {
-		return nil, fmt.Errorf("failed to save private key: %w", err)
-	}
-	return privKey, nil
-}
-
-// DefaultBootnodes for the VPS-hosted default node
-var DefaultBootnodes = []string{
-	"/ip4/148.251.35.204/tcp/9090/p2p/QmYQMdZkvC4R7DHqSkCKNh89Hs7gDPLjx9j9xnPsUkkS2P",
-}
-
-// convertBootnodesToAddrInfo converts multiaddresses to peer.AddrInfo
-func convertBootnodesToAddrInfo(bootnodes []string) ([]peer.AddrInfo, error) {
-	var addrInfos []peer.AddrInfo
-	for _, addr := range bootnodes {
-		if addr == "" {
-			continue
-		}
-		addrInfo, err := peer.AddrInfoFromString(addr)
-		if err != nil {
-			log.Printf("Failed to parse bootnode address %s: %v", addr, err)
-			continue
-		}
-		addrInfos = append(addrInfos, *addrInfo)
-	}
-	return addrInfos, nil
 }
 
 // logPeerEvent logs a peer event
@@ -566,12 +570,15 @@ type discoveryNotifee struct {
 }
 
 func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
+	if pi.ID == n.node.host.ID() {
+		return // Prevent self-discovery
+	}
 	addrs := make([]string, 0, len(pi.Addrs))
 	for _, addr := range pi.Addrs {
 		addrs = append(addrs, addr.String())
 	}
 	n.node.logPeerEvent(pi.ID, "discovered", addrs)
-	n.node.dialQueue.AddTask(&pi, 1) // Priority 1 for discovered peers
+	n.node.dialQueue.AddTask(&pi, 1)
 }
 
 // startDiscovery runs peer discovery loops
@@ -660,7 +667,7 @@ func (n *Node) getRandomPeer() *peer.ID {
 func (n *Node) getRandomBootnode() *peer.AddrInfo {
 	nonConnectedNodes := make([]*peer.AddrInfo, 0, len(n.bootnodes.bootnodeArr))
 	for _, v := range n.bootnodes.bootnodeArr {
-		if n.host.Network().Connectedness(v.ID) != network.Connected {
+		if v.ID != n.host.ID() && n.host.Network().Connectedness(v.ID) != network.Connected {
 			nonConnectedNodes = append(nonConnectedNodes, v)
 		}
 	}
@@ -689,6 +696,9 @@ func (n *Node) runDial() {
 				break
 			}
 			peerInfo := tt.GetAddrInfo()
+			if peerInfo.ID == n.host.ID() {
+				continue // Prevent self-dial
+			}
 			if n.host.Network().Connectedness(peerInfo.ID) == network.Connected {
 				continue
 			}
@@ -705,8 +715,17 @@ func (n *Node) runDial() {
 					if err := n.host.Connect(ctxDial, *pi); err != nil {
 						log.Printf("Direct dial to %s failed: %v, attempting relay", pi.ID.String(), err)
 						mtr.NetworkErrorsTotal.WithLabelValues("dial_direct").Inc()
+						// Filter out invalid addresses
+						validAddrs := make([]multiaddr.Multiaddr, 0, len(pi.Addrs))
+						for _, addr := range pi.Addrs {
+							if !isInvalidAddr(addr) {
+								validAddrs = append(validAddrs, addr)
+							}
+						}
+						pi.Addrs = validAddrs
 						// Try relayed connection via a bootnode
-						if bootnode := n.getRandomBootnode(); bootnode != nil {
+						bootnode := n.getRandomBootnode()
+						if bootnode != nil && bootnode.ID != pi.ID {
 							log.Printf("Attempting relayed connection to %s via %s", pi.ID.String(), bootnode.ID.String())
 							ctxRelay, cancelRelay := context.WithTimeout(ctx, 30*time.Second)
 							defer cancelRelay()
@@ -723,6 +742,8 @@ func (n *Node) runDial() {
 							} else {
 								log.Printf("Successfully connected to %s via relay %s", pi.ID.String(), bootnode.ID.String())
 							}
+						} else {
+							log.Printf("No suitable bootnode available for relay to %s", pi.ID.String())
 						}
 					} else {
 						log.Printf("Successfully connected to %s (direct)", pi.ID.String())
@@ -731,6 +752,21 @@ func (n *Node) runDial() {
 			}
 		}
 	}
+}
+
+// isInvalidAddr checks if an address is likely to cause connection issues
+func isInvalidAddr(addr multiaddr.Multiaddr) bool {
+	// Filter out localhost or unspecified addresses for external peers
+	components := multiaddr.Split(addr)
+	for _, comp := range components {
+		if comp.Protocol().Code == multiaddr.P_IP4 {
+			ip := comp.Value()
+			if ip == "127.0.0.1" || ip == "0.0.0.0" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // keepAliveMinimumPeerConnections ensures minimum connections
@@ -754,24 +790,36 @@ func (n *Node) keepAliveMinimumPeerConnections() {
 
 // Close shuts down the node
 func (n *Node) Close() error {
+	var errs []error
 	if n.mdns != nil {
 		if err := n.mdns.Close(); err != nil {
-			log.Printf("Error closing mDNS: %v", err)
+			errs = append(errs, fmt.Errorf("error closing mDNS: %w", err))
 		}
 	}
 	if n.contentAnnounceTopic != nil {
 		if err := n.contentAnnounceTopic.Close(); err != nil {
-			log.Printf("Error closing content announce topic: %v", err)
+			errs = append(errs, fmt.Errorf("error closing content announce topic: %w", err))
 		}
 	}
 	if n.dht != nil {
 		if err := n.dht.Close(); err != nil {
-			log.Printf("Error closing DHT: %v", err)
+			errs = append(errs, fmt.Errorf("error closing DHT: %w", err))
+		}
+	}
+	if n.relayService != nil {
+		if err := n.relayService.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("error closing relay service: %w", err))
 		}
 	}
 	n.dialQueue.Close()
 	n.cancel()
-	return n.host.Close()
+	if err := n.host.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("error closing host: %w", err))
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("errors during shutdown: %v", errs)
+	}
+	return nil
 }
 
 // ID returns the node's peer ID
@@ -799,18 +847,27 @@ func (n *Node) Connect(ctx context.Context, peerAddr string) error {
 	if err != nil {
 		return fmt.Errorf("failed to parse peer address %s: %w", peerAddr, err)
 	}
+	if addrInfo.ID == n.host.ID() {
+		return fmt.Errorf("cannot connect to self: %s", addrInfo.ID.String())
+	}
 	n.dialQueue.AddTask(addrInfo, 1)
 	return nil
 }
 
 // SendContent sends content to a peer
 func (n *Node) SendContent(ctx context.Context, peerID peer.ID, data []byte) error {
+	if peerID == n.host.ID() {
+		return fmt.Errorf("cannot send to self: %s", peerID.String())
+	}
 	mtr.NetworkMessagesTotal.WithLabelValues("content").Inc()
 	return n.sendData(ctx, peerID, ProtocolContentExchange, data)
 }
 
 // SendChunk sends a chunk to a peer
 func (n *Node) SendChunk(ctx context.Context, peerID peer.ID, data []byte) error {
+	if peerID == n.host.ID() {
+		return fmt.Errorf("cannot send to self: %s", peerID.String())
+	}
 	mtr.NetworkMessagesTotal.WithLabelValues("chunk").Inc()
 	return n.sendData(ctx, peerID, ProtocolChunkExchange, data)
 }
@@ -823,10 +880,10 @@ func (n *Node) sendData(ctx context.Context, peerID peer.ID, protocolID protocol
 		defer cancel()
 		stream, err := n.host.NewStream(ctx, peerID, protocolID)
 		if err != nil {
-			log.Printf("Attempt %d/%d: Failed to open stream to %s: %v", attempt, maxRetries, peerID.String(), err)
-			mtr.NetworkErrorsTotal.WithLabelValues("send_data").Inc()
+			log.Printf("Attempt %d/%d: Failed to open stream to %s for %s: %v", attempt, maxRetries, peerID.String(), protocolID, err)
+			mtr.NetworkErrorsTotal.WithLabelValues("send_data_open_stream").Inc()
 			if attempt == maxRetries {
-				return fmt.Errorf("failed to open stream to %s after %d attempts: %w", peerID.String(), maxRetries, err)
+				return fmt.Errorf("failed to open stream to %s for %s after %d attempts: %w", peerID.String(), protocolID, maxRetries, err)
 			}
 			mtr.NetworkRetriesTotal.Inc()
 			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
@@ -835,18 +892,23 @@ func (n *Node) sendData(ctx context.Context, peerID peer.ID, protocolID protocol
 		defer stream.Close()
 		stream.SetWriteDeadline(time.Now().Add(30 * time.Second))
 		if _, err := stream.Write(data); err != nil {
-			log.Printf("Attempt %d/%d: Failed to write data to %s: %v", attempt, maxRetries, peerID.String(), err)
-			mtr.NetworkErrorsTotal.WithLabelValues("send_data").Inc()
+			log.Printf("Attempt %d/%d: Failed to write data to %s for %s: %v", attempt, maxRetries, peerID.String(), protocolID, err)
+			mtr.NetworkErrorsTotal.WithLabelValues("send_data_write").Inc()
 			if attempt == maxRetries {
-				return fmt.Errorf("failed to write data to %s after %d attempts: %w", peerID.String(), maxRetries, err)
+				return fmt.Errorf("failed to write data to %s for %s after %d attempts: %w", peerID.String(), protocolID, maxRetries, err)
 			}
 			mtr.NetworkRetriesTotal.Inc()
 			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
 			continue
 		}
+		if err := stream.CloseWrite(); err != nil {
+			log.Printf("Attempt %d/%d: Failed to close write stream to %s for %s: %v", attempt, maxRetries, peerID.String(), protocolID, err)
+			mtr.NetworkErrorsTotal.WithLabelValues("send_data_close_write").Inc()
+			continue
+		}
 		return nil
 	}
-	return fmt.Errorf("failed to send data to %s: max retries exceeded", peerID.String())
+	return fmt.Errorf("failed to send data to %s for %s: max retries exceeded", peerID.String(), protocolID)
 }
 
 // handleContentStream handles content streams
@@ -879,17 +941,12 @@ func (n *Node) handleContentStream(stream network.Stream) {
 		_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: invalid hash: %v", err)))
 		return
 	}
-	if err := n.storage.ValidateContent(hash); err != nil {
-		log.Printf("Content validation failed for %s from %s: %v", contentHashStr, remotePeer.String(), err)
-		mtr.NetworkErrorsTotal.WithLabelValues("content_validation").Inc()
-		_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: %v", err)))
-		return
-	}
+	// Check if content exists before proceeding
 	metadata, err := n.storage.GetContent(hash)
 	if err != nil {
-		log.Printf("Failed to get metadata for %s from %s: %v", contentHashStr, remotePeer.String(), err)
+		log.Printf("Content metadata not found for %s from %s: %v", contentHashStr, remotePeer.String(), err)
 		mtr.NetworkErrorsTotal.WithLabelValues("get_metadata").Inc()
-		_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: failed to get metadata: %v", err)))
+		_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: content not found: %v", err)))
 		return
 	}
 	dataStream, err := n.storage.GetDataStream(hash)
@@ -983,20 +1040,23 @@ func (n *Node) readContentAnnounceLoop(sub *pubsub.Subscription) {
 		}
 		hashStr := string(msg.Data)
 		peerID := msg.GetFrom()
+		if peerID == n.host.ID() {
+			continue // Skip self-announcements
+		}
 		cacheKey := fmt.Sprintf("%s:%s", hashStr, peerID.String())
 
 		// Rate limit announcements per peer
 		n.announceRateLimitMu.Lock()
 		if lastAnnounce, exists := n.announceRateLimit[cacheKey]; exists && time.Since(lastAnnounce) < AnnouncementRateLimit {
 			n.announceRateLimitMu.Unlock()
-			continue // Skip if rate limit exceeded
+			continue
 		}
 		n.announceRateLimit[cacheKey] = time.Now()
 		n.announceRateLimitMu.Unlock()
 
 		// Check announcement cache
 		if _, found := n.announcementCache.Get(cacheKey); found {
-			continue // Skip duplicate announcement
+			continue
 		}
 		n.announcementCache.Set(cacheKey, true, AnnouncementCacheTTL)
 		log.Printf("Received content announcement for %s from %s", hashStr, peerID.String())
@@ -1007,26 +1067,28 @@ func (n *Node) readContentAnnounceLoop(sub *pubsub.Subscription) {
 			n.host.Peerstore().AddAddr(peerID, addrs[0], peerstore.TempAddrTTL)
 		}
 
-		// Forward announcement only if not from self
-		if peerID != n.host.ID() {
-			if err := n.contentAnnounceTopic.Publish(n.ctx, []byte(hashStr)); err != nil {
-				log.Printf("Failed to forward content announcement for %s: %v", hashStr, err)
-				mtr.NetworkErrorsTotal.WithLabelValues("forward_content_announce").Inc()
-			} else {
-				log.Printf("Forwarded content announcement for %s from %s", hashStr, peerID.String())
-			}
+		// Forward announcement
+		if err := n.contentAnnounceTopic.Publish(n.ctx, []byte(hashStr)); err != nil {
+			log.Printf("Failed to forward content announcement for %s: %v", hashStr, err)
+			mtr.NetworkErrorsTotal.WithLabelValues("forward_content_announce").Inc()
+		} else {
+			log.Printf("Forwarded content announcement for %s from %s", hashStr, peerID.String())
+			mtr.NetworkMessagesTotal.WithLabelValues("content_announce").Inc()
 		}
 
-		// Automatically attempt to fetch content if not already stored
+		// Only fetch content if storage is configured and content is not already present
 		if n.storage != nil {
 			hash, err := hasher.HashFromString(hashStr)
-			if err == nil && n.storage.ValidateContent(hash) != nil {
-				go func() {
-					_, _, err := n.RequestContentFromPeer(peerID, hashStr)
-					if err != nil {
-						log.Printf("Failed to fetch content %s from %s: %v", hashStr, peerID.String(), err)
-					}
-				}()
+			if err == nil {
+				_, err := n.storage.GetContent(hash)
+				if err != nil {
+					go func() {
+						_, _, err := n.RequestContentFromPeer(peerID, hashStr)
+						if err != nil {
+							log.Printf("Failed to fetch content %s from %s: %v", hashStr, peerID.String(), err)
+						}
+					}()
+				}
 			}
 		}
 	}
@@ -1042,9 +1104,9 @@ func (n *Node) AnnounceContent(contentHashStr string) error {
 	if err != nil {
 		return fmt.Errorf("invalid content hash: %w", err)
 	}
-	if err := n.storage.ValidateContent(hash); err != nil {
-		log.Printf("Validation failed for content %s: %v", contentHashStr, err)
-		return err
+	if _, err := n.storage.GetContent(hash); err != nil {
+		log.Printf("Content not found for %s: %v", contentHashStr, err)
+		return fmt.Errorf("content not found: %w", err)
 	}
 	// Announce via DHT
 	const maxRetries = 5
@@ -1132,6 +1194,9 @@ func (n *Node) FindContentProviders(contentHash string) ([]peer.AddrInfo, error)
 
 // RequestContentFromPeer requests content from a peer with relay support
 func (n *Node) RequestContentFromPeer(peerID peer.ID, contentHash string) ([]byte, *storage.ContentMetadata, error) {
+	if peerID == n.host.ID() {
+		return nil, nil, fmt.Errorf("cannot request content from self: %s", peerID.String())
+	}
 	const maxRetries = 5
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		ctx, cancel := context.WithTimeout(n.ctx, 60*time.Second)
@@ -1141,11 +1206,19 @@ func (n *Node) RequestContentFromPeer(peerID peer.ID, contentHash string) ([]byt
 		// Ensure connectivity (direct or relayed)
 		if n.host.Network().Connectedness(peerID) != network.Connected {
 			pi := peer.AddrInfo{ID: peerID, Addrs: n.host.Peerstore().Addrs(peerID)}
+			// Filter out invalid addresses
+			validAddrs := make([]multiaddr.Multiaddr, 0, len(pi.Addrs))
+			for _, addr := range pi.Addrs {
+				if !isInvalidAddr(addr) {
+					validAddrs = append(validAddrs, addr)
+				}
+			}
+			pi.Addrs = validAddrs
 			if err := n.host.Connect(ctx, pi); err != nil {
 				log.Printf("Attempt %d/%d: Direct connect to %s failed: %v, trying relay", attempt, maxRetries, peerID.String(), err)
 				// Try relayed connection
 				bootnode := n.getRandomBootnode()
-				if bootnode != nil {
+				if bootnode != nil && bootnode.ID != peerID {
 					log.Printf("Attempting relayed connection to %s via %s", peerID.String(), bootnode.ID.String())
 					relayAddr, err := multiaddr.NewMultiaddr(fmt.Sprintf("/p2p/%s/p2p-circuit/p2p/%s", bootnode.ID.String(), peerID.String()))
 					if err != nil {
@@ -1170,7 +1243,7 @@ func (n *Node) RequestContentFromPeer(peerID peer.ID, contentHash string) ([]byt
 					}
 					log.Printf("Successfully connected to %s via relay %s", peerID.String(), bootnode.ID.String())
 				} else {
-					log.Printf("No bootnode available for relay to %s", peerID.String())
+					log.Printf("No suitable bootnode available for relay to %s", peerID.String())
 					if attempt == maxRetries {
 						return nil, nil, fmt.Errorf("failed to connect to %s after %d attempts: no relay available", peerID.String(), maxRetries)
 					}
