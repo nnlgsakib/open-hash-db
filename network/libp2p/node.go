@@ -62,6 +62,7 @@ const (
 	DefaultBucketSize         = 20
 	AnnouncementCacheTTL      = 5 * time.Minute
 	AnnouncementCacheCleanup  = 10 * time.Minute
+	AnnouncementRateLimit     = 1 * time.Second // New: Rate limit for processing announcements
 )
 
 // PeerEvent represents a peer discovery, connection, or disconnection event
@@ -93,6 +94,8 @@ type Node struct {
 	ContentHandler        func(peer.ID, []byte) error
 	ChunkHandler          func(peer.ID, []byte) error
 	PeerConnectedCallback func(peer.ID)
+	announceRateLimit     map[string]time.Time // New: Track last announcement time per peer
+	announceRateLimitMu   sync.Mutex
 }
 
 // ConnectionInfo tracks connection limits and counts
@@ -290,7 +293,6 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string)
 			"/ip4/0.0.0.0/udp/0/quic-v1",
 		),
 		libp2p.EnableRelay(),
-		libp2p.EnableHolePunching(),
 		libp2p.EnableAutoRelayWithPeerSource(func(ctx context.Context, numPeers int) <-chan peer.AddrInfo {
 			peerChan := make(chan peer.AddrInfo, numPeers)
 			go func() {
@@ -335,20 +337,33 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string)
 		return nil, fmt.Errorf("failed to create libp2p host: %w", err)
 	}
 
-	// Initialize PubSub with message deduplication
+	// Initialize PubSub with enhanced message deduplication
 	ps, err := pubsub.NewGossipSub(
 		ctx,
 		h,
 		pubsub.WithPeerOutboundQueueSize(PeerOutboundBufferSize),
 		pubsub.WithValidateQueueSize(ValidateBufferSize),
 		pubsub.WithMessageIdFn(func(pmsg *pb.Message) string {
-			// Use content hash and sender ID for message ID to prevent duplicates
-			return fmt.Sprintf("%s:%s", string(pmsg.Data), peer.ID(pmsg.GetFrom()).String())
+			hash := hasher.HashBytes(append(pmsg.Data, []byte(peer.ID(pmsg.GetFrom()).String())...))
+			return base64.StdEncoding.EncodeToString(hash[:])
+		}),
+		pubsub.WithGossipSubParams(pubsub.GossipSubParams{
+			D:                 6,
+			Dlo:               4,
+			Dhi:               8,
+			Dlazy:             4,
+			HeartbeatInterval: 700 * time.Millisecond, // Fix for non-positive ticker
+			// Dscore:            0,
+			// FanoutTTL:         60 * time.Second, // Fix for divide by zero
 		}),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize pubsub: %w", err)
 	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize pubsub: %w", err)
+	}
+
 	// Join content announcement topic
 	contentAnnounceTopic, err := ps.Join(TopicContentAnnounce)
 	if err != nil {
@@ -369,6 +384,7 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string)
 		bootnodes:             &bootnodesWrapper{bootnodeArr: bootnodeArr, bootnodesMap: bootnodesMap},
 		peerEvents:            make([]PeerEvent, 0, MaxPeerEventLogs),
 		announcementCache:     cache.New(AnnouncementCacheTTL, AnnouncementCacheCleanup),
+		announceRateLimit:     make(map[string]time.Time),
 		PeerConnectedCallback: func(p peer.ID) {},
 	}
 
@@ -655,7 +671,7 @@ func (n *Node) getRandomBootnode() *peer.AddrInfo {
 	return nonConnectedNodes[randNum.Int64()]
 }
 
-// runDial processes the dial queue
+// runDial processes the dial queue with relay support
 func (n *Node) runDial() {
 	slots := make(chan struct{}, MaxOutboundPeers)
 	for i := int64(0); i < MaxOutboundPeers; i++ {
@@ -683,12 +699,33 @@ func (n *Node) runDial() {
 			case <-slots:
 				go func(pi *peer.AddrInfo) {
 					defer func() { slots <- struct{}{} }()
-					log.Printf("Dialing peer %s", pi.ID.String())
+					log.Printf("Dialing peer %s (direct)", pi.ID.String())
 					ctxDial, cancelDial := context.WithTimeout(ctx, 30*time.Second)
 					defer cancelDial()
 					if err := n.host.Connect(ctxDial, *pi); err != nil {
-						log.Printf("Failed to dial %s: %v", pi.ID.String(), err)
-						mtr.NetworkErrorsTotal.WithLabelValues("dial").Inc()
+						log.Printf("Direct dial to %s failed: %v, attempting relay", pi.ID.String(), err)
+						mtr.NetworkErrorsTotal.WithLabelValues("dial_direct").Inc()
+						// Try relayed connection via a bootnode
+						if bootnode := n.getRandomBootnode(); bootnode != nil {
+							log.Printf("Attempting relayed connection to %s via %s", pi.ID.String(), bootnode.ID.String())
+							ctxRelay, cancelRelay := context.WithTimeout(ctx, 30*time.Second)
+							defer cancelRelay()
+							relayAddr, err := multiaddr.NewMultiaddr(fmt.Sprintf("/p2p/%s/p2p-circuit/p2p/%s", bootnode.ID.String(), pi.ID.String()))
+							if err != nil {
+								log.Printf("Failed to create relay address for %s: %v", pi.ID.String(), err)
+								mtr.NetworkErrorsTotal.WithLabelValues("relay_addr").Inc()
+								return
+							}
+							relayInfo := peer.AddrInfo{ID: pi.ID, Addrs: []multiaddr.Multiaddr{relayAddr}}
+							if err := n.host.Connect(ctxRelay, relayInfo); err != nil {
+								log.Printf("Relayed dial to %s via %s failed: %v", pi.ID.String(), bootnode.ID.String(), err)
+								mtr.NetworkErrorsTotal.WithLabelValues("dial_relay").Inc()
+							} else {
+								log.Printf("Successfully connected to %s via relay %s", pi.ID.String(), bootnode.ID.String())
+							}
+						}
+					} else {
+						log.Printf("Successfully connected to %s (direct)", pi.ID.String())
 					}
 				}(peerInfo)
 			}
@@ -947,15 +984,39 @@ func (n *Node) readContentAnnounceLoop(sub *pubsub.Subscription) {
 		hashStr := string(msg.Data)
 		peerID := msg.GetFrom()
 		cacheKey := fmt.Sprintf("%s:%s", hashStr, peerID.String())
+
+		// Rate limit announcements per peer
+		n.announceRateLimitMu.Lock()
+		if lastAnnounce, exists := n.announceRateLimit[cacheKey]; exists && time.Since(lastAnnounce) < AnnouncementRateLimit {
+			n.announceRateLimitMu.Unlock()
+			continue // Skip if rate limit exceeded
+		}
+		n.announceRateLimit[cacheKey] = time.Now()
+		n.announceRateLimitMu.Unlock()
+
+		// Check announcement cache
 		if _, found := n.announcementCache.Get(cacheKey); found {
 			continue // Skip duplicate announcement
 		}
 		n.announcementCache.Set(cacheKey, true, AnnouncementCacheTTL)
 		log.Printf("Received content announcement for %s from %s", hashStr, peerID.String())
+
+		// Update peerstore with addresses
 		addrs := n.host.Peerstore().Addrs(peerID)
 		if len(addrs) > 0 {
 			n.host.Peerstore().AddAddr(peerID, addrs[0], peerstore.TempAddrTTL)
 		}
+
+		// Forward announcement only if not from self
+		if peerID != n.host.ID() {
+			if err := n.contentAnnounceTopic.Publish(n.ctx, []byte(hashStr)); err != nil {
+				log.Printf("Failed to forward content announcement for %s: %v", hashStr, err)
+				mtr.NetworkErrorsTotal.WithLabelValues("forward_content_announce").Inc()
+			} else {
+				log.Printf("Forwarded content announcement for %s from %s", hashStr, peerID.String())
+			}
+		}
+
 		// Automatically attempt to fetch content if not already stored
 		if n.storage != nil {
 			hash, err := hasher.HashFromString(hashStr)
@@ -1017,6 +1078,15 @@ func (n *Node) AnnounceContent(contentHashStr string) error {
 			log.Printf("Skipping duplicate announcement for %s", contentHashStr)
 			return nil
 		}
+		n.announceRateLimitMu.Lock()
+		if lastAnnounce, exists := n.announceRateLimit[cacheKey]; exists && time.Since(lastAnnounce) < AnnouncementRateLimit {
+			n.announceRateLimitMu.Unlock()
+			log.Printf("Rate limit hit for announcing %s", contentHashStr)
+			return nil
+		}
+		n.announceRateLimit[cacheKey] = time.Now()
+		n.announceRateLimitMu.Unlock()
+
 		n.announcementCache.Set(cacheKey, true, AnnouncementCacheTTL)
 		if err := n.contentAnnounceTopic.Publish(n.ctx, []byte(contentHashStr)); err != nil {
 			log.Printf("Failed to publish content announcement for %s: %v", contentHashStr, err)
@@ -1060,24 +1130,57 @@ func (n *Node) FindContentProviders(contentHash string) ([]peer.AddrInfo, error)
 	return result, nil
 }
 
-// RequestContentFromPeer requests content from a peer
+// RequestContentFromPeer requests content from a peer with relay support
 func (n *Node) RequestContentFromPeer(peerID peer.ID, contentHash string) ([]byte, *storage.ContentMetadata, error) {
 	const maxRetries = 5
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		ctx, cancel := context.WithTimeout(n.ctx, 60*time.Second)
 		defer cancel()
 		log.Printf("Attempt %d/%d: Requesting content %s from %s", attempt, maxRetries, contentHash, peerID.String())
-		// Ensure connectivity
+
+		// Ensure connectivity (direct or relayed)
 		if n.host.Network().Connectedness(peerID) != network.Connected {
-			if err := n.host.Connect(ctx, peer.AddrInfo{ID: peerID, Addrs: n.host.Peerstore().Addrs(peerID)}); err != nil {
-				log.Printf("Attempt %d/%d: Failed to connect to %s: %v", attempt, maxRetries, peerID.String(), err)
-				if attempt == maxRetries {
-					return nil, nil, fmt.Errorf("failed to connect to %s after %d attempts: %w", peerID.String(), maxRetries, err)
+			pi := peer.AddrInfo{ID: peerID, Addrs: n.host.Peerstore().Addrs(peerID)}
+			if err := n.host.Connect(ctx, pi); err != nil {
+				log.Printf("Attempt %d/%d: Direct connect to %s failed: %v, trying relay", attempt, maxRetries, peerID.String(), err)
+				// Try relayed connection
+				bootnode := n.getRandomBootnode()
+				if bootnode != nil {
+					log.Printf("Attempting relayed connection to %s via %s", peerID.String(), bootnode.ID.String())
+					relayAddr, err := multiaddr.NewMultiaddr(fmt.Sprintf("/p2p/%s/p2p-circuit/p2p/%s", bootnode.ID.String(), peerID.String()))
+					if err != nil {
+						log.Printf("Failed to create relay address for %s: %v", peerID.String(), err)
+						mtr.NetworkErrorsTotal.WithLabelValues("relay_addr").Inc()
+						if attempt == maxRetries {
+							return nil, nil, fmt.Errorf("failed to create relay address for %s: %w", peerID.String(), err)
+						}
+						mtr.NetworkRetriesTotal.Inc()
+						time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
+						continue
+					}
+					relayInfo := peer.AddrInfo{ID: peerID, Addrs: []multiaddr.Multiaddr{relayAddr}}
+					if err := n.host.Connect(ctx, relayInfo); err != nil {
+						log.Printf("Attempt %d/%d: Relayed connect to %s via %s failed: %v", attempt, maxRetries, peerID.String(), bootnode.ID.String(), err)
+						if attempt == maxRetries {
+							return nil, nil, fmt.Errorf("failed to connect to %s via relay after %d attempts: %w", peerID.String(), maxRetries, err)
+						}
+						mtr.NetworkRetriesTotal.Inc()
+						time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
+						continue
+					}
+					log.Printf("Successfully connected to %s via relay %s", peerID.String(), bootnode.ID.String())
+				} else {
+					log.Printf("No bootnode available for relay to %s", peerID.String())
+					if attempt == maxRetries {
+						return nil, nil, fmt.Errorf("failed to connect to %s after %d attempts: no relay available", peerID.String(), maxRetries)
+					}
+					mtr.NetworkRetriesTotal.Inc()
+					time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
+					continue
 				}
-				time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
-				continue
 			}
 		}
+
 		stream, err := n.host.NewStream(ctx, peerID, ProtocolContentExchange)
 		if err != nil {
 			log.Printf("Attempt %d/%d: Failed to open stream to %s: %v", attempt, maxRetries, peerID.String(), err)

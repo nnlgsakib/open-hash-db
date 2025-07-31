@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"openhashdb/core/hasher"
 	"openhashdb/network/mtr"
 
 	"github.com/libp2p/go-libp2p"
@@ -29,6 +30,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/core/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	quic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
@@ -55,6 +57,9 @@ const (
 	DefaultBucketSize         = 20
 	AnnouncementCacheTTL      = 5 * time.Minute
 	AnnouncementCacheCleanup  = 10 * time.Minute
+	AnnouncementRateLimit     = 1 * time.Second
+	RelayReservationTTL       = 2 * time.Hour
+	MaxRelayReservations      = 100
 )
 
 // PeerEvent represents a peer discovery, connection, or disconnection event
@@ -65,7 +70,7 @@ type PeerEvent struct {
 	Addresses []string  `json:"addresses"`
 }
 
-// BootNode represents a libp2p boot node for peer discovery
+// BootNode represents a libp2p boot node for peer discovery and relaying
 type BootNode struct {
 	host                  host.Host
 	ctx                   context.Context
@@ -83,6 +88,9 @@ type BootNode struct {
 	peerEventsMu          sync.RWMutex
 	announcementCache     *cache.Cache
 	PeerConnectedCallback func(peer.ID)
+	announceRateLimit     map[string]time.Time
+	announceRateLimitMu   sync.Mutex
+	relayService          *relayv2.Relay
 }
 
 // ConnectionInfo tracks connection limits and counts
@@ -323,11 +331,12 @@ func NewBootNode(ctx context.Context, keyPath string, bootnodes []string, p2pPor
 
 	var nodeDHT *dht.IpfsDHT
 	var routingTable *kbucket.RoutingTable
+	var relayService *relayv2.Relay
 	h, err := libp2p.New(
 		libp2p.Identity(privKey),
 		libp2p.ListenAddrStrings(listenAddrs...),
 		libp2p.EnableRelay(),
-		libp2p.EnableRelayService(),
+		libp2p.EnableRelayService(relayv2.WithResources(relayv2.DefaultResources())),
 		libp2p.EnableHolePunching(),
 		libp2p.EnableAutoRelayWithPeerSource(func(ctx context.Context, numPeers int) <-chan peer.AddrInfo {
 			peerChan := make(chan peer.AddrInfo, numPeers)
@@ -373,15 +382,30 @@ func NewBootNode(ctx context.Context, keyPath string, bootnodes []string, p2pPor
 		return nil, fmt.Errorf("failed to create libp2p host: %w", err)
 	}
 
-	// Initialize PubSub with message deduplication
+	// Initialize circuit relay v2 service
+	relayService, err = relayv2.New(h, relayv2.WithResources(relayv2.DefaultResources()))
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize relay service: %w", err)
+	}
+
+	// Initialize PubSub with message deduplication consistent with node.go
 	ps, err := pubsub.NewGossipSub(
 		ctx,
 		h,
 		pubsub.WithPeerOutboundQueueSize(PeerOutboundBufferSize),
 		pubsub.WithValidateQueueSize(ValidateBufferSize),
 		pubsub.WithMessageIdFn(func(pmsg *pb.Message) string {
-			// Use content hash and sender ID for message ID to prevent duplicates
-			return fmt.Sprintf("%s:%s", string(pmsg.Data), peer.ID(pmsg.GetFrom()).String())
+			hash := hasher.HashBytes(append(pmsg.Data, []byte(peer.ID(pmsg.GetFrom()).String())...))
+			return base64.StdEncoding.EncodeToString(hash[:])
+		}),
+		pubsub.WithGossipSubParams(pubsub.GossipSubParams{
+			D:                 6,
+			Dlo:               4,
+			Dhi:               8,
+			Dlazy:             4,
+			HeartbeatInterval: 700 * time.Millisecond, // Fix for non-positive ticker
+			// Dscore:            0,
+			// FanoutTTL:         60 * time.Second,
 		}),
 	)
 	if err != nil {
@@ -399,6 +423,7 @@ func NewBootNode(ctx context.Context, keyPath string, bootnodes []string, p2pPor
 		host:                  h,
 		ctx:                   nodeCtx,
 		cancel:                cancel,
+		mdns:                  nil,
 		dht:                   nodeDHT,
 		routingTable:          routingTable,
 		pubsub:                ps,
@@ -408,6 +433,8 @@ func NewBootNode(ctx context.Context, keyPath string, bootnodes []string, p2pPor
 		bootnodes:             &bootnodesWrapper{bootnodeArr: bootnodeArr, bootnodesMap: bootnodesMap},
 		peerEvents:            make([]PeerEvent, 0, MaxPeerEventLogs),
 		announcementCache:     cache.New(AnnouncementCacheTTL, AnnouncementCacheCleanup),
+		announceRateLimit:     make(map[string]time.Time),
+		relayService:          relayService,
 		PeerConnectedCallback: func(p peer.ID) {},
 	}
 
@@ -415,18 +442,18 @@ func NewBootNode(ctx context.Context, keyPath string, bootnodes []string, p2pPor
 	h.SetStreamHandler(ProtocolContentExchange, func(s network.Stream) {
 		log.Printf("Received content stream from %s, rejecting as bootnode does not store data", s.Conn().RemotePeer())
 		mtr.NetworkErrorsTotal.WithLabelValues("content_rejected").Inc()
-		s.Write([]byte("ERROR: bootnode does not store data"))
-		s.Reset()
+		_, _ = s.Write([]byte("ERROR: bootnode does not store data"))
+		_ = s.Reset()
 	})
 	h.SetStreamHandler(ProtocolChunkExchange, func(s network.Stream) {
 		log.Printf("Received chunk stream from %s, rejecting as bootnode does not store data", s.Conn().RemotePeer())
 		mtr.NetworkErrorsTotal.WithLabelValues("chunk_rejected").Inc()
-		s.Write([]byte("ERROR: bootnode does not store data"))
-		s.Reset()
+		_, _ = s.Write([]byte("ERROR: bootnode does not store data"))
+		_ = s.Reset()
 	})
 
 	// Set up mDNS
-	mdnsService := mdns.NewMdnsService(h, ServiceTag, &discoveryNotifiee{node: bn})
+	mdnsService := mdns.NewMdnsService(h, ServiceTag, &discoveryNotifee{node: bn})
 	if err := mdnsService.Start(); err != nil {
 		log.Printf("Warning: failed to start mDNS: %v", err)
 	} else {
@@ -481,6 +508,11 @@ func (bn *BootNode) Close() error {
 	if bn.dht != nil {
 		if err := bn.dht.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("error closing DHT: %w", err))
+		}
+	}
+	if bn.relayService != nil {
+		if err := bn.relayService.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("error closing relay service: %w", err))
 		}
 	}
 	bn.dialQueue.Close()
@@ -588,18 +620,18 @@ func (n *networkNotifiee) Disconnected(net network.Network, conn network.Conn) {
 func (n *networkNotifiee) Listen(net network.Network, addr multiaddr.Multiaddr)      {}
 func (n *networkNotifiee) ListenClose(net network.Network, addr multiaddr.Multiaddr) {}
 
-// discoveryNotifiee handles peer discovery
-type discoveryNotifiee struct {
+// discoveryNotifee handles peer discovery
+type discoveryNotifee struct {
 	node *BootNode
 }
 
-func (n *discoveryNotifiee) HandlePeerFound(pi peer.AddrInfo) {
+func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
 	addrs := make([]string, 0, len(pi.Addrs))
 	for _, addr := range pi.Addrs {
 		addrs = append(addrs, addr.String())
 	}
 	n.node.logPeerEvent(pi.ID, "discovered", addrs)
-	n.node.dialQueue.AddTask(&pi, 1) // Priority 1 for discovered peers
+	n.node.dialQueue.AddTask(&pi, 1)
 }
 
 // subscribeContentAnnounce subscribes to content announcement topic to forward announcements
@@ -627,8 +659,19 @@ func (bn *BootNode) readContentAnnounceLoop(sub *pubsub.Subscription) {
 		hashStr := string(msg.Data)
 		peerID := msg.GetFrom()
 		cacheKey := fmt.Sprintf("%s:%s", hashStr, peerID.String())
+
+		// Rate limit announcements per peer
+		bn.announceRateLimitMu.Lock()
+		if lastAnnounce, exists := bn.announceRateLimit[cacheKey]; exists && time.Since(lastAnnounce) < AnnouncementRateLimit {
+			bn.announceRateLimitMu.Unlock()
+			continue
+		}
+		bn.announceRateLimit[cacheKey] = time.Now()
+		bn.announceRateLimitMu.Unlock()
+
+		// Check announcement cache
 		if _, found := bn.announcementCache.Get(cacheKey); found {
-			continue // Skip duplicate announcement
+			continue
 		}
 		bn.announcementCache.Set(cacheKey, true, AnnouncementCacheTTL)
 		log.Printf("Forwarding content announcement for %s from %s", hashStr, peerID.String())
@@ -777,6 +820,8 @@ func (bn *BootNode) runDial() {
 					if err := bn.host.Connect(ctxDial, *pi); err != nil {
 						log.Printf("Failed to dial %s: %v", pi.ID.String(), err)
 						mtr.NetworkErrorsTotal.WithLabelValues("dial").Inc()
+					} else {
+						log.Printf("Successfully connected to %s", pi.ID.String())
 					}
 				}(peerInfo)
 			}
