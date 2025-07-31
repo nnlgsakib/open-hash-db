@@ -209,7 +209,7 @@ func convertBootnodesToAddrInfo(bootnodes []string) ([]peer.AddrInfo, error) {
 }
 
 // NewNodeWithKeyPath creates a new libp2p node
-func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string) (*Node, error) {
+func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string, p2pPort int) (*Node, error) {
 	var privKey crypto.PrivKey
 	var err error
 
@@ -233,13 +233,15 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string)
 		log.Printf("Warning: failed to parse some bootnode addresses: %v", err)
 	}
 
+	listenAddrs := []string{
+		fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", p2pPort),
+		fmt.Sprintf("/ip4/0.0.0.0/udp/%d/quic-v1", p2pPort),
+	}
+
 	var nodeDHT *dht.IpfsDHT
 	h, err := libp2p.New(
 		libp2p.Identity(privKey),
-		libp2p.ListenAddrStrings(
-			"/ip4/0.0.0.0/tcp/0",
-			"/ip4/0.0.0.0/udp/0/quic-v1",
-		),
+		libp2p.ListenAddrStrings(listenAddrs...),
 		libp2p.EnableRelay(),
 		libp2p.EnableHolePunching(),
 		libp2p.EnableAutoRelayWithPeerSource(func(ctx context.Context, numPeers int) <-chan peer.AddrInfo {
