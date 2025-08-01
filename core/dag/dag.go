@@ -30,21 +30,21 @@ type Link struct {
 
 // DAGNode represents a node in the Merkle DAG
 type DAGNode struct {
-	Type      NodeType    `json:"type"`
-	Links     []Link      `json:"links,omitempty"`
-	Data      []byte      `json:"data,omitempty"`
-	Hash      hasher.Hash `json:"hash"`
-	Size      int64       `json:"size"`
-	CreatedAt time.Time   `json:"created_at"`
+	Type      NodeType      `json:"type"`
+	Links     []Link        `json:"links,omitempty"`
+	Data      []byte        `json:"data,omitempty"`
+	Hash      hasher.Hash   `json:"hash"`
+	Size      int64         `json:"size"`
+	CreatedAt time.Time     `json:"created_at"`
 }
 
 // FileInfo represents file metadata
 type FileInfo struct {
-	Name     string      `json:"name"`
-	Size     int64       `json:"size"`
+	Name     string    `json:"name"`
+	Size     int64     `json:"size"`
 	Mode     fs.FileMode `json:"mode"`
-	ModTime  time.Time   `json:"mod_time"`
-	MimeType string      `json:"mime_type"`
+	ModTime  time.Time `json:"mod_time"`
+	MimeType string    `json:"mime_type"`
 }
 
 // DAGBuilder builds Merkle DAGs from file system structures
@@ -135,7 +135,7 @@ func (b *DAGBuilder) buildDirectoryNode(path, name string, info fs.FileInfo) (*D
 	// Process each entry in the directory
 	for _, entry := range entries {
 		entryPath := filepath.Join(path, entry.Name())
-
+		
 		// Skip hidden files and directories starting with .
 		if strings.HasPrefix(entry.Name(), ".") {
 			continue
@@ -289,14 +289,14 @@ func (node *DAGNode) Verify() error {
 		if node.Data != nil && len(node.Data) > 0 {
 			return fmt.Errorf("directory node should not have data")
 		}
-
+		
 		var totalSize int64
 		for _, link := range node.Links {
 			totalSize += link.Size
 		}
-
+		
 		if totalSize != node.Size {
-			return fmt.Errorf("directory size mismatch: expected %d, got %d",
+			return fmt.Errorf("directory size mismatch: expected %d, got %d", 
 				node.Size, totalSize)
 		}
 	}
@@ -325,3 +325,4 @@ func (node *DAGNode) Clone() *DAGNode {
 
 	return clone
 }
+

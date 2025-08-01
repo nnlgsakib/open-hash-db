@@ -159,25 +159,31 @@ func (r *Replicator) AnnounceContent(hash hasher.Hash, size int64) error {
 // ReannounceAll re-announces all local content
 func (r *Replicator) ReannounceAll() {
 	log.Println("Re-announcing all local content...")
-	r.announcePinnedContent()
+	hashes, err := r.storage.ListContent()
+	if err != nil {
+		log.Printf("Error listing content: %v", err)
+		return
+	}
+
+	for _, hash := range hashes {
+		go func(h hasher.Hash) {
+			metadata, err := r.storage.GetContent(h)
+			if err != nil {
+				log.Printf("Could not get metadata for %s: %v", h.String(), err)
+				return
+			}
+			if err := r.AnnounceContent(h, metadata.Size); err != nil {
+				log.Printf("Failed to re-announce %s: %v", h.String(), err)
+			}
+		}(hash)
+	}
+	log.Printf("Finished re-announcing %d content hashes", len(hashes))
 }
 
 // RequestChunk requests a chunk from the network or relays it
 func (r *Replicator) RequestChunk(hash hasher.Hash) ([]byte, error) {
 	// Check local storage
 	if r.storage.HasData(hash) {
-		// Announce non-pinned content on-demand
-		if !r.IsPinned(hash) {
-			go func() {
-				metadata, err := r.storage.GetContent(hash)
-				if err == nil {
-					log.Printf("Announcing non-pinned content %s on-demand", hash.String())
-					if err := r.AnnounceContent(hash, metadata.Size); err != nil {
-						log.Printf("Failed to announce on-demand content %s: %v", hash.String(), err)
-					}
-				}
-			}()
-		}
 		data, err := r.storage.GetData(hash)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get local data for %s: %w", hash.String(), err)
@@ -223,26 +229,22 @@ func (r *Replicator) RequestChunk(hash hasher.Hash) ([]byte, error) {
 		return nil, fmt.Errorf("failed to fetch content from %s: %w", providers[0].ID.String(), err)
 	}
 
-	// Store in relay cache if the data is not nil (not a large file stored directly)
-	if data != nil {
-		r.mu.Lock()
-		r.relayCache[hash.String()] = data
-		r.mu.Unlock()
-	}
+	// Store in relay cache
+	r.mu.Lock()
+	r.relayCache[hash.String()] = data
+	r.mu.Unlock()
 
 	// On-demand replication
 	if shouldReplicate {
 		replicationRequestsTotal.WithLabelValues("on_demand").Inc()
-		if data != nil {
-			if err := r.storage.StoreData(hash, data); err != nil {
-				replicationFailuresTotal.Inc()
-				log.Printf("Failed to replicate content %s: %v", hash.String(), err)
-			} else {
-				replicationSuccessTotal.Inc()
-				log.Printf("Replicated content %s locally after %d requests", hash.String(), tracker.Count)
-				if err := r.AnnounceContent(hash, metadata.Size); err != nil {
-					log.Printf("Failed to announce replicated content %s: %v", hash.String(), err)
-				}
+		if err := r.storage.StoreData(hash, data); err != nil {
+			replicationFailuresTotal.Inc()
+			log.Printf("Failed to replicate content %s: %v", hash.String(), err)
+		} else {
+			replicationSuccessTotal.Inc()
+			log.Printf("Replicated content %s locally after %d requests", hash.String(), tracker.Count)
+			if err := r.AnnounceContent(hash, metadata.Size); err != nil {
+				log.Printf("Failed to announce replicated content %s: %v", hash.String(), err)
 			}
 		}
 	}
@@ -260,15 +262,7 @@ func (r *Replicator) PinContent(hash hasher.Hash, priority int) error {
 		return r.storage.IncrementRefCount(hash)
 	}
 
-	// If content is not available locally, fetch it from the network
-	log.Printf("Content %s not found locally, attempting to fetch and pin...", hash.String())
-	_, err := r.RequestChunk(hash) // This will fetch and store the content
-	if err != nil {
-		return fmt.Errorf("failed to fetch content for pinning: %w", err)
-	}
-
-	// Now that it's fetched, increment the reference count
-	return r.storage.IncrementRefCount(hash)
+	return fmt.Errorf("content not found: %s", hash.String())
 }
 
 // UnpinContent unpins content
@@ -447,7 +441,7 @@ func (r *Replicator) handleChunkMessage(peerID peer.ID, data []byte) error {
 	return nil
 }
 
-// announceContentPeriodically periodically announces pinned content
+// announceContentPeriodically periodically announces content
 func (r *Replicator) announceContentPeriodically() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
@@ -455,35 +449,29 @@ func (r *Replicator) announceContentPeriodically() {
 	for {
 		select {
 		case <-ticker.C:
-			r.announcePinnedContent()
+			r.announceAllContent()
 		case <-r.ctx.Done():
 			return
 		}
 	}
 }
 
-// announcePinnedContent announces all pinned local content
-func (r *Replicator) announcePinnedContent() {
-	r.mu.RLock()
-	pinned := r.GetPinnedContent()
-	r.mu.RUnlock()
+// announceAllContent announces all local content
+func (r *Replicator) announceAllContent() {
+	hashes, err := r.storage.ListContent()
+	if err != nil {
+		log.Printf("Failed to list content: %v", err)
+		return
+	}
 
-	log.Printf("Announcing %d pinned content items...", len(pinned))
-	for hashStr := range pinned {
-		hash, err := hasher.HashFromString(hashStr)
-		if err != nil {
-			log.Printf("Invalid pinned hash %s: %v", hashStr, err)
-			continue
-		}
-
+	for _, hash := range hashes {
 		metadata, err := r.storage.GetContent(hash)
 		if err != nil {
-			log.Printf("Could not get metadata for pinned content %s: %v", hashStr, err)
 			continue
 		}
 
 		if err := r.AnnounceContent(hash, metadata.Size); err != nil {
-			log.Printf("Failed to announce pinned content %s: %v", hash.String(), err)
+			log.Printf("Failed to announce content %s: %v", hash.String(), err)
 		}
 	}
 }
