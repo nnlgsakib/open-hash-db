@@ -47,7 +47,7 @@ func HashReader(r io.Reader) (Hash, error) {
 	if err != nil {
 		return Hash{}, fmt.Errorf("failed to hash reader: %w", err)
 	}
-	
+
 	var result Hash
 	copy(result[:], hasher.Sum(nil))
 	return result, nil
@@ -60,7 +60,7 @@ func HashFile(filepath string) (Hash, error) {
 		return Hash{}, fmt.Errorf("failed to open file %s: %w", filepath, err)
 	}
 	defer file.Close()
-	
+
 	return HashReader(file)
 }
 
@@ -70,7 +70,7 @@ func HashMultiple(hashes ...Hash) Hash {
 	for _, h := range hashes {
 		hasher.Write(h[:])
 	}
-	
+
 	var result Hash
 	copy(result[:], hasher.Sum(nil))
 	return result
@@ -99,4 +99,3 @@ func VerifyFile(filepath string, expectedHash Hash) (bool, error) {
 	}
 	return actualHash == expectedHash, nil
 }
-

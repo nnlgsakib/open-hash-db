@@ -775,27 +775,121 @@ func (s *Server) storeFile(filename string, content []byte) (hasher.Hash, error)
 // }
 
 // getMimeType determines MIME type from filename
-func getMimeType(filename string) string {
-	ext := strings.ToLower(filepath.Ext(filename))
+func getMimeType(path string) string {
+	ext := strings.ToLower(filepath.Ext(path)) // Normalize extension to lowercase
 	switch ext {
-	case ".txt":
-		return "text/plain"
-	case ".html", ".htm":
+	// Text-based formats (HTML and variants)
+	case ".html", ".htm", ".shtml", ".xhtml":
 		return "text/html"
-	case ".css":
+	case ".css", ".scss", ".sass", ".less":
 		return "text/css"
-	case ".js":
+	case ".js", ".mjs", ".jsx":
 		return "application/javascript"
+	case ".ts", ".tsx":
+		return "application/typescript"
 	case ".json":
 		return "application/json"
+	case ".xml":
+		return "application/xml"
+	case ".svg":
+		return "image/svg+xml"
+	case ".csv":
+		return "text/csv"
+	case ".md", ".markdown":
+		return "text/markdown"
+	case ".webmanifest":
+		return "application/manifest+json"
+	case ".vtt":
+		return "text/vtt"
+	case ".txt":
+		return "text/plain"
+	case ".php":
+		return "text/x-php"
+	case ".py":
+		return "text/x-python"
+	case ".rb":
+		return "text/x-ruby"
+	case ".java":
+		return "text/x-java-source"
+	case ".c":
+		return "text/x-c"
+	case ".cpp":
+		return "text/x-c++src"
+	case ".cs":
+		return "text/x-csharp"
+	case ".go":
+		return "text/x-go"
+	case ".sh":
+		return "text/x-shellscript"
+	case ".sql":
+		return "text/x-sql"
+	case ".yaml", ".yml":
+		return "text/yaml"
+	case ".toml":
+		return "text/x-toml"
+	case ".ini":
+		return "text/x-ini"
+
+	// Image formats
 	case ".png":
 		return "image/png"
 	case ".jpg", ".jpeg":
 		return "image/jpeg"
 	case ".gif":
 		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	case ".avif":
+		return "image/avif"
+	case ".ico":
+		return "image/x-icon"
+	case ".bmp":
+		return "image/bmp"
+
+	// Audio formats
+	case ".mp3":
+		return "audio/mpeg"
+	case ".wav":
+		return "audio/wav"
+	case ".ogg":
+		return "audio/ogg"
+	case ".aac":
+		return "audio/aac"
+	case ".flac":
+		return "audio/flac"
+	case ".m4a":
+		return "audio/mp4"
+
+	// Video formats
+	case ".mp4":
+		return "video/mp4"
+	case ".webm":
+		return "video/webm"
+	case ".ogv":
+		return "video/ogg"
+	case ".mov":
+		return "video/quicktime"
+	case ".mkv":
+		return "video/x-matroska"
+
+	// Font formats
+	case ".woff":
+		return "font/woff"
+	case ".woff2":
+		return "font/woff2"
+	case ".ttf":
+		return "font/ttf"
+	case ".otf":
+		return "font/otf"
+	case ".eot":
+		return "application/vnd.ms-fontobject"
+
+	// Application formats (renderable in browsers)
 	case ".pdf":
 		return "application/pdf"
+	case ".wasm":
+		return "application/wasm"
+
 	default:
 		return "application/octet-stream"
 	}

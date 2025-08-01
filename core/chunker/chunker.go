@@ -30,9 +30,9 @@ type ChunkInfo struct {
 
 // ChunkedFile represents a file split into chunks
 type ChunkedFile struct {
-	Chunks    []ChunkInfo   `json:"chunks"`
-	TotalSize int64         `json:"total_size"`
-	RootHash  hasher.Hash   `json:"root_hash"`
+	Chunks    []ChunkInfo `json:"chunks"`
+	TotalSize int64       `json:"total_size"`
+	RootHash  hasher.Hash `json:"root_hash"`
 }
 
 // Chunker handles file chunking operations
@@ -55,13 +55,13 @@ func (c *Chunker) ChunkBytes(data []byte) ([]Chunk, error) {
 
 	var chunks []Chunk
 	offset := 0
-	
+
 	for offset < len(data) {
 		end := offset + c.chunkSize
 		if end > len(data) {
 			end = len(data)
 		}
-		
+
 		chunkData := data[offset:end]
 		chunk := Chunk{
 			Hash: hasher.HashBytes(chunkData),
@@ -69,11 +69,11 @@ func (c *Chunker) ChunkBytes(data []byte) ([]Chunk, error) {
 			Size: len(chunkData),
 		}
 		copy(chunk.Data, chunkData)
-		
+
 		chunks = append(chunks, chunk)
 		offset = end
 	}
-	
+
 	return chunks, nil
 }
 
@@ -81,7 +81,7 @@ func (c *Chunker) ChunkBytes(data []byte) ([]Chunk, error) {
 func (c *Chunker) ChunkReader(r io.Reader) ([]Chunk, error) {
 	var chunks []Chunk
 	buffer := make([]byte, c.chunkSize)
-	
+
 	for {
 		n, err := r.Read(buffer)
 		if n == 0 {
@@ -92,18 +92,18 @@ func (c *Chunker) ChunkReader(r io.Reader) ([]Chunk, error) {
 				return nil, fmt.Errorf("failed to read chunk: %w", err)
 			}
 		}
-		
+
 		chunkData := make([]byte, n)
 		copy(chunkData, buffer[:n])
-		
+
 		chunk := Chunk{
 			Hash: hasher.HashBytes(chunkData),
 			Data: chunkData,
 			Size: n,
 		}
-		
+
 		chunks = append(chunks, chunk)
-		
+
 		if err == io.EOF {
 			break
 		}
@@ -111,7 +111,7 @@ func (c *Chunker) ChunkReader(r io.Reader) ([]Chunk, error) {
 			return nil, fmt.Errorf("failed to read chunk: %w", err)
 		}
 	}
-	
+
 	return chunks, nil
 }
 
@@ -120,7 +120,7 @@ func (c *Chunker) CreateChunkedFile(chunks []Chunk) *ChunkedFile {
 	var chunkInfos []ChunkInfo
 	var totalSize int64
 	var hashes []hasher.Hash
-	
+
 	for _, chunk := range chunks {
 		chunkInfos = append(chunkInfos, ChunkInfo{
 			Hash: chunk.Hash,
@@ -129,10 +129,10 @@ func (c *Chunker) CreateChunkedFile(chunks []Chunk) *ChunkedFile {
 		totalSize += int64(chunk.Size)
 		hashes = append(hashes, chunk.Hash)
 	}
-	
+
 	// Create Merkle tree root hash
 	rootHash := c.computeMerkleRoot(hashes)
-	
+
 	return &ChunkedFile{
 		Chunks:    chunkInfos,
 		TotalSize: totalSize,
@@ -148,14 +148,14 @@ func (c *Chunker) computeMerkleRoot(hashes []hasher.Hash) hasher.Hash {
 	if len(hashes) == 1 {
 		return hashes[0]
 	}
-	
+
 	// Build Merkle tree bottom-up
 	currentLevel := make([]hasher.Hash, len(hashes))
 	copy(currentLevel, hashes)
-	
+
 	for len(currentLevel) > 1 {
 		var nextLevel []hasher.Hash
-		
+
 		for i := 0; i < len(currentLevel); i += 2 {
 			if i+1 < len(currentLevel) {
 				// Pair exists, hash both
@@ -166,75 +166,74 @@ func (c *Chunker) computeMerkleRoot(hashes []hasher.Hash) hasher.Hash {
 				nextLevel = append(nextLevel, currentLevel[i])
 			}
 		}
-		
+
 		currentLevel = nextLevel
 	}
-	
+
 	return currentLevel[0]
 }
 
 // ReassembleChunks reconstructs original data from chunks
 func ReassembleChunks(chunks []Chunk) ([]byte, error) {
 	var buffer bytes.Buffer
-	
+
 	for i, chunk := range chunks {
 		if chunk.Size != len(chunk.Data) {
-			return nil, fmt.Errorf("chunk %d size mismatch: expected %d, got %d", 
+			return nil, fmt.Errorf("chunk %d size mismatch: expected %d, got %d",
 				i, chunk.Size, len(chunk.Data))
 		}
-		
+
 		// Verify chunk integrity
 		if !hasher.Verify(chunk.Data, chunk.Hash) {
 			return nil, fmt.Errorf("chunk %d failed integrity check", i)
 		}
-		
+
 		buffer.Write(chunk.Data)
 	}
-	
+
 	return buffer.Bytes(), nil
 }
 
 // VerifyChunkedFile verifies the integrity of a chunked file
 func VerifyChunkedFile(chunkedFile *ChunkedFile, chunks []Chunk) error {
 	if len(chunks) != len(chunkedFile.Chunks) {
-		return fmt.Errorf("chunk count mismatch: expected %d, got %d", 
+		return fmt.Errorf("chunk count mismatch: expected %d, got %d",
 			len(chunkedFile.Chunks), len(chunks))
 	}
-	
+
 	var totalSize int64
 	var hashes []hasher.Hash
-	
+
 	for i, chunk := range chunks {
 		expectedInfo := chunkedFile.Chunks[i]
-		
+
 		if chunk.Hash != expectedInfo.Hash {
 			return fmt.Errorf("chunk %d hash mismatch", i)
 		}
-		
+
 		if chunk.Size != expectedInfo.Size {
 			return fmt.Errorf("chunk %d size mismatch", i)
 		}
-		
+
 		if !hasher.Verify(chunk.Data, chunk.Hash) {
 			return fmt.Errorf("chunk %d failed integrity check", i)
 		}
-		
+
 		totalSize += int64(chunk.Size)
 		hashes = append(hashes, chunk.Hash)
 	}
-	
+
 	if totalSize != chunkedFile.TotalSize {
-		return fmt.Errorf("total size mismatch: expected %d, got %d", 
+		return fmt.Errorf("total size mismatch: expected %d, got %d",
 			chunkedFile.TotalSize, totalSize)
 	}
-	
+
 	// Verify Merkle root
 	chunker := NewChunker(ChunkSize256KB) // Size doesn't matter for verification
 	rootHash := chunker.computeMerkleRoot(hashes)
 	if rootHash != chunkedFile.RootHash {
 		return fmt.Errorf("Merkle root hash mismatch")
 	}
-	
+
 	return nil
 }
-

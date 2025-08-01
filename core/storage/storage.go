@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -43,16 +44,17 @@ const (
 
 // ContentMetadata represents metadata for stored content
 type ContentMetadata struct {
-	Hash        hasher.Hash `json:"hash"`         // Random hash used as the primary identifier
-	ContentHash hasher.Hash `json:"content_hash"` // Content-based hash for verification
-	Filename    string      `json:"filename"`
-	MimeType    string      `json:"mime_type"`
-	Size        int64       `json:"size"`
-	ModTime     time.Time   `json:"mod_time"`
-	ChunkCount  int         `json:"chunk_count,omitempty"`
-	IsDirectory bool        `json:"is_directory"`
-	CreatedAt   time.Time   `json:"created_at"`
-	RefCount    int         `json:"ref_count"`
+	Hash        hasher.Hash   `json:"hash"`         // Random hash used as the primary identifier
+	ContentHash hasher.Hash   `json:"content_hash"` // Content-based hash for verification
+	Filename    string        `json:"filename"`
+	MimeType    string        `json:"mime_type"`
+	Size        int64         `json:"size"`
+	ModTime     time.Time     `json:"mod_time"`
+	ChunkHashes []hasher.Hash `json:"chunk_hashes,omitempty"` // Hashes of the file's chunks
+	ChunkCount  int           `json:"chunk_count,omitempty"`
+	IsDirectory bool          `json:"is_directory"`
+	CreatedAt   time.Time     `json:"created_at"`
+	RefCount    int           `json:"ref_count"`
 }
 
 // ChunkMetadata represents metadata for a chunk
@@ -294,6 +296,42 @@ func (s *Storage) StoreData(hash hasher.Hash, data []byte) error {
 	}
 
 	storageOperationsTotal.WithLabelValues("store_data", "success").Inc()
+	return nil
+}
+
+// StoreDataFromFile moves a file from srcPath to the storage data path.
+func (s *Storage) StoreDataFromFile(hash hasher.Hash, srcPath string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	dstPath := filepath.Join(s.dataPath, hash.String())
+	if err := os.Rename(srcPath, dstPath); err != nil {
+		// If rename fails (e.g., across different devices), fall back to copy
+		log.Printf("Failed to move file, falling back to copy: %v", err)
+		src, err := os.Open(srcPath)
+		if err != nil {
+			return fmt.Errorf("failed to open source file for copy: %w", err)
+		}
+		defer src.Close()
+
+		dst, err := os.Create(dstPath)
+		if err != nil {
+			return fmt.Errorf("failed to create destination file for copy: %w", err)
+		}
+		defer dst.Close()
+
+		if _, err := io.Copy(dst, src); err != nil {
+			return fmt.Errorf("failed to copy file to storage: %w", err)
+		}
+	}
+
+	log.Printf("Stored data for %s from file %s", hash.String(), srcPath)
+	// Update available space metric
+	if space, err := s.GetAvailableSpace(); err == nil {
+		storageSpaceAvailable.Set(float64(space))
+	}
+
+	storageOperationsTotal.WithLabelValues("store_data_from_file", "success").Inc()
 	return nil
 }
 
