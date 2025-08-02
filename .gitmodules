@@ -1,0 +1,3 @@
+[submodule "openhashdb-ui"]
+	path = openhashdb-ui
+	url = https://github.com/nnlgsakib/openhashdb-ui.git
