@@ -351,7 +351,7 @@ func (s *Storage) HasContent(hash hasher.Hash) bool {
 	key := contentPrefix + hash.String()
 	_, err := s.db.Get([]byte(key), nil)
 	if err == nil {
-		log.Printf("Content metadata found for %s", hash.String())
+		// log.Printf("Content metadata found for %s", hash.String())
 		storageOperationsTotal.WithLabelValues("has_content", "success").Inc()
 		return true
 	}
