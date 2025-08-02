@@ -275,24 +275,32 @@ func (s *Server) downloadContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Try to get content data from local storage first.
-	data, err := s.storage.GetData(hash)
+	var data []byte
+	var metadata *storage.ContentMetadata
+
+	// Try to get metadata from local storage first.
+	metadata, err = s.storage.GetContent(hash)
 	if err != nil {
-		log.Printf("Content %s not found locally, attempting to fetch from network.", hashStr)
-		// If not found, try to fetch from the network.
-		data, err = s.fetchContentFromNetwork(r.Context(), hash)
+		// Metadata not found locally, try to fetch from the network.
+		log.Printf("Metadata for %s not found locally, attempting to fetch from network.", hashStr)
+		data, metadata, err = s.fetchContentFromNetwork(r.Context(), hash)
 		if err != nil {
 			s.writeError(w, http.StatusNotFound, "Content not found locally or on the network", err)
 			return
 		}
-	}
-
-	// We have the data, now get metadata for the headers.
-	metadata, err := s.storage.GetContent(hash)
-	if err != nil {
-		// This is unlikely if we just stored it, but handle it.
-		s.writeError(w, http.StatusInternalServerError, "Failed to get metadata for content", err)
-		return
+	} else {
+		// Metadata found, now get the data.
+		data, err = s.storage.GetData(hash)
+		if err != nil {
+			// Data not found locally, despite having metadata. This is an inconsistent state.
+			// Let's try to recover by fetching from the network.
+			log.Printf("Metadata for %s found, but data is missing. Attempting to fetch from network.", hashStr)
+			data, metadata, err = s.fetchContentFromNetwork(r.Context(), hash)
+			if err != nil {
+				s.writeError(w, http.StatusNotFound, "Content data missing and could not be fetched from the network", err)
+				return
+			}
+		}
 	}
 
 	// Set headers
@@ -318,23 +326,32 @@ func (s *Server) viewContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Try to get content data from local storage first.
-	data, err := s.storage.GetData(hash)
+	var data []byte
+	var metadata *storage.ContentMetadata
+
+	// Try to get metadata from local storage first.
+	metadata, err = s.storage.GetContent(hash)
 	if err != nil {
-		log.Printf("Content %s not found locally for viewing, attempting to fetch from network.", hashStr)
-		// If not found, try to fetch from the network.
-		data, err = s.fetchContentFromNetwork(r.Context(), hash)
+		// Metadata not found locally, try to fetch from the network.
+		log.Printf("Metadata for %s not found locally, attempting to fetch from network.", hashStr)
+		data, metadata, err = s.fetchContentFromNetwork(r.Context(), hash)
 		if err != nil {
 			s.writeError(w, http.StatusNotFound, "Content not found locally or on the network", err)
 			return
 		}
-	}
-
-	// We have the data, now get metadata for the headers.
-	metadata, err := s.storage.GetContent(hash)
-	if err != nil {
-		s.writeError(w, http.StatusInternalServerError, "Failed to get metadata for content", err)
-		return
+	} else {
+		// Metadata found, now get the data.
+		data, err = s.storage.GetData(hash)
+		if err != nil {
+			// Data not found locally, despite having metadata. This is an inconsistent state.
+			// Let's try to recover by fetching from the network.
+			log.Printf("Metadata for %s found, but data is missing. Attempting to fetch from network.", hashStr)
+			data, metadata, err = s.fetchContentFromNetwork(r.Context(), hash)
+			if err != nil {
+				s.writeError(w, http.StatusNotFound, "Content data missing and could not be fetched from the network", err)
+				return
+			}
+		}
 	}
 
 	// Determine if content is renderable in browser
@@ -377,20 +394,20 @@ func (s *Server) viewContent(w http.ResponseWriter, r *http.Request) {
 }
 
 // fetchContentFromNetwork finds and retrieves content from peers.
-func (s *Server) fetchContentFromNetwork(ctx context.Context, hash hasher.Hash) ([]byte, error) {
+func (s *Server) fetchContentFromNetwork(ctx context.Context, hash hasher.Hash) ([]byte, *storage.ContentMetadata, error) {
 	libp2pNode, ok := s.node.(*libp2p.Node)
 	if !ok {
-		return nil, fmt.Errorf("network node is not available or does not support fetching")
+		return nil, nil, fmt.Errorf("network node is not available or does not support fetching")
 	}
 
 	hashStr := hash.String()
 	log.Printf("Searching for providers of content %s", hashStr)
 	providers, err := libp2pNode.FindContentProviders(hashStr)
 	if err != nil {
-		return nil, fmt.Errorf("failed to find content providers: %w", err)
+		return nil, nil, fmt.Errorf("failed to find content providers: %w", err)
 	}
 	if len(providers) == 0 {
-		return nil, fmt.Errorf("no providers found for content %s", hashStr)
+		return nil, nil, fmt.Errorf("no providers found for content %s", hashStr)
 	}
 
 	log.Printf("Found %d provider(s) for %s. Attempting to fetch...", len(providers), hashStr)
@@ -470,10 +487,10 @@ func (s *Server) fetchContentFromNetwork(ctx context.Context, hash hasher.Hash) 
 			log.Printf("Warning: failed to store fetched data for %s: %v", hashStr, err)
 		}
 
-		return data, nil
+		return data, metadata, nil
 	}
 
-	return nil, fmt.Errorf("failed to fetch content from all found providers: %w", lastErr)
+	return nil, nil, fmt.Errorf("failed to fetch content from all found providers: %w", lastErr)
 }
 
 // func (s *Server) fetchContentFromNetwork(ctx context.Context, hash hasher.Hash) ([]byte, error) {
@@ -621,23 +638,14 @@ func (s *Server) pinContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get priority from query parameter (default to 1)
-	priority := 1
-	if priorityStr := r.URL.Query().Get("priority"); priorityStr != "" {
-		if p, err := strconv.Atoi(priorityStr); err == nil {
-			priority = p
-		}
-	}
-
-	if err := s.replicator.PinContent(hash, priority); err != nil {
+	if err := s.replicator.PinContent(hash); err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to pin content", err)
 		return
 	}
 
 	response := map[string]interface{}{
-		"hash":     hash.String(),
-		"priority": priority,
-		"message":  "Content pinned successfully",
+		"hash":    hash.String(),
+		"message": "Content pinned successfully",
 	}
 
 	s.writeJSON(w, http.StatusOK, response)
@@ -667,7 +675,7 @@ func (s *Server) unpinContent(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, response)
 }
 
-// listPins lists all pinned content
+// listPins lists all pinned content hashes
 func (s *Server) listPins(w http.ResponseWriter, r *http.Request) {
 	pins := s.replicator.GetPinnedContent()
 	s.writeJSON(w, http.StatusOK, pins)

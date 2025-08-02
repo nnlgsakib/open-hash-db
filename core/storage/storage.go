@@ -399,18 +399,37 @@ func (s *Storage) IncrementRefCount(hash hasher.Hash) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	metadata, err := s.GetContent(hash)
+	key := contentPrefix + hash.String()
+	data, err := s.db.Get([]byte(key), nil)
 	if err != nil {
-		log.Printf("Failed to increment ref count for %s: %v", hash.String(), err)
+		if err == leveldb.ErrNotFound {
+			log.Printf("Content metadata not found for %s", hash.String())
+			storageOperationsTotal.WithLabelValues("increment_ref_count", "not_found").Inc()
+			return fmt.Errorf("content not found: %s", hash.String())
+		}
+		log.Printf("Failed to get content metadata for %s: %v", hash.String(), err)
 		storageOperationsTotal.WithLabelValues("increment_ref_count", "error").Inc()
-		return err
+		return fmt.Errorf("failed to get content metadata for %s: %w", hash.String(), err)
+	}
+
+	var metadata ContentMetadata
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		log.Printf("Failed to unmarshal metadata for %s: %v", hash.String(), err)
+		storageOperationsTotal.WithLabelValues("increment_ref_count", "error").Inc()
+		return fmt.Errorf("failed to unmarshal metadata for %s: %w", hash.String(), err)
 	}
 
 	metadata.RefCount++
-	if err := s.StoreContent(metadata); err != nil {
-		log.Printf("Failed to store updated ref count for %s: %v", hash.String(), err)
+
+	newData, err := json.Marshal(&metadata)
+	if err != nil {
 		storageOperationsTotal.WithLabelValues("increment_ref_count", "error").Inc()
-		return err
+		return fmt.Errorf("failed to marshal metadata for %s: %w", metadata.Hash.String(), err)
+	}
+
+	if err := s.db.Put([]byte(key), newData, &opt.WriteOptions{Sync: true}); err != nil {
+		storageOperationsTotal.WithLabelValues("increment_ref_count", "error").Inc()
+		return fmt.Errorf("failed to store content metadata for %s: %w", metadata.Hash.String(), err)
 	}
 
 	log.Printf("Incremented ref count for %s to %d", hash.String(), metadata.RefCount)
@@ -423,20 +442,39 @@ func (s *Storage) DecrementRefCount(hash hasher.Hash) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	metadata, err := s.GetContent(hash)
+	key := contentPrefix + hash.String()
+	data, err := s.db.Get([]byte(key), nil)
 	if err != nil {
-		log.Printf("Failed to decrement ref count for %s: %v", hash.String(), err)
+		if err == leveldb.ErrNotFound {
+			log.Printf("Content metadata not found for %s", hash.String())
+			storageOperationsTotal.WithLabelValues("decrement_ref_count", "not_found").Inc()
+			return fmt.Errorf("content not found: %s", hash.String())
+		}
+		log.Printf("Failed to get content metadata for %s: %v", hash.String(), err)
 		storageOperationsTotal.WithLabelValues("decrement_ref_count", "error").Inc()
-		return err
+		return fmt.Errorf("failed to get content metadata for %s: %w", hash.String(), err)
+	}
+
+	var metadata ContentMetadata
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		log.Printf("Failed to unmarshal metadata for %s: %v", hash.String(), err)
+		storageOperationsTotal.WithLabelValues("decrement_ref_count", "error").Inc()
+		return fmt.Errorf("failed to unmarshal metadata for %s: %w", hash.String(), err)
 	}
 
 	if metadata.RefCount > 0 {
 		metadata.RefCount--
 	}
-	if err := s.StoreContent(metadata); err != nil {
-		log.Printf("Failed to store updated ref count for %s: %v", hash.String(), err)
+
+	newData, err := json.Marshal(&metadata)
+	if err != nil {
 		storageOperationsTotal.WithLabelValues("decrement_ref_count", "error").Inc()
-		return err
+		return fmt.Errorf("failed to marshal metadata for %s: %w", metadata.Hash.String(), err)
+	}
+
+	if err := s.db.Put([]byte(key), newData, &opt.WriteOptions{Sync: true}); err != nil {
+		storageOperationsTotal.WithLabelValues("decrement_ref_count", "error").Inc()
+		return fmt.Errorf("failed to store content metadata for %s: %w", metadata.Hash.String(), err)
 	}
 
 	log.Printf("Decremented ref count for %s to %d", hash.String(), metadata.RefCount)

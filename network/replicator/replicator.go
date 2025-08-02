@@ -91,7 +91,7 @@ type Replicator struct {
 	storage           *storage.Storage
 	node              *libp2p.Node
 	replicationFactor ReplicationFactor
-	pinnedContent     map[string]int
+	pinnedContent     map[string]struct{}
 	pendingRequests   map[string]chan ChunkResponse
 	requestTracker    map[string]*RequestTracker
 	relayCache        map[string][]byte
@@ -107,7 +107,7 @@ func NewReplicator(storage *storage.Storage, node *libp2p.Node, replicationFacto
 		storage:           storage,
 		node:              node,
 		replicationFactor: replicationFactor,
-		pinnedContent:     make(map[string]int),
+		pinnedContent:     make(map[string]struct{}),
 		pendingRequests:   make(map[string]chan ChunkResponse),
 		requestTracker:    make(map[string]*RequestTracker),
 		relayCache:        make(map[string][]byte),
@@ -156,29 +156,7 @@ func (r *Replicator) AnnounceContent(hash hasher.Hash, size int64) error {
 	return r.node.BroadcastGossip(r.ctx, data)
 }
 
-// ReannounceAll re-announces all local content
-func (r *Replicator) ReannounceAll() {
-	log.Println("Re-announcing all local content...")
-	hashes, err := r.storage.ListContent()
-	if err != nil {
-		log.Printf("Error listing content: %v", err)
-		return
-	}
 
-	for _, hash := range hashes {
-		go func(h hasher.Hash) {
-			metadata, err := r.storage.GetContent(h)
-			if err != nil {
-				log.Printf("Could not get metadata for %s: %v", h.String(), err)
-				return
-			}
-			if err := r.AnnounceContent(h, metadata.Size); err != nil {
-				log.Printf("Failed to re-announce %s: %v", h.String(), err)
-			}
-		}(hash)
-	}
-	log.Printf("Finished re-announcing %d content hashes", len(hashes))
-}
 
 // RequestChunk requests a chunk from the network or relays it
 func (r *Replicator) RequestChunk(hash hasher.Hash) ([]byte, error) {
@@ -252,17 +230,60 @@ func (r *Replicator) RequestChunk(hash hasher.Hash) ([]byte, error) {
 	return data, nil
 }
 
-// PinContent pins content with a priority
-func (r *Replicator) PinContent(hash hasher.Hash, priority int) error {
+// PinContent pins content
+func (r *Replicator) PinContent(hash hasher.Hash) error {
 	r.mu.Lock()
-	r.pinnedContent[hash.String()] = priority
+	r.pinnedContent[hash.String()] = struct{}{}
 	r.mu.Unlock()
 
 	if r.storage.HasContent(hash) {
 		return r.storage.IncrementRefCount(hash)
 	}
 
-	return fmt.Errorf("content not found: %s", hash.String())
+	// If content is not local, fetch it in the background
+	go func() {
+		log.Printf("Content %s is pinned but not local, fetching...", hash.String())
+		providers, err := r.node.FindContentProviders(hash.String())
+		if err != nil {
+			log.Printf("Failed to find providers for pinned content %s: %v", hash.String(), err)
+			return
+		}
+		if len(providers) == 0 {
+			log.Printf("No providers found for pinned content %s", hash.String())
+			return
+		}
+
+		var data []byte
+		var metadata *storage.ContentMetadata
+		var fetchErr error
+
+		for _, p := range providers {
+			if p.ID == r.node.ID() {
+				continue // Skip self
+			}
+			data, metadata, fetchErr = r.node.RequestContentFromPeer(p.ID, hash.String())
+			if fetchErr == nil {
+				break // Success
+			}
+			log.Printf("Failed to fetch pinned content %s from peer %s: %v", hash.String(), p.ID, fetchErr)
+		}
+
+		if fetchErr != nil {
+			log.Printf("Failed to fetch pinned content %s from all providers", hash.String())
+			return
+		}
+
+		if err := r.storage.StoreContent(metadata); err != nil {
+			log.Printf("Failed to store metadata for pinned content %s: %v", hash.String(), err)
+		}
+		if err := r.storage.StoreData(hash, data); err != nil {
+			log.Printf("Failed to store data for pinned content %s: %v", hash.String(), err)
+		}
+		r.storage.IncrementRefCount(hash)
+		log.Printf("Successfully fetched and stored pinned content %s", hash.String())
+	}()
+
+	return nil
 }
 
 // UnpinContent unpins content
@@ -286,13 +307,13 @@ func (r *Replicator) IsPinned(hash hasher.Hash) bool {
 	return pinned
 }
 
-// GetPinnedContent returns all pinned content
-func (r *Replicator) GetPinnedContent() map[string]int {
+// GetPinnedContent returns all pinned content hashes
+func (r *Replicator) GetPinnedContent() []string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	result := make(map[string]int)
-	for hash, priority := range r.pinnedContent {
-		result[hash] = priority
+	result := make([]string, 0, len(r.pinnedContent))
+	for hash := range r.pinnedContent {
+		result = append(result, hash)
 	}
 	return result
 }
@@ -441,37 +462,48 @@ func (r *Replicator) handleChunkMessage(peerID peer.ID, data []byte) error {
 	return nil
 }
 
-// announceContentPeriodically periodically announces content
+// announceContentPeriodically periodically announces pinned content
 func (r *Replicator) announceContentPeriodically() {
-	ticker := time.NewTicker(5 * time.Minute)
+	log.Println("Starting periodic announcement of pinned content...")
+	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			r.announceAllContent()
+			r.announcePinnedContent()
 		case <-r.ctx.Done():
 			return
 		}
 	}
 }
 
-// announceAllContent announces all local content
-func (r *Replicator) announceAllContent() {
-	hashes, err := r.storage.ListContent()
-	if err != nil {
-		log.Printf("Failed to list content: %v", err)
-		return
+// announcePinnedContent announces all pinned local content
+func (r *Replicator) announcePinnedContent() {
+	r.mu.RLock()
+	hashes := make([]string, 0, len(r.pinnedContent))
+	for hash := range r.pinnedContent {
+		hashes = append(hashes, hash)
 	}
+	r.mu.RUnlock()
 
-	for _, hash := range hashes {
+	log.Printf("Announcing %d pinned content items...", len(hashes))
+
+	for _, hashStr := range hashes {
+		hash, err := hasher.HashFromString(hashStr)
+		if err != nil {
+			log.Printf("Invalid pinned hash %s: %v", hashStr, err)
+			continue
+		}
+
 		metadata, err := r.storage.GetContent(hash)
 		if err != nil {
+			log.Printf("Could not get metadata for pinned content %s: %v", hash.String(), err)
 			continue
 		}
 
 		if err := r.AnnounceContent(hash, metadata.Size); err != nil {
-			log.Printf("Failed to announce content %s: %v", hash.String(), err)
+			log.Printf("Failed to announce pinned content %s: %v", hash.String(), err)
 		}
 	}
 }
