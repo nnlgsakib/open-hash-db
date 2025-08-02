@@ -213,7 +213,7 @@ func (s *Storage) GetContent(hash hasher.Hash) (*ContentMetadata, error) {
 		return nil, fmt.Errorf("failed to unmarshal metadata for %s: %w", hash.String(), err)
 	}
 
-	log.Printf("Retrieved content metadata for %s (content hash %s)", hash.String(), metadata.ContentHash.String())
+	// log.Printf("Retrieved content metadata for %s (content hash %s)", hash.String(), metadata.ContentHash.String())
 	storageOperationsTotal.WithLabelValues("get_content", "success").Inc()
 	return &metadata, nil
 }

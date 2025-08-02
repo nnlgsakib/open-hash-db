@@ -15,6 +15,7 @@ import (
 	"openhashdb/core/storage"
 	"openhashdb/network/libp2p"
 	"openhashdb/network/replicator"
+	"openhashdb/openhashdb-ui"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -101,6 +102,8 @@ func (s *Server) setupRoutes() {
 
 	// Health check
 	s.router.HandleFunc("/health", s.healthCheck).Methods("GET", "OPTIONS")
+	//web
+	s.router.PathPrefix("/").Handler(openhashdb.GetHandler())
 }
 
 // corsMiddleware adds CORS headers
