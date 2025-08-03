@@ -358,39 +358,44 @@ func (s *Server) downloadContent(w http.ResponseWriter, r *http.Request) {
 
 	metadata, err := s.storage.GetContent(hash)
 	if err != nil {
-		s.writeError(w, http.StatusNotFound, "Content not found", err)
-		return
+		// Content not found locally, check the network
+		log.Printf("Content %s not found locally. Checking network...", hashStr)
+		libp2pNode, ok := s.node.(*libp2p.Node)
+		if !ok {
+			s.writeError(w, http.StatusNotFound, "Content not found locally and network is unavailable", nil)
+			return
+		}
+
+		providers, err := libp2pNode.FindContentProviders(hashStr)
+		if err != nil || len(providers) == 0 {
+			s.writeError(w, http.StatusNotFound, fmt.Sprintf("Content not found locally or on the network: no providers found for content %s", hashStr), nil)
+			return
+		}
+
+		// Found providers. Assume it's a large file and fetch the manifest first.
+		log.Printf("Found providers for %s. Fetching manifest...", hashStr)
+		_, manifest, err := s.fetchContentFromNetwork(r.Context(), hash)
+		if err != nil {
+			s.writeError(w, http.StatusInternalServerError, "Failed to fetch content manifest from network", err)
+			return
+		}
+		metadata = manifest
 	}
 
-	// Handle large files by fetching chunks
+	// At this point, we have the metadata, either from local storage or the network.
 	if metadata.IsDirectory && metadata.ChunkCount > 0 {
 		s.downloadLargeFile(w, metadata)
 		return
 	}
 
-	var data []byte
-	// Try to get metadata from local storage first.
-	metadata, err = s.storage.GetContent(hash)
+	// Handle small files
+	data, err := s.storage.GetData(hash)
 	if err != nil {
-		// Metadata not found locally, try to fetch from the network.
-		log.Printf("Metadata for %s not found locally, attempting to fetch from network.", hashStr)
+		// If data is still not found (e.g., manifest was fetched but not the content), fetch it now.
 		data, metadata, err = s.fetchContentFromNetwork(r.Context(), hash)
 		if err != nil {
-			s.writeError(w, http.StatusNotFound, "Content not found locally or on the network", err)
+			s.writeError(w, http.StatusNotFound, "Content data missing and could not be fetched from the network", err)
 			return
-		}
-	} else {
-		// Metadata found, now get the data.
-		data, err = s.storage.GetData(hash)
-		if err != nil {
-			// Data not found locally, despite having metadata. This is an inconsistent state.
-			// Let's try to recover by fetching from the network.
-			log.Printf("Metadata for %s found, but data is missing. Attempting to fetch from network.", hashStr)
-			data, metadata, err = s.fetchContentFromNetwork(r.Context(), hash)
-			if err != nil {
-				s.writeError(w, http.StatusNotFound, "Content data missing and could not be fetched from the network", err)
-				return
-			}
 		}
 	}
 
@@ -414,21 +419,35 @@ func (s *Server) downloadLargeFile(w http.ResponseWriter, metadata *storage.Cont
 		return
 	}
 
+	totalChunks := len(chunkHashes)
+	log.Printf("Starting download of large file %s (%d chunks)", metadata.Filename, totalChunks)
+
+
 	// Set headers for the file
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", metadata.Filename))
 	w.WriteHeader(http.StatusOK)
 
-	// Fetch and stream chunks in parallel
-	for _, chunkHash := range chunkHashes {
+	// Fetch and stream chunks sequentially to ensure correct order
+	for i, chunkHash := range chunkHashes {
+		progress := float64(i+1) / float64(totalChunks) * 100
+		log.Printf("Downloading chunk %d of %d (%.2f%%) for file %s", i+1, totalChunks, progress, metadata.Filename)
+
 		chunkData, err := s.replicator.RequestChunk(chunkHash)
 		if err != nil {
 			log.Printf("Failed to fetch chunk %s: %v", chunkHash.String(), err)
-			// Handle error appropriately, maybe retry or fail the download
+			// Handling the error by stopping the download. A more robust solution might involve retries.
+			http.Error(w, "Failed to download a chunk", http.StatusInternalServerError)
 			return
 		}
-		w.Write(chunkData)
+		_, err = w.Write(chunkData)
+		if err != nil {
+			// This error typically happens if the client closes the connection.
+			log.Printf("Failed to write chunk data to response: %v", err)
+			return
+		}
 	}
+	log.Printf("Finished downloading large file %s", metadata.Filename)
 }
 
 // viewContent handles content viewing, fetching from the network if not available locally.
@@ -673,7 +692,25 @@ func (s *Server) getContentInfo(w http.ResponseWriter, r *http.Request) {
 
 	metadata, err := s.storage.GetContent(hash)
 	if err != nil {
-		s.writeError(w, http.StatusNotFound, "Content not found", err)
+		// Content not found locally, let's check the network.
+		log.Printf("Content %s not found locally. Checking network for providers...", hashStr)
+		libp2pNode, ok := s.node.(*libp2p.Node)
+		if !ok {
+			s.writeError(w, http.StatusNotFound, "Content not found locally and network is unavailable", nil)
+			return
+		}
+
+		providers, err := libp2pNode.FindContentProviders(hashStr)
+		if err != nil || len(providers) == 0 {
+			s.writeError(w, http.StatusNotFound, fmt.Sprintf("Content not found locally or on the network: no providers found for content %s", hashStr), nil)
+			return
+		}
+
+		// Providers found, so the content exists on the network.
+		s.writeJSON(w, http.StatusAccepted, map[string]string{
+			"message": "Content is available on the network. Use the /download endpoint to retrieve it.",
+			"hash":    hashStr,
+		})
 		return
 	}
 
