@@ -292,6 +292,7 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 	h.SetStreamHandler(ProtocolContentExchange, node.handleContentStream)
 	h.SetStreamHandler(ProtocolChunkExchange, node.handleChunkStream)
 	h.SetStreamHandler(ProtocolGossip, node.handleGossipStream)
+	h.SetStreamHandler(DiscoveryProtocol, node.discovery.handleStream)
 
 	// Setup mDNS
 	if err := node.setupMDNS(); err != nil {
