@@ -24,6 +24,10 @@ import (
 	"github.com/gorilla/mux"
 )
 
+const (
+	LargeFileThreshold = 200 * 1024 * 1024 // 200MB
+)
+
 // Server represents the REST API server
 type Server struct {
 	storage    *storage.Storage
@@ -166,6 +170,12 @@ func (s *Server) uploadFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Handle large files
+	if len(content) > LargeFileThreshold {
+		s.handleLargeFile(w, header.Filename, content)
+		return
+	}
+
 	// Store the file
 	hash, err := s.storeFile(header.Filename, content)
 	if err != nil {
@@ -174,7 +184,7 @@ func (s *Server) uploadFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Announce to network
-	if err := s.replicator.AnnounceContent(hash, int64(len(content))); err != nil {
+	if err := s.replicator.AnnounceContent(hash, int64(len(content)), false); err != nil {
 		log.Printf("Failed to announce content: %v", err)
 	}
 
@@ -187,6 +197,67 @@ func (s *Server) uploadFile(w http.ResponseWriter, r *http.Request) {
 
 	s.writeJSON(w, http.StatusOK, response)
 }
+
+// handleLargeFile chunks a large file, stores the chunks, and announces the root hash.
+func (s *Server) handleLargeFile(w http.ResponseWriter, filename string, content []byte) {
+	chunks, err := s.chunker.ChunkBytes(content)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "Failed to chunk file", err)
+		return
+	}
+
+	chunkedFile := s.chunker.CreateChunkedFile(chunks)
+	var chunkHashes []hasher.Hash
+	for _, chunk := range chunks {
+		if err := s.storage.StoreData(chunk.Hash, chunk.Data); err != nil {
+			s.writeError(w, http.StatusInternalServerError, "Failed to store chunk", err)
+			return
+		}
+		chunkHashes = append(chunkHashes, chunk.Hash)
+	}
+
+	// Store the chunk hashes
+	chunkHashesBytes, err := json.Marshal(chunkHashes)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "Failed to marshal chunk hashes", err)
+		return
+	}
+	if err := s.storage.StoreData(chunkedFile.RootHash, chunkHashesBytes); err != nil {
+		s.writeError(w, http.StatusInternalServerError, "Failed to store chunk hashes", err)
+		return
+	}
+
+	// Store the DAG structure as metadata
+	dagNode := &storage.ContentMetadata{
+		Hash:        chunkedFile.RootHash,
+		Filename:    filename,
+		Size:        chunkedFile.TotalSize,
+		ModTime:     time.Now(),
+		IsDirectory: true, // Treat as a directory of chunks
+		CreatedAt:   time.Now(),
+		RefCount:    1,
+		ChunkCount:  len(chunks),
+	}
+	if err := s.storage.StoreContent(dagNode); err != nil {
+		s.writeError(w, http.StatusInternalServerError, "Failed to store DAG metadata", err)
+		return
+	}
+
+	// Announce only the root hash, and mark it as a large file
+	if err := s.replicator.AnnounceContent(chunkedFile.RootHash, chunkedFile.TotalSize, true); err != nil {
+		log.Printf("Failed to announce large file content: %v", err)
+	}
+
+	response := UploadResponse{
+		Hash:     chunkedFile.RootHash.String(),
+		Size:     chunkedFile.TotalSize,
+		Filename: filename,
+		Message:  "Large file uploaded and chunked successfully",
+	}
+
+	s.writeJSON(w, http.StatusOK, response)
+}
+
 
 // uploadFolder handles folder uploads by accepting multiple files, zipping them in-memory, and storing the zip.
 func (s *Server) uploadFolder(w http.ResponseWriter, r *http.Request) {
@@ -246,6 +317,13 @@ func (s *Server) uploadFolder(w http.ResponseWriter, r *http.Request) {
 
 	// Store the zipped content.
 	zipData := buf.Bytes()
+
+	// Handle large files
+	if len(zipData) > LargeFileThreshold {
+		s.handleLargeFile(w, folderName, zipData)
+		return
+	}
+
 	hash, err := s.storeFile(folderName, zipData)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to store zipped folder", err)
@@ -253,7 +331,7 @@ func (s *Server) uploadFolder(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Announce to network.
-	if err := s.replicator.AnnounceContent(hash, int64(len(zipData))); err != nil {
+	if err := s.replicator.AnnounceContent(hash, int64(len(zipData)), false); err != nil {
 		log.Printf("Failed to announce content: %v", err)
 	}
 
@@ -278,9 +356,19 @@ func (s *Server) downloadContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var data []byte
-	var metadata *storage.ContentMetadata
+	metadata, err := s.storage.GetContent(hash)
+	if err != nil {
+		s.writeError(w, http.StatusNotFound, "Content not found", err)
+		return
+	}
 
+	// Handle large files by fetching chunks
+	if metadata.IsDirectory && metadata.ChunkCount > 0 {
+		s.downloadLargeFile(w, metadata)
+		return
+	}
+
+	var data []byte
 	// Try to get metadata from local storage first.
 	metadata, err = s.storage.GetContent(hash)
 	if err != nil {
@@ -316,6 +404,31 @@ func (s *Server) downloadContent(w http.ResponseWriter, r *http.Request) {
 	// Write content
 	w.WriteHeader(http.StatusOK)
 	w.Write(data)
+}
+
+// downloadLargeFile handles the download of a large file by fetching its chunks.
+func (s *Server) downloadLargeFile(w http.ResponseWriter, metadata *storage.ContentMetadata) {
+	chunkHashes, err := s.storage.GetChunkHashes(metadata.Hash)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "Failed to get chunk hashes", err)
+		return
+	}
+
+	// Set headers for the file
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", metadata.Filename))
+	w.WriteHeader(http.StatusOK)
+
+	// Fetch and stream chunks in parallel
+	for _, chunkHash := range chunkHashes {
+		chunkData, err := s.replicator.RequestChunk(chunkHash)
+		if err != nil {
+			log.Printf("Failed to fetch chunk %s: %v", chunkHash.String(), err)
+			// Handle error appropriately, maybe retry or fail the download
+			return
+		}
+		w.Write(chunkData)
+	}
 }
 
 // viewContent handles content viewing, fetching from the network if not available locally.

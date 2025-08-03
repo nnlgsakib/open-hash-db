@@ -154,7 +154,7 @@ func (s *Storage) StoreContent(metadata *ContentMetadata) error {
 		return fmt.Errorf("failed to store content metadata for %s: %w", metadata.Hash.String(), err)
 	}
 
-	log.Printf("Stored content metadata for random hash %s with content hash %s", metadata.Hash.String(), metadata.ContentHash.String())
+	// log.Printf("Stored content metadata for random hash %s with content hash %s", metadata.Hash.String(), metadata.ContentHash.String())
 	storageOperationsTotal.WithLabelValues("store_content", "success").Inc()
 	return nil
 }
@@ -665,6 +665,34 @@ func (s *Storage) GarbageCollect() error {
 	log.Printf("Completed garbage collection")
 	storageOperationsTotal.WithLabelValues("garbage_collect", "success").Inc()
 	return nil
+}
+
+// GetChunkHashes retrieves the hashes of all chunks associated with a large file's root hash.
+func (s *Storage) GetChunkHashes(rootHash hasher.Hash) ([]hasher.Hash, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	metadata, err := s.GetContent(rootHash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get content metadata for root hash %s: %w", rootHash.String(), err)
+	}
+
+	if !metadata.IsDirectory || metadata.ChunkCount == 0 {
+		return nil, fmt.Errorf("not a large file or no chunks associated with root hash %s", rootHash.String())
+	}
+
+	// In our simplified model, we assume the chunk hashes are stored in a file named after the root hash.
+	data, err := s.GetData(rootHash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read chunk hashes file: %w", err)
+	}
+
+	var chunkHashes []hasher.Hash
+	if err := json.Unmarshal(data, &chunkHashes); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal chunk hashes: %w", err)
+	}
+
+	return chunkHashes, nil
 }
 
 // GetStats returns storage statistics

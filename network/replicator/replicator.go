@@ -58,6 +58,7 @@ type ContentAnnouncement struct {
 	Size      int64       `json:"size"`
 	Timestamp time.Time   `json:"timestamp"`
 	PeerID    string      `json:"peer_id"`
+	IsLarge   bool        `json:"is_large"`
 }
 
 // ChunkRequest represents a request for a specific chunk
@@ -129,8 +130,40 @@ func (r *Replicator) Close() error {
 	return nil
 }
 
+// RequestChunk requests a chunk from the network.
+func (r *Replicator) RequestChunk(hash hasher.Hash) ([]byte, error) {
+	// Check local storage first
+	if r.storage.HasData(hash) {
+		return r.storage.GetData(hash)
+	}
+
+	// Find providers for the chunk
+	providers, err := r.node.FindContentProviders(hash.String())
+	if err != nil {
+		return nil, fmt.Errorf("failed to find providers for chunk %s: %w", hash.String(), err)
+	}
+
+	if len(providers) == 0 {
+		return nil, fmt.Errorf("no providers found for chunk %s", hash.String())
+	}
+
+	// Request the chunk from the first provider
+	// A more robust implementation would try multiple providers
+	data, _, err := r.node.RequestContentFromPeer(providers[0].ID, hash.String())
+	if err != nil {
+		return nil, fmt.Errorf("failed to request chunk %s from peer %s: %w", hash.String(), providers[0].ID, err)
+	}
+
+	// Store the chunk locally
+	if err := r.storage.StoreData(hash, data); err != nil {
+		log.Printf("Failed to store chunk %s: %v", hash.String(), err)
+	}
+
+	return data, nil
+}
+
 // AnnounceContent announces new content
-func (r *Replicator) AnnounceContent(hash hasher.Hash, size int64) error {
+func (r *Replicator) AnnounceContent(hash hasher.Hash, size int64, isLargeFile bool) error {
 	// Verify that content metadata exists before announcing
 	if !r.storage.HasContent(hash) {
 		log.Printf("Content %s not found locally, skipping announcement", hash.String())
@@ -146,6 +179,7 @@ func (r *Replicator) AnnounceContent(hash hasher.Hash, size int64) error {
 		Size:      size,
 		Timestamp: time.Now(),
 		PeerID:    r.node.ID().String(),
+		IsLarge:   isLargeFile,
 	}
 
 	data, err := json.Marshal(announcement)
@@ -158,77 +192,7 @@ func (r *Replicator) AnnounceContent(hash hasher.Hash, size int64) error {
 
 
 
-// RequestChunk requests a chunk from the network or relays it
-func (r *Replicator) RequestChunk(hash hasher.Hash) ([]byte, error) {
-	// Check local storage
-	if r.storage.HasData(hash) {
-		data, err := r.storage.GetData(hash)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get local data for %s: %w", hash.String(), err)
-		}
-		return data, nil
-	}
 
-	// Check relay cache
-	r.mu.RLock()
-	if data, exists := r.relayCache[hash.String()]; exists {
-		r.mu.RUnlock()
-		return data, nil
-	}
-	r.mu.RUnlock()
-
-	// Track request frequency
-	r.mu.Lock()
-	tracker, exists := r.requestTracker[hash.String()]
-	if !exists {
-		tracker = &RequestTracker{
-			Count:     1,
-			FirstSeen: time.Now(),
-		}
-		r.requestTracker[hash.String()] = tracker
-	} else {
-		tracker.Count++
-	}
-	shouldReplicate := tracker.Count >= RelayThreshold
-	r.mu.Unlock()
-
-	// Find providers
-	providers, err := r.node.FindContentProviders(hash.String())
-	if err != nil {
-		return nil, fmt.Errorf("failed to find providers for %s: %w", hash.String(), err)
-	}
-	if len(providers) == 0 {
-		return nil, fmt.Errorf("no providers found for content %s", hash.String())
-	}
-
-	// Request from first provider
-	data, metadata, err := r.node.RequestContentFromPeer(providers[0].ID, hash.String())
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch content from %s: %w", providers[0].ID.String(), err)
-	}
-
-	// Store in relay cache
-	r.mu.Lock()
-	r.relayCache[hash.String()] = data
-	r.mu.Unlock()
-
-	// On-demand replication
-	if shouldReplicate {
-		replicationRequestsTotal.WithLabelValues("on_demand").Inc()
-		if err := r.storage.StoreData(hash, data); err != nil {
-			replicationFailuresTotal.Inc()
-			log.Printf("Failed to replicate content %s: %v", hash.String(), err)
-		} else {
-			replicationSuccessTotal.Inc()
-			log.Printf("Replicated content %s locally after %d requests", hash.String(), tracker.Count)
-			if err := r.AnnounceContent(hash, metadata.Size); err != nil {
-				log.Printf("Failed to announce replicated content %s: %v", hash.String(), err)
-			}
-		}
-	}
-
-	return data, nil
-}
 
 // PinContent pins content
 func (r *Replicator) PinContent(hash hasher.Hash) error {
@@ -343,6 +307,12 @@ func (r *Replicator) handleContentAnnouncement(peerID peer.ID, announcement *Con
 		return nil
 	}
 
+	// Do not auto-replicate large files
+	if announcement.IsLarge {
+		log.Printf("Received announcement for large file %s. Will not auto-replicate.", announcement.Hash.String())
+		return nil
+	}
+
 	availableSpace, err := r.storage.GetAvailableSpace()
 	if err != nil {
 		log.Printf("Failed to check storage capacity: %v", err)
@@ -386,7 +356,7 @@ func (r *Replicator) handleContentAnnouncement(peerID peer.ID, announcement *Con
 
 	replicationSuccessTotal.Inc()
 	log.Printf("Successfully replicated content %s from %s", announcement.Hash.String(), peerID.String())
-	if err := r.AnnounceContent(announcement.Hash, metadata.Size); err != nil {
+	if err := r.AnnounceContent(announcement.Hash, metadata.Size, false); err != nil {
 		log.Printf("Failed to announce replicated content %s: %v", announcement.Hash.String(), err)
 	}
 
@@ -502,7 +472,7 @@ func (r *Replicator) announcePinnedContent() {
 			continue
 		}
 
-		if err := r.AnnounceContent(hash, metadata.Size); err != nil {
+		if err := r.AnnounceContent(hash, metadata.Size, false); err != nil {
 			log.Printf("Failed to announce pinned content %s: %v", hash.String(), err)
 		}
 	}
