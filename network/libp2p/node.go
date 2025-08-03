@@ -77,7 +77,7 @@ const (
 	ProtocolContentExchange = protocol.ID("/openhashdb/content/1.0.0")
 	ProtocolChunkExchange   = protocol.ID("/openhashdb/chunk/1.0.0")
 	ProtocolGossip          = protocol.ID("/openhashdb/gossip/1.0.0")
-	ProtocolDiscovery       = protocol.ID("/openhashdb/discovery/1.0.0") // Discovery protocol for peer discovery
+	DiscoveryProtocol       = protocol.ID("/openhashdb/discovery/1.0.0") // Discovery protocol for peer discovery
 	ServiceTag              = "openhashdb"
 	MaxPeerEventLogs        = 100
 )

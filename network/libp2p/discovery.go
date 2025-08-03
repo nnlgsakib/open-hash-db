@@ -1,4 +1,3 @@
-
 package libp2p
 
 import (
@@ -11,12 +10,10 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/core/protocol"
+	// "github.com/libp2p/go-libp2p/core/protocol"
 )
 
 const (
-	// DiscoveryProtocol is the protocol ID for peer discovery.
-	DiscoveryProtocol = protocol.ID("/openhashdb/discovery/1.0.0")
 	// PeerExchangeRequest is the message type for requesting peers.
 	PeerExchangeRequest = "PEER_EXCHANGE_REQUEST"
 	// PeerExchangeResponse is the message type for responding with peers.
