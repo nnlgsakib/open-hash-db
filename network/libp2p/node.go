@@ -77,7 +77,6 @@ const (
 	ProtocolContentExchange = protocol.ID("/openhashdb/content/1.0.0")
 	ProtocolChunkExchange   = protocol.ID("/openhashdb/chunk/1.0.0")
 	ProtocolGossip          = protocol.ID("/openhashdb/gossip/1.0.0")
-	DiscoveryProtocol       = protocol.ID("/openhashdb/discovery/1.0.0") // Discovery protocol for peer discovery
 	ServiceTag              = "openhashdb"
 	MaxPeerEventLogs        = 100
 )
@@ -97,7 +96,6 @@ type Node struct {
 	cancel                context.CancelFunc
 	mdns                  mdns.Service
 	dht                   *dht.IpfsDHT
-	discovery             *DiscoveryService //peer discovery service
 	storage               *storage.Storage
 	ContentHandler        func(peer.ID, []byte) error
 	ChunkHandler          func(peer.ID, []byte) error
@@ -292,16 +290,11 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 	h.SetStreamHandler(ProtocolContentExchange, node.handleContentStream)
 	h.SetStreamHandler(ProtocolChunkExchange, node.handleChunkStream)
 	h.SetStreamHandler(ProtocolGossip, node.handleGossipStream)
-	h.SetStreamHandler(DiscoveryProtocol, node.discovery.handleStream)
 
 	// Setup mDNS
 	if err := node.setupMDNS(); err != nil {
 		log.Printf("Warning: failed to setup mDNS: %v", err)
 	}
-
-	// Setup Discovery Service
-	node.discovery = NewDiscoveryService(nodeCtx, h)
-	node.discovery.Start()
 
 	log.Printf("Node started with ID: %s", h.ID().String())
 	log.Printf("Listening on addresses:")
@@ -387,9 +380,7 @@ func (n *Node) Close() error {
 			log.Printf("Error closing DHT: %v", err)
 		}
 	}
-	if n.discovery != nil { // Stop the discovery service if it exists
-		n.discovery.Stop()
-	}
+
 	n.cancel()
 	return n.host.Close()
 }
