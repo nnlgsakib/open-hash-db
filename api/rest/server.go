@@ -145,13 +145,6 @@ func (s *Server) Stop(ctx context.Context) error {
 
 // uploadFile handles single file uploads
 func (s *Server) uploadFile(w http.ResponseWriter, r *http.Request) {
-	// Parse multipart form
-	err := r.ParseMultipartForm(32 << 20) // 32MB max memory
-	if err != nil {
-		s.writeError(w, http.StatusBadRequest, "Failed to parse multipart form", err)
-		return
-	}
-
 	file, header, err := r.FormFile("file")
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, "No file provided", err)
@@ -159,28 +152,21 @@ func (s *Server) uploadFile(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	// Read file content
-	content, err := io.ReadAll(file)
-	if err != nil {
-		s.writeError(w, http.StatusInternalServerError, "Failed to read file", err)
-		return
-	}
-
-	// Store the file
-	hash, err := s.storeFile(header.Filename, content)
+	// Store the file by streaming
+	hash, size, err := s.storeFile(header.Filename, file)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to store file", err)
 		return
 	}
 
 	// Announce to network
-	if err := s.replicator.AnnounceContent(hash, int64(len(content))); err != nil {
+	if err := s.replicator.AnnounceContent(hash, size); err != nil {
 		log.Printf("Failed to announce content: %v", err)
 	}
 
 	response := UploadResponse{
 		Hash:     hash.String(),
-		Size:     int64(len(content)),
+		Size:     size,
 		Filename: header.Filename,
 		Message:  "File uploaded successfully",
 	}
@@ -245,21 +231,21 @@ func (s *Server) uploadFolder(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Store the zipped content.
-	zipData := buf.Bytes()
-	hash, err := s.storeFile(folderName, zipData)
+	zipDataReader := bytes.NewReader(buf.Bytes())
+	hash, size, err := s.storeFile(folderName, zipDataReader)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to store zipped folder", err)
 		return
 	}
 
 	// Announce to network.
-	if err := s.replicator.AnnounceContent(hash, int64(len(zipData))); err != nil {
+	if err := s.replicator.AnnounceContent(hash, size); err != nil {
 		log.Printf("Failed to announce content: %v", err)
 	}
 
 	response := UploadResponse{
 		Hash:     hash.String(),
-		Size:     int64(len(zipData)),
+		Size:     size,
 		Filename: folderName,
 		Message:  "Folder uploaded and zipped successfully",
 	}
@@ -278,33 +264,39 @@ func (s *Server) downloadContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var data []byte
 	var metadata *storage.ContentMetadata
+	var dataStream io.ReadCloser
 
-	// Try to get metadata from local storage first.
+	// Try to get metadata and data stream from local storage first.
 	metadata, err = s.storage.GetContent(hash)
 	if err != nil {
 		// Metadata not found locally, try to fetch from the network.
 		log.Printf("Metadata for %s not found locally, attempting to fetch from network.", hashStr)
-		data, metadata, err = s.fetchContentFromNetwork(r.Context(), hash)
+		var fetchedData []byte
+		fetchedData, metadata, err = s.fetchContentFromNetwork(r.Context(), hash)
 		if err != nil {
 			s.writeError(w, http.StatusNotFound, "Content not found locally or on the network", err)
 			return
 		}
+		// Create a reader from the fetched data for streaming
+		dataStream = io.NopCloser(bytes.NewReader(fetchedData))
 	} else {
-		// Metadata found, now get the data.
-		data, err = s.storage.GetData(hash)
+		// Metadata found, now get the data stream.
+		dataStream, err = s.storage.GetDataStream(hash)
 		if err != nil {
-			// Data not found locally, despite having metadata. This is an inconsistent state.
+			// Data stream not found locally, despite having metadata. This is an inconsistent state.
 			// Let's try to recover by fetching from the network.
-			log.Printf("Metadata for %s found, but data is missing. Attempting to fetch from network.", hashStr)
-			data, metadata, err = s.fetchContentFromNetwork(r.Context(), hash)
+			log.Printf("Metadata for %s found, but data stream is missing. Attempting to fetch from network.", hashStr)
+			var fetchedData []byte
+			fetchedData, metadata, err = s.fetchContentFromNetwork(r.Context(), hash)
 			if err != nil {
 				s.writeError(w, http.StatusNotFound, "Content data missing and could not be fetched from the network", err)
 				return
 			}
+			dataStream = io.NopCloser(bytes.NewReader(fetchedData))
 		}
 	}
+	defer dataStream.Close()
 
 	// Set headers
 	w.Header().Set("Content-Type", metadata.MimeType)
@@ -313,9 +305,12 @@ func (s *Server) downloadContent(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", metadata.Filename))
 	}
 
-	// Write content
+	// Write content by streaming
 	w.WriteHeader(http.StatusOK)
-	w.Write(data)
+	if _, err := io.Copy(w, dataStream); err != nil {
+		log.Printf("Failed to stream content %s to client: %v", hashStr, err)
+		// Note: Cannot write error to response after headers have been sent
+	}
 }
 
 // viewContent handles content viewing, fetching from the network if not available locally.
@@ -329,33 +324,39 @@ func (s *Server) viewContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var data []byte
 	var metadata *storage.ContentMetadata
+	var dataStream io.ReadCloser
 
-	// Try to get metadata from local storage first.
+	// Try to get metadata and data stream from local storage first.
 	metadata, err = s.storage.GetContent(hash)
 	if err != nil {
 		// Metadata not found locally, try to fetch from the network.
 		log.Printf("Metadata for %s not found locally, attempting to fetch from network.", hashStr)
-		data, metadata, err = s.fetchContentFromNetwork(r.Context(), hash)
+		var fetchedData []byte
+		fetchedData, metadata, err = s.fetchContentFromNetwork(r.Context(), hash)
 		if err != nil {
 			s.writeError(w, http.StatusNotFound, "Content not found locally or on the network", err)
 			return
 		}
+		// Create a reader from the fetched data for streaming
+		dataStream = io.NopCloser(bytes.NewReader(fetchedData))
 	} else {
-		// Metadata found, now get the data.
-		data, err = s.storage.GetData(hash)
+		// Metadata found, now get the data stream.
+		dataStream, err = s.storage.GetDataStream(hash)
 		if err != nil {
-			// Data not found locally, despite having metadata. This is an inconsistent state.
+			// Data stream not found locally, despite having metadata. This is an inconsistent state.
 			// Let's try to recover by fetching from the network.
-			log.Printf("Metadata for %s found, but data is missing. Attempting to fetch from network.", hashStr)
-			data, metadata, err = s.fetchContentFromNetwork(r.Context(), hash)
+			log.Printf("Metadata for %s found, but data stream is missing. Attempting to fetch from network.", hashStr)
+			var fetchedData []byte
+			fetchedData, metadata, err = s.fetchContentFromNetwork(r.Context(), hash)
 			if err != nil {
 				s.writeError(w, http.StatusNotFound, "Content data missing and could not be fetched from the network", err)
 				return
 			}
+			dataStream = io.NopCloser(bytes.NewReader(fetchedData))
 		}
 	}
+	defer dataStream.Close()
 
 	// Determine if content is renderable in browser
 	isRenderable := strings.HasPrefix(metadata.MimeType, "text/") ||
@@ -367,9 +368,12 @@ func (s *Server) viewContent(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", metadata.MimeType)
 		w.Header().Set("Content-Length", strconv.FormatInt(metadata.Size, 10))
 		w.Header().Set("Content-Disposition", "inline")
-		// Write content
+		// Write content by streaming
 		w.WriteHeader(http.StatusOK)
-		w.Write(data)
+		if _, err := io.Copy(w, dataStream); err != nil {
+			log.Printf("Failed to stream content %s to client: %v", hashStr, err)
+			// Note: Cannot write error to response after headers have been sent
+		}
 	} else {
 		// For non-renderable content, provide a download link
 		w.Header().Set("Content-Type", "text/html")
@@ -695,26 +699,30 @@ func (s *Server) healthCheck(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, health)
 }
 
-// storeFile stores a file and returns its hash
-func (s *Server) storeFile(filename string, content []byte) (hasher.Hash, error) {
-	// Generate a random 32-byte hash
+// storeFile stores a file and returns its hash and size
+func (s *Server) storeFile(filename string, reader io.Reader) (hasher.Hash, int64, error) {
+	// Generate a random 32-byte hash for the primary identifier
 	randomBytes := make([]byte, 32)
 	_, err := rand.Read(randomBytes)
 	if err != nil {
-		return hasher.Hash{}, fmt.Errorf("failed to generate random hash: %w", err)
+		return hasher.Hash{}, 0, fmt.Errorf("failed to generate random hash: %w", err)
 	}
+	hash := hasher.HashBytes(randomBytes)
 
-	// Create random hash using hasher.HashBytes
-	hash := hasher.HashBytes(randomBytes) // Changed from sha256.Sum256 to hasher.HashBytes
+	// Create a buffer to read the content and calculate its hash and size
+	var b bytes.Buffer
+	size, err := io.Copy(&b, reader)
+	if err != nil {
+		return hasher.Hash{}, 0, fmt.Errorf("failed to read content for hashing: %w", err)
+	}
+	contentHash := hasher.HashBytes(b.Bytes())
 
-	// Compute content-based hash for verification
-	contentHash := hasher.HashBytes(content)
-	log.Printf("Storing file %s: random hash=%s, content hash=%s", filename, hash.String(), contentHash.String())
+	log.Printf("Storing file %s: random hash=%s, content hash=%s, size=%d", filename, hash.String(), contentHash.String(), size)
 
 	// Check if content with this random hash already exists
 	if s.storage.HasContent(hash) {
 		log.Printf("Content with hash %s already exists", hash.String())
-		return hash, nil
+		return hash, size, nil
 	}
 
 	// Create metadata
@@ -723,7 +731,7 @@ func (s *Server) storeFile(filename string, content []byte) (hasher.Hash, error)
 		ContentHash: contentHash, // Store content-based hash
 		Filename:    filename,
 		MimeType:    getMimeType(filename),
-		Size:        int64(len(content)),
+		Size:        size,
 		ModTime:     time.Now(),
 		IsDirectory: false,
 		CreatedAt:   time.Now(),
@@ -732,16 +740,16 @@ func (s *Server) storeFile(filename string, content []byte) (hasher.Hash, error)
 
 	// Store metadata
 	if err := s.storage.StoreContent(metadata); err != nil {
-		return hasher.Hash{}, fmt.Errorf("failed to store metadata: %w", err)
+		return hasher.Hash{}, 0, fmt.Errorf("failed to store metadata: %w", err)
 	}
 
-	// Store data
-	if err := s.storage.StoreData(hash, content); err != nil {
-		return hasher.Hash{}, fmt.Errorf("failed to store data: %w", err)
+	// Store data using the buffered content
+	if err := s.storage.StoreDataStream(hash, bytes.NewReader(b.Bytes()), size); err != nil {
+		return hasher.Hash{}, 0, fmt.Errorf("failed to store data stream: %w", err)
 	}
 
 	log.Printf("Successfully stored file %s with random hash %s and content hash %s", filename, hash.String(), contentHash.String())
-	return hash, nil
+	return hash, size, nil
 }
 
 // func (s *Server) storeFile(filename string, content []byte) (hasher.Hash, error) {

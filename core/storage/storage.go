@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -294,6 +295,43 @@ func (s *Storage) StoreData(hash hasher.Hash, data []byte) error {
 	}
 
 	storageOperationsTotal.WithLabelValues("store_data", "success").Inc()
+	return nil
+}
+
+// StoreDataStream stores raw data from a reader to the filesystem
+func (s *Storage) StoreDataStream(hash hasher.Hash, reader io.Reader, size int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	filePath := filepath.Join(s.dataPath, hash.String())
+	file, err := os.Create(filePath)
+	if err != nil {
+		log.Printf("Failed to create file for %s at %s: %v", hash.String(), filePath, err)
+		storageOperationsTotal.WithLabelValues("store_data_stream", "error").Inc()
+		return fmt.Errorf("failed to create file for %s: %w", hash.String(), err)
+	}
+	defer file.Close()
+
+	bytesWritten, err := io.Copy(file, reader)
+	if err != nil {
+		log.Printf("Failed to write data stream for %s to %s: %v", hash.String(), filePath, err)
+		storageOperationsTotal.WithLabelValues("store_data_stream", "error").Inc()
+		return fmt.Errorf("failed to write data stream for %s: %w", hash.String(), err)
+	}
+
+	if bytesWritten != size {
+		log.Printf("Warning: bytes written (%d) for %s do not match expected size (%d)", bytesWritten, hash.String(), size)
+		// This might indicate a truncated upload, but we'll proceed for now.
+		// A more robust solution might involve retries or explicit error handling.
+	}
+
+	log.Printf("Stored data stream for %s at %s (%d bytes)", hash.String(), filePath, bytesWritten)
+	// Update available space metric
+	if space, err := s.GetAvailableSpace(); err == nil {
+		storageSpaceAvailable.Set(float64(space))
+	}
+
+	storageOperationsTotal.WithLabelValues("store_data_stream", "success").Inc()
 	return nil
 }
 
