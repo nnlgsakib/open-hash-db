@@ -308,7 +308,6 @@ func (s *Server) downloadContent(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-
 // viewContent handles content viewing, fetching from the network if not available locally.
 func (s *Server) viewContent(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
@@ -344,9 +343,23 @@ func (s *Server) viewContent(w http.ResponseWriter, r *http.Request) {
 	defer dataStream.Close()
 
 	// Determine if content is renderable in browser
-	isRenderable := strings.HasPrefix(metadata.MimeType, "text/") ||
-		strings.HasPrefix(metadata.MimeType, "image/") ||
-		metadata.MimeType == "application/pdf"
+	// isRenderable := strings.HasPrefix(metadata.MimeType, "text/") ||
+	// 	strings.HasPrefix(metadata.MimeType, "image/") ||
+	// 	metadata.MimeType == "application/pdf"
+	isRenderable := strings.HasPrefix(metadata.MimeType, "text/") || // Text: plain, html, css, csv, vtt, markdown, vcard, calendar
+		strings.HasPrefix(metadata.MimeType, "image/") || // Images: png, jpg, jpeg, gif, svg, webp, ico, bmp, avif, heif, tiff
+		strings.HasPrefix(metadata.MimeType, "audio/") || // Audio: mp3, wav, ogg, flac, aac
+		strings.HasPrefix(metadata.MimeType, "video/") || // Videos: mp4, webm, mpeg, ogv, avi, mov, ts
+		strings.HasPrefix(metadata.MimeType, "font/") || // Fonts: woff, woff2, ttf, otf
+		metadata.MimeType == "application/pdf" || // PDF
+		metadata.MimeType == "application/javascript" || // JavaScript: js, mjs
+		metadata.MimeType == "application/json" || // JSON
+		metadata.MimeType == "application/ld+json" || // JSON-LD
+		metadata.MimeType == "application/vnd.ms-fontobject" || // Font: eot
+		metadata.MimeType == "application/xml" || // XML
+		metadata.MimeType == "application/xhtml+xml" || // XHTML
+		metadata.MimeType == "application/wasm" || // WebAssembly
+		metadata.MimeType == "application/vnd.apple.mpegurl" // Streaming: m3u8
 
 	if isRenderable {
 		// Set headers for inline viewing
@@ -417,7 +430,7 @@ func (s *Server) fetchContentStreamFromNetwork(ctx context.Context, hash hasher.
 		}
 
 		// Since RequestTransfer now returns metadata, we need to get it.
-		// This is a bit of a hack, as we don't have the metadata yet. 
+		// This is a bit of a hack, as we don't have the metadata yet.
 		// We'll get it from the stream itself.
 		var metadata *storage.ContentMetadata
 
@@ -455,7 +468,7 @@ func (s *Server) fetchContentStreamFromNetwork(ctx context.Context, hash hasher.
 			// A better solution would be to have the metadata sent first.
 			// But that would require a change in the protocol.
 			// So we'll stick with this for now.
-			
+
 			// read metadata from the stream
 			var metaLen uint32
 			if err := binary.Read(pr, binary.BigEndian, &metaLen); err != nil {
@@ -904,18 +917,173 @@ func getMimeType(filename string) string {
 		return "text/html"
 	case ".css":
 		return "text/css"
-	case ".js":
+	case ".js", ".mjs":
 		return "application/javascript"
 	case ".json":
 		return "application/json"
+	case ".jsonld":
+		return "application/ld+json"
 	case ".png":
 		return "image/png"
 	case ".jpg", ".jpeg":
 		return "image/jpeg"
 	case ".gif":
 		return "image/gif"
+	case ".svg":
+		return "image/svg+xml"
+	case ".webp":
+		return "image/webp"
+	case ".ico":
+		return "image/x-icon"
+	case ".bmp":
+		return "image/bmp"
+	case ".avif":
+		return "image/avif"
+	case ".heif", ".heic":
+		return "image/heif"
+	case ".tiff", ".tif":
+		return "image/tiff"
+	case ".mp3":
+		return "audio/mpeg"
+	case ".wav":
+		return "audio/wav"
+	case ".ogg":
+		return "audio/ogg"
+	case ".flac":
+		return "audio/flac"
+	case ".aac":
+		return "audio/aac"
+	case ".mp4":
+		return "video/mp4"
+	case ".webm":
+		return "video/webm"
+	case ".mpeg", ".mpg":
+		return "video/mpeg"
+	case ".ogv":
+		return "video/ogg"
+	case ".avi":
+		return "video/x-msvideo"
+	case ".mov":
+		return "video/quicktime"
+	case ".woff":
+		return "font/woff"
+	case ".woff2":
+		return "font/woff2"
+	case ".ttf":
+		return "font/ttf"
+	case ".otf":
+		return "font/otf"
+	case ".eot":
+		return "application/vnd.ms-fontobject"
+	case ".xml":
+		return "application/xml"
+	case ".xhtml":
+		return "application/xhtml+xml"
+	case ".wasm":
+		return "application/wasm"
+	case ".csv":
+		return "text/csv"
+	case ".vtt":
+		return "text/vtt"
+	case ".md", ".markdown":
+		return "text/markdown"
+	case ".ts":
+		return "video/mp2t"
+	case ".m3u8":
+		return "application/vnd.apple.mpegurl"
+
+	// Browser-unrenderable MIME types
 	case ".pdf":
 		return "application/pdf"
+	case ".zip":
+		return "application/zip"
+	case ".rar":
+		return "application/x-rar-compressed"
+	case ".7z":
+		return "application/x-7z-compressed"
+	case ".tar":
+		return "application/x-tar"
+	case ".gz":
+		return "application/gzip"
+	case ".bz2":
+		return "application/x-bzip2"
+	case ".xz":
+		return "application/x-xz"
+	case ".zst":
+		return "application/zstd"
+	case ".exe":
+		return "application/x-msdownload"
+	case ".doc":
+		return "application/msword"
+	case ".docx":
+		return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+	case ".xls":
+		return "application/vnd.ms-excel"
+	case ".xlsx":
+		return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+	case ".ppt":
+		return "application/vnd.ms-powerpoint"
+	case ".pptx":
+		return "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+	case ".odt":
+		return "application/vnd.oasis.opendocument.text"
+	case ".ods":
+		return "application/vnd.oasis.opendocument.spreadsheet"
+	case ".odp":
+		return "application/vnd.oasis.opendocument.presentation"
+	case ".odg":
+		return "application/vnd.oasis.opendocument.graphics"
+	case ".rtf":
+		return "application/rtf"
+	case ".epub":
+		return "application/epub+zip"
+	case ".jar":
+		return "application/java-archive"
+	case ".war":
+		return "application/x-webarchive"
+	case ".bin":
+		return "application/octet-stream"
+	case ".iso":
+		return "application/x-iso9660-image"
+	case ".dmg":
+		return "application/x-apple-diskimage"
+	case ".torrent":
+		return "application/x-bittorrent"
+	case ".sql":
+		return "application/sql"
+	case ".db", ".sqlite":
+		return "application/x-sqlite3"
+	case ".psd":
+		return "image/vnd.adobe.photoshop"
+	case ".ai":
+		return "application/postscript"
+	case ".eps":
+		return "application/postscript"
+	case ".vcf", ".vcard":
+		return "text/vcard"
+	case ".ics", ".ical":
+		return "text/calendar"
+	case ".apk":
+		return "application/vnd.android.package-archive"
+	case ".deb":
+		return "application/vnd.debian.binary-package"
+	case ".rpm":
+		return "application/x-rpm"
+	case ".swf":
+		return "application/x-shockwave-flash"
+	case ".mkv":
+		return "video/x-matroska"
+	case ".flv":
+		return "video/x-flv"
+	case ".dwg":
+		return "image/vnd.dwg"
+	case ".kml":
+		return "application/vnd.google-earth.kml+xml"
+	case ".kmz":
+		return "application/vnd.google-earth.kmz"
+	case ".gpx":
+		return "application/gpx+xml"
+
 	default:
 		return "application/octet-stream"
 	}
