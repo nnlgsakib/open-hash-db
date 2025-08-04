@@ -240,7 +240,8 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 	h, err := libp2p.New(
 		libp2p.Identity(privKey),
 		libp2p.ListenAddrStrings(listenAddrs...),
-		libp2p.EnableAutoRelay(),
+		libp2p.EnableRelay(),
+
 		libp2p.EnableRelayService(relay.WithResources(relay.Resources{
 			Limit: &relay.RelayLimit{
 				Duration: time.Minute * 10,
@@ -406,16 +407,15 @@ func (n *Node) ConnectedPeers() []peer.ID {
 	return n.host.Network().Peers()
 }
 
-// Connect connects to a peer with exponential backoff
+// Connect connects to a peer with exponential backoff, with relay fallback
 func (n *Node) Connect(ctx context.Context, peerAddr string) error {
 	maddr, err := peer.AddrInfoFromString(peerAddr)
 	if err != nil {
 		return fmt.Errorf("failed to parse peer address %s: %w", peerAddr, err)
 	}
 
-	const maxRetries = 5
+	const maxRetries = 3
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		// Increase timeout for each attempt
 		ctx, cancel := context.WithTimeout(ctx, time.Duration(10+5*attempt)*time.Second)
 		defer cancel()
 
@@ -425,14 +425,43 @@ func (n *Node) Connect(ctx context.Context, peerAddr string) error {
 			n.PeerConnectedCallback(maddr.ID)
 			return nil
 		}
-		log.Printf("Attempt %d/%d: Failed to connect to peer %s: %v", attempt, maxRetries, maddr.ID.String(), err)
+		log.Printf("Attempt %d/%d: Failed to connect directly to peer %s: %v", attempt, maxRetries, maddr.ID.String(), err)
 		networkErrorsTotal.WithLabelValues("connect").Inc()
-		if attempt < maxRetries {
-			networkRetriesTotal.Inc()
-			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond) // Exponential backoff
-		}
 	}
-	return fmt.Errorf("failed to connect to peer %s after %d attempts: %w", maddr.ID.String(), maxRetries, err)
+
+	log.Printf("Direct connection failed, attempting relay connection to %s", maddr.ID.String())
+	// Combine bootnodes
+	allBootnodes := append(DefaultBootnodes)
+	addrInfos, err := convertBootnodesToAddrInfo(allBootnodes)
+	if err != nil {
+		log.Printf("Warning: failed to parse some bootnode addresses: %v", err)
+	}
+
+	for _, relayInfo := range addrInfos {
+		log.Printf("Attempting to connect via relay: %s", relayInfo.ID.String())
+		relayAddr, err := multiaddr.NewMultiaddr(fmt.Sprintf("/p2p/%s/p2p-circuit/p2p/%s", relayInfo.ID.String(), maddr.ID.String()))
+		if err != nil {
+			log.Printf("Failed to create relay address: %v", err)
+			continue
+		}
+
+		relayPeerInfo := peer.AddrInfo{
+			ID:    maddr.ID,
+			Addrs: []multiaddr.Multiaddr{relayAddr},
+		}
+
+		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+
+		if err := n.host.Connect(ctx, relayPeerInfo); err == nil {
+			log.Printf("Successfully connected to peer %s via relay %s", maddr.ID.String(), relayInfo.ID.String())
+			n.PeerConnectedCallback(maddr.ID)
+			return nil
+		}
+		log.Printf("Failed to connect to peer %s via relay %s: %v", maddr.ID.String(), relayInfo.ID.String(), err)
+	}
+
+	return fmt.Errorf("failed to connect to peer %s directly or via any relay", maddr.ID.String())
 }
 
 // SendContent sends content to a peer
