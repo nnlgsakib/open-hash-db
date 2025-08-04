@@ -28,6 +28,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/core/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	quic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
@@ -239,9 +240,20 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 	h, err := libp2p.New(
 		libp2p.Identity(privKey),
 		libp2p.ListenAddrStrings(listenAddrs...),
-		libp2p.EnableRelayService(),
-		libp2p.EnableHolePunching(),
 		libp2p.EnableAutoRelay(),
+		libp2p.EnableRelayService(relay.WithResources(relay.Resources{
+			Limit: &relay.RelayLimit{
+				Duration: time.Minute * 10,
+				Data:     1 << 20, // 1MB
+			},
+			ReservationTTL:  time.Hour,
+			MaxReservations: 128,
+			MaxCircuits:     16,
+			BufferSize:      2048,
+		})),
+		libp2p.EnableHolePunching(),
+		libp2p.EnableAutoNATv2(),
+		libp2p.EnableAutoRelayWithStaticRelays(addrInfos),
 		libp2p.Security(noise.ID, noise.New),
 		libp2p.Transport(tcp.NewTCPTransport),
 		libp2p.Transport(quic.NewTransport),
