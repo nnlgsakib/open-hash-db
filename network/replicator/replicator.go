@@ -50,6 +50,7 @@ const (
 	RelayThreshold                             = 5
 	RequestTimeout                             = 30 * time.Second
 	CleanupInterval                            = 1 * time.Minute
+	LargeFileSizeThreshold                     = 200 * 1024 * 1024 // 200MB
 )
 
 // ContentAnnouncement represents an announcement of new content
@@ -340,6 +341,12 @@ func (r *Replicator) handleContentAnnouncement(peerID peer.ID, announcement *Con
 
 	if r.storage.HasContent(announcement.Hash) {
 		// log.Printf("Content %s already exists locally, skipping replication and announcement", announcement.Hash.String())
+		return nil
+	}
+
+	// Skip automatic replication for large files
+	if announcement.Size > LargeFileSizeThreshold {
+		log.Printf("Content %s is larger than %d bytes, skipping automatic replication", announcement.Hash.String(), LargeFileSizeThreshold)
 		return nil
 	}
 

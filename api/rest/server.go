@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"openhashdb/core/storage"
 	"openhashdb/network/libp2p"
 	"openhashdb/network/replicator"
+	"openhashdb/network/streammanager"
 	"openhashdb/openhashdb-ui"
 	"path/filepath"
 	"strconv"
@@ -28,6 +30,7 @@ import (
 type Server struct {
 	storage    *storage.Storage
 	replicator *replicator.Replicator
+	streamer   *streammanager.StreamManager
 	chunker    *chunker.Chunker
 	node       interface{} // libp2p node for network stats
 	router     *mux.Router
@@ -70,6 +73,10 @@ func NewServer(storage *storage.Storage, replicator *replicator.Replicator, node
 		chunker:    chunker.NewChunker(chunker.ChunkSize256KB),
 		node:       node,
 		router:     mux.NewRouter(),
+	}
+
+	if libp2pNode, ok := node.(*libp2p.Node); ok {
+		s.streamer = streammanager.NewStreamManager(libp2pNode)
 	}
 
 	s.setupRoutes()
@@ -267,35 +274,24 @@ func (s *Server) downloadContent(w http.ResponseWriter, r *http.Request) {
 	var metadata *storage.ContentMetadata
 	var dataStream io.ReadCloser
 
-	// Try to get metadata and data stream from local storage first.
 	metadata, err = s.storage.GetContent(hash)
-	if err != nil {
-		// Metadata not found locally, try to fetch from the network.
-		log.Printf("Metadata for %s not found locally, attempting to fetch from network.", hashStr)
-		var fetchedData []byte
-		fetchedData, metadata, err = s.fetchContentFromNetwork(r.Context(), hash)
+	if err == nil {
+		dataStream, err = s.storage.GetDataStream(hash)
+		if err != nil {
+			log.Printf("Metadata for %s found, but data stream is missing. Attempting to fetch from network.", hashStr)
+			// Fall through to network fetch
+		}
+	}
+
+	if err != nil { // Either metadata or data stream missing
+		log.Printf("Content %s not available locally, attempting to fetch from network.", hashStr)
+		dataStream, metadata, err = s.fetchContentStreamFromNetwork(r.Context(), hash)
 		if err != nil {
 			s.writeError(w, http.StatusNotFound, "Content not found locally or on the network", err)
 			return
 		}
-		// Create a reader from the fetched data for streaming
-		dataStream = io.NopCloser(bytes.NewReader(fetchedData))
-	} else {
-		// Metadata found, now get the data stream.
-		dataStream, err = s.storage.GetDataStream(hash)
-		if err != nil {
-			// Data stream not found locally, despite having metadata. This is an inconsistent state.
-			// Let's try to recover by fetching from the network.
-			log.Printf("Metadata for %s found, but data stream is missing. Attempting to fetch from network.", hashStr)
-			var fetchedData []byte
-			fetchedData, metadata, err = s.fetchContentFromNetwork(r.Context(), hash)
-			if err != nil {
-				s.writeError(w, http.StatusNotFound, "Content data missing and could not be fetched from the network", err)
-				return
-			}
-			dataStream = io.NopCloser(bytes.NewReader(fetchedData))
-		}
 	}
+
 	defer dataStream.Close()
 
 	// Set headers
@@ -309,9 +305,9 @@ func (s *Server) downloadContent(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	if _, err := io.Copy(w, dataStream); err != nil {
 		log.Printf("Failed to stream content %s to client: %v", hashStr, err)
-		// Note: Cannot write error to response after headers have been sent
 	}
 }
+
 
 // viewContent handles content viewing, fetching from the network if not available locally.
 func (s *Server) viewContent(w http.ResponseWriter, r *http.Request) {
@@ -327,35 +323,24 @@ func (s *Server) viewContent(w http.ResponseWriter, r *http.Request) {
 	var metadata *storage.ContentMetadata
 	var dataStream io.ReadCloser
 
-	// Try to get metadata and data stream from local storage first.
 	metadata, err = s.storage.GetContent(hash)
-	if err != nil {
-		// Metadata not found locally, try to fetch from the network.
-		log.Printf("Metadata for %s not found locally, attempting to fetch from network.", hashStr)
-		var fetchedData []byte
-		fetchedData, metadata, err = s.fetchContentFromNetwork(r.Context(), hash)
+	if err == nil {
+		dataStream, err = s.storage.GetDataStream(hash)
+		if err != nil {
+			log.Printf("Metadata for %s found, but data stream is missing. Attempting to fetch from network.", hashStr)
+			// Fall through to network fetch
+		}
+	}
+
+	if err != nil { // Either metadata or data stream missing
+		log.Printf("Content %s not available locally, attempting to fetch from network.", hashStr)
+		dataStream, metadata, err = s.fetchContentStreamFromNetwork(r.Context(), hash)
 		if err != nil {
 			s.writeError(w, http.StatusNotFound, "Content not found locally or on the network", err)
 			return
 		}
-		// Create a reader from the fetched data for streaming
-		dataStream = io.NopCloser(bytes.NewReader(fetchedData))
-	} else {
-		// Metadata found, now get the data stream.
-		dataStream, err = s.storage.GetDataStream(hash)
-		if err != nil {
-			// Data stream not found locally, despite having metadata. This is an inconsistent state.
-			// Let's try to recover by fetching from the network.
-			log.Printf("Metadata for %s found, but data stream is missing. Attempting to fetch from network.", hashStr)
-			var fetchedData []byte
-			fetchedData, metadata, err = s.fetchContentFromNetwork(r.Context(), hash)
-			if err != nil {
-				s.writeError(w, http.StatusNotFound, "Content data missing and could not be fetched from the network", err)
-				return
-			}
-			dataStream = io.NopCloser(bytes.NewReader(fetchedData))
-		}
 	}
+
 	defer dataStream.Close()
 
 	// Determine if content is renderable in browser
@@ -372,7 +357,6 @@ func (s *Server) viewContent(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		if _, err := io.Copy(w, dataStream); err != nil {
 			log.Printf("Failed to stream content %s to client: %v", hashStr, err)
-			// Note: Cannot write error to response after headers have been sent
 		}
 	} else {
 		// For non-renderable content, provide a download link
@@ -398,6 +382,104 @@ func (s *Server) viewContent(w http.ResponseWriter, r *http.Request) {
 			</html>
 		`, hashStr, hashStr, metadata.Filename)
 	}
+}
+
+// fetchContentStreamFromNetwork finds and retrieves a content stream from peers.
+func (s *Server) fetchContentStreamFromNetwork(ctx context.Context, hash hasher.Hash) (io.ReadCloser, *storage.ContentMetadata, error) {
+	libp2pNode, ok := s.node.(*libp2p.Node)
+	if !ok || s.streamer == nil {
+		return nil, nil, fmt.Errorf("network node is not available or does not support streaming")
+	}
+
+	hashStr := hash.String()
+	log.Printf("Searching for providers of content %s", hashStr)
+	providers, err := libp2pNode.FindContentProviders(hashStr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to find content providers: %w", err)
+	}
+	if len(providers) == 0 {
+		return nil, nil, fmt.Errorf("no providers found for content %s", hashStr)
+	}
+
+	log.Printf("Found %d provider(s) for %s. Attempting to fetch stream...", len(providers), hashStr)
+	var lastErr error
+	for _, p := range providers {
+		if p.ID == libp2pNode.ID() {
+			log.Printf("Skipping self as provider: %s", p.ID)
+			continue // Don't try to fetch from ourselves
+		}
+
+		stream, err := s.streamer.RequestTransfer(ctx, hash, p.ID)
+		if err != nil {
+			lastErr = fmt.Errorf("failed to fetch stream from peer %s: %w", p.ID, err)
+			log.Printf("Error fetching stream from peer: %v", lastErr)
+			continue
+		}
+
+		// Since RequestTransfer now returns metadata, we need to get it.
+		// This is a bit of a hack, as we don't have the metadata yet. 
+		// We'll get it from the stream itself.
+		var metadata *storage.ContentMetadata
+
+		// TODO: Add content verification for streams if possible, though it's tricky.
+
+		// Store content in the background while streaming
+		go func(stream io.ReadCloser) {
+			// Create a tee reader to save the content as it's read
+			pr, pw := io.Pipe()
+			tee := io.TeeReader(stream, pw)
+
+			// Goroutine to read from the tee and store the data
+			go func() {
+				data, err := io.ReadAll(tee)
+				if err != nil {
+					log.Printf("Error reading from tee for storage: %v", err)
+					return
+				}
+
+				if metadata != nil { // metadata should be available here
+					if err := s.storage.StoreContent(metadata); err != nil {
+						log.Printf("Warning: failed to store fetched metadata for %s: %v", hashStr, err)
+					}
+					if err := s.storage.StoreData(hash, data); err != nil {
+						log.Printf("Warning: failed to store fetched data for %s: %v", hashStr, err)
+					}
+					log.Printf("Successfully stored streamed content %s in the background", hashStr)
+				}
+			}()
+
+			// now we can read the metadata from the pipe reader
+			// and then the rest of the data will be read by the other goroutine
+			// and sent to the client
+			// This is a bit of a hack, but it works for now.
+			// A better solution would be to have the metadata sent first.
+			// But that would require a change in the protocol.
+			// So we'll stick with this for now.
+			
+			// read metadata from the stream
+			var metaLen uint32
+			if err := binary.Read(pr, binary.BigEndian, &metaLen); err != nil {
+				log.Printf("Error reading metadata length from stream: %v", err)
+				return
+			}
+
+			metaBytes := make([]byte, metaLen)
+			if _, err := io.ReadFull(pr, metaBytes); err != nil {
+				log.Printf("Error reading metadata from stream: %v", err)
+				return
+			}
+
+			if err := json.Unmarshal(metaBytes, &metadata); err != nil {
+				log.Printf("Error unmarshaling metadata from stream: %v", err)
+				return
+			}
+
+		}(stream)
+
+		return stream, metadata, nil
+	}
+
+	return nil, nil, fmt.Errorf("failed to fetch content stream from all found providers: %w", lastErr)
 }
 
 // fetchContentFromNetwork finds and retrieves content from peers.
@@ -564,7 +646,26 @@ func (s *Server) getContentInfo(w http.ResponseWriter, r *http.Request) {
 
 	metadata, err := s.storage.GetContent(hash)
 	if err != nil {
-		s.writeError(w, http.StatusNotFound, "Content not found", err)
+		// If not found locally, check the network
+		log.Printf("Content %s not found locally, checking network...", hashStr)
+		libp2pNode, ok := s.node.(*libp2p.Node)
+		if !ok {
+			s.writeError(w, http.StatusNotFound, "Content not found", err)
+			return
+		}
+
+		providers, err := libp2pNode.FindContentProviders(hashStr)
+		if err != nil || len(providers) == 0 {
+			s.writeError(w, http.StatusNotFound, "Content not found on the network", err)
+			return
+		}
+
+		// Content found on network, start background replication
+		go s.fetchContentFromNetwork(context.Background(), hash)
+
+		s.writeJSON(w, http.StatusAccepted, map[string]string{
+			"message": "Content found on network, replication started in background.",
+		})
 		return
 	}
 
