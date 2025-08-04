@@ -303,8 +303,37 @@ func (s *Server) downloadContent(w http.ResponseWriter, r *http.Request) {
 
 	// Write content by streaming
 	w.WriteHeader(http.StatusOK)
-	if _, err := io.Copy(w, dataStream); err != nil {
-		log.Printf("Failed to stream content %s to client: %v", hashStr, err)
+
+	// Use a buffered copy to handle large files and client disconnects
+	buf := make([]byte, 32*1024) // 32KB buffer
+	for {
+		select {
+		case <-r.Context().Done():
+			log.Printf("Client disconnected before content %s could be fully sent.", hashStr)
+			return
+		default:
+			nr, readErr := dataStream.Read(buf)
+			if nr > 0 {
+				_, writeErr := w.Write(buf[0:nr])
+				if writeErr != nil {
+					// Don't log error if client disconnected
+					if r.Context().Err() == nil {
+						log.Printf("Failed to write chunk of content %s to client: %v", hashStr, writeErr)
+					}
+					return
+				}
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+			}
+			if readErr == io.EOF {
+				return // End of file
+			}
+			if readErr != nil {
+				log.Printf("Failed to read content %s for streaming: %v", hashStr, readErr)
+				return
+			}
+		}
 	}
 }
 
@@ -343,9 +372,6 @@ func (s *Server) viewContent(w http.ResponseWriter, r *http.Request) {
 	defer dataStream.Close()
 
 	// Determine if content is renderable in browser
-	// isRenderable := strings.HasPrefix(metadata.MimeType, "text/") ||
-	// 	strings.HasPrefix(metadata.MimeType, "image/") ||
-	// 	metadata.MimeType == "application/pdf"
 	isRenderable := strings.HasPrefix(metadata.MimeType, "text/") || // Text: plain, html, css, csv, vtt, markdown, vcard, calendar
 		strings.HasPrefix(metadata.MimeType, "image/") || // Images: png, jpg, jpeg, gif, svg, webp, ico, bmp, avif, heif, tiff
 		strings.HasPrefix(metadata.MimeType, "audio/") || // Audio: mp3, wav, ogg, flac, aac
@@ -368,8 +394,37 @@ func (s *Server) viewContent(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Disposition", "inline")
 		// Write content by streaming
 		w.WriteHeader(http.StatusOK)
-		if _, err := io.Copy(w, dataStream); err != nil {
-			log.Printf("Failed to stream content %s to client: %v", hashStr, err)
+
+		// Use a buffered copy to handle large files and client disconnects
+		buf := make([]byte, 32*1024) // 32KB buffer
+		for {
+			select {
+			case <-r.Context().Done():
+				log.Printf("Client disconnected before content %s could be fully sent.", hashStr)
+				return
+			default:
+				nr, readErr := dataStream.Read(buf)
+				if nr > 0 {
+					_, writeErr := w.Write(buf[0:nr])
+					if writeErr != nil {
+						// Don't log error if client disconnected
+						if r.Context().Err() == nil {
+							log.Printf("Failed to write chunk of content %s to client: %v", hashStr, writeErr)
+						}
+						return
+					}
+					if f, ok := w.(http.Flusher); ok {
+						f.Flush()
+					}
+				}
+				if readErr == io.EOF {
+					return // End of file
+				}
+				if readErr != nil {
+					log.Printf("Failed to read content %s for streaming: %v", hashStr, readErr)
+					return
+				}
+			}
 		}
 	} else {
 		// For non-renderable content, provide a download link

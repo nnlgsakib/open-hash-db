@@ -288,7 +288,7 @@ func (s *Storage) StoreData(hash hasher.Hash, data []byte) error {
 		return fmt.Errorf("failed to store data for %s: %w", hash.String(), err)
 	}
 
-	log.Printf("Stored data for %s at %s (%d bytes)", hash.String(), filePath, len(data))
+	// log.Printf("Stored data for %s at %s (%d bytes)", hash.String(), filePath, len(data))
 	// Update available space metric
 	if space, err := s.GetAvailableSpace(); err == nil {
 		storageSpaceAvailable.Set(float64(space))
@@ -376,7 +376,7 @@ func (s *Storage) GetDataStream(hash hasher.Hash) (*os.File, error) {
 		return nil, fmt.Errorf("failed to open data stream for %s: %w", hash.String(), err)
 	}
 
-	log.Printf("Opened data stream for %s at %s", hash.String(), filePath)
+	// log.Printf("Opened data stream for %s at %s", hash.String(), filePath)
 	storageOperationsTotal.WithLabelValues("get_data_stream", "success").Inc()
 	return file, nil
 }
