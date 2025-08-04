@@ -97,6 +97,7 @@ type Node struct {
 	cancel                context.CancelFunc
 	mdns                  mdns.Service
 	dht                   *dht.IpfsDHT
+	heartbeatService      *HeartbeatService
 	storage               *storage.Storage
 	ContentHandler        func(peer.ID, []byte) error
 	ChunkHandler          func(peer.ID, []byte) error
@@ -282,6 +283,7 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 		peerEvents:            make([]PeerEvent, 0, MaxPeerEventLogs),
 		PeerConnectedCallback: func(p peer.ID) {},
 	}
+	node.heartbeatService = NewHeartbeatService(nodeCtx, h)
 
 	// Set up network notifiee
 	n := &networkNotifiee{node: node}
@@ -505,7 +507,10 @@ func (n *Node) handleContentStream(stream network.Stream) {
 	remotePeer := stream.Conn().RemotePeer()
 	log.Printf("Handling content stream from %s", remotePeer.String())
 
-	stream.SetReadDeadline(time.Now().Add(30 * time.Second))
+	// Monitor the stream using heartbeats
+	stopMonitor := n.heartbeatService.MonitorStream(stream)
+	defer stopMonitor()
+
 	buf := make([]byte, 256)
 	bytesRead, err := stream.Read(buf)
 	if err != nil && err != io.EOF && err != context.Canceled {
@@ -564,7 +569,6 @@ func (n *Node) handleContentStream(stream network.Stream) {
 		return
 	}
 
-	stream.SetWriteDeadline(time.Now().Add(60 * time.Second))
 	if err := binary.Write(stream, binary.BigEndian, uint32(len(metaBytes))); err != nil {
 		log.Printf("Failed to write metadata length for %s to %s: %v", contentHashStr, remotePeer.String(), err)
 		networkErrorsTotal.WithLabelValues("write_metadata_length").Inc()
@@ -579,7 +583,6 @@ func (n *Node) handleContentStream(stream network.Stream) {
 		return
 	}
 
-	stream.SetWriteDeadline(time.Now().Add(5 * time.Minute))
 	bytesSent, err := io.Copy(stream, dataStream)
 	if err != nil {
 		log.Printf("Failed to write content for %s to %s: %v", contentHashStr, remotePeer.String(), err)
@@ -1000,14 +1003,27 @@ func (n *Node) RequestContentStreamFromPeer(ctx context.Context, peerID peer.ID,
 		}
 	}()
 
-	stream.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	// Monitor the stream using heartbeats
+	stopMonitor := n.heartbeatService.MonitorStream(stream)
+	go func() {
+		for {
+			time.Sleep(1 * time.Second)
+			buf := make([]byte, 1)
+			stream.SetReadDeadline(time.Now().Add(1 * time.Millisecond))
+			_, err := stream.Read(buf)
+			if err == io.EOF {
+				stopMonitor()
+				return
+			}
+		}
+	}()
+
 	if _, err := stream.Write([]byte(contentHash)); err != nil {
 		stream.Reset()
 		return nil, nil, fmt.Errorf("failed to send content request to %s: %w", peerID.String(), err)
 	}
 	stream.CloseWrite()
 
-	stream.SetReadDeadline(time.Now().Add(60 * time.Second))
 	var metaLen uint32
 	if err := binary.Read(stream, binary.BigEndian, &metaLen); err != nil {
 		stream.Reset()
@@ -1034,7 +1050,10 @@ func (n *Node) handleStreamExchange(stream network.Stream) {
 	remotePeer := stream.Conn().RemotePeer()
 	log.Printf("Handling stream exchange from %s", remotePeer.String())
 
-	stream.SetReadDeadline(time.Now().Add(30 * time.Second))
+	// Monitor the stream using heartbeats
+	stopMonitor := n.heartbeatService.MonitorStream(stream)
+	defer stopMonitor()
+
 	buf := make([]byte, 256)
 	bytesRead, err := stream.Read(buf)
 	if err != nil && err != io.EOF && err != context.Canceled {
@@ -1072,7 +1091,6 @@ func (n *Node) handleStreamExchange(stream network.Stream) {
 		return
 	}
 
-	stream.SetWriteDeadline(time.Now().Add(60 * time.Second))
 	if err := binary.Write(stream, binary.BigEndian, uint32(len(metaBytes))); err != nil {
 		log.Printf("Failed to write metadata length for %s to %s: %v", contentHashStr, remotePeer.String(), err)
 		stream.Reset()
@@ -1085,7 +1103,6 @@ func (n *Node) handleStreamExchange(stream network.Stream) {
 		return
 	}
 
-	stream.SetWriteDeadline(time.Now().Add(30 * time.Minute)) // Increased deadline for large files
 	bytesSent, err := io.Copy(stream, dataStream)
 	if err != nil {
 		log.Printf("Failed to write content for %s to %s: %v", contentHashStr, remotePeer.String(), err)
