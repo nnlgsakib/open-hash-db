@@ -42,21 +42,25 @@ func (hs *HeartbeatService) handleHeartbeatStream(stream network.Stream) {
 
 // MonitorStream starts a monitoring goroutine for a given data stream.
 // It returns a function that should be called to stop the monitor when the stream is closed.
-func (hs *HeartbeatService) MonitorStream(dataStream network.Stream) func() {
+func (hs *HeartbeatService) MonitorStream(dataStream network.Stream, bidirectional bool) func() {
 	peerID := dataStream.Conn().RemotePeer()
 	ctx, cancel := context.WithCancel(hs.ctx)
 
-	go hs.monitor(ctx, peerID, dataStream)
+	go hs.monitor(ctx, peerID, dataStream, bidirectional)
 
 	return cancel
 }
 
-func (hs *HeartbeatService) monitor(ctx context.Context, peerID peer.ID, dataStream network.Stream) {
+func (hs *HeartbeatService) monitor(ctx context.Context, peerID peer.ID, dataStream network.Stream, bidirectional bool) {
 	ticker := time.NewTicker(HeartbeatInterval)
 	defer ticker.Stop()
 
 	log.Printf("Starting heartbeat monitor for stream with %s", peerID)
 	defer log.Printf("Stopping heartbeat monitor for stream with %s", peerID)
+
+	if bidirectional {
+		go hs.handleIncomingHeartbeats(dataStream)
+	}
 
 	for {
 		select {
@@ -78,6 +82,20 @@ func (hs *HeartbeatService) monitor(ctx context.Context, peerID peer.ID, dataStr
 				log.Printf("Data stream with %s closed, stopping heartbeat monitor.", peerID)
 				return
 			}
+		}
+	}
+}
+
+// handleIncomingHeartbeats reads from the stream and responds to heartbeats.
+func (hs *HeartbeatService) handleIncomingHeartbeats(stream network.Stream) {
+	for {
+		buf := make([]byte, 1)
+		_, err := stream.Read(buf)
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("Error reading from heartbeat stream: %v", err)
+			}
+			return
 		}
 	}
 }

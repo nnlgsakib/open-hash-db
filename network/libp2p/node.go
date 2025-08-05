@@ -508,7 +508,7 @@ func (n *Node) handleContentStream(stream network.Stream) {
 	log.Printf("Handling content stream from %s", remotePeer.String())
 
 	// Monitor the stream using heartbeats
-	stopMonitor := n.heartbeatService.MonitorStream(stream)
+	stopMonitor := n.heartbeatService.MonitorStream(stream, true)
 	defer stopMonitor()
 
 	buf := make([]byte, 256)
@@ -1004,7 +1004,7 @@ func (n *Node) RequestContentStreamFromPeer(ctx context.Context, peerID peer.ID,
 	}()
 
 	// Monitor the stream using heartbeats
-	stopMonitor := n.heartbeatService.MonitorStream(stream)
+	stopMonitor := n.heartbeatService.MonitorStream(stream, true)
 	go func() {
 		for {
 			time.Sleep(1 * time.Second)
@@ -1051,7 +1051,7 @@ func (n *Node) handleStreamExchange(stream network.Stream) {
 	log.Printf("Handling stream exchange from %s", remotePeer.String())
 
 	// Monitor the stream using heartbeats
-	stopMonitor := n.heartbeatService.MonitorStream(stream)
+	stopMonitor := n.heartbeatService.MonitorStream(stream, true)
 	defer stopMonitor()
 
 	buf := make([]byte, 256)
