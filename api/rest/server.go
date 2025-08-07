@@ -771,10 +771,8 @@ func (s *Server) storeFile(filename string, reader io.Reader) (hasher.Hash, int6
 		return hash, metadata.Size, nil
 	}
 
-	// Create a temporary buffer to determine size and chunk the data
-	var buf bytes.Buffer
-	tee := io.TeeReader(reader, &buf)
-	manifest, err := s.chunker.ChunkReader(tee)
+	// Chunk the data directly from the reader
+	manifest, err := s.chunker.ChunkReader(reader)
 	if err != nil {
 		return hasher.Hash{}, 0, fmt.Errorf("failed to chunk content: %w", err)
 	}

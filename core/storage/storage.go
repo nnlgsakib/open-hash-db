@@ -328,22 +328,36 @@ func (s *Storage) GetChunkData(merkleRoot, chunkHash hasher.Hash) ([]byte, error
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	filePath := filepath.Join(s.dataPath, merkleRoot.String(), chunkHash.String())
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			log.Printf("Chunk data not found for %s at %s", chunkHash.String(), filePath)
-			storageOperationsTotal.WithLabelValues("get_chunk_data", "not_found").Inc()
-			return nil, fmt.Errorf("chunk data not found: %s", chunkHash.String())
+	// If merkleRoot is provided, look in the specific directory
+	if !bytes.Equal(merkleRoot[:], make([]byte, 32)) {
+		filePath := filepath.Join(s.dataPath, merkleRoot.String(), chunkHash.String())
+		data, err := os.ReadFile(filePath)
+		if err == nil {
+			log.Printf("Retrieved chunk data for %s from %s", chunkHash.String(), filePath)
+			storageOperationsTotal.WithLabelValues("get_chunk_data", "success").Inc()
+			return data, nil
 		}
-		log.Printf("Failed to get chunk data for %s at %s: %v", chunkHash.String(), filePath, err)
-		storageOperationsTotal.WithLabelValues("get_chunk_data", "error").Inc()
-		return nil, fmt.Errorf("failed to get chunk data for %s: %w", chunkHash.String(), err)
 	}
 
-	log.Printf("Retrieved chunk data for %s from %s", chunkHash.String(), filePath)
-	storageOperationsTotal.WithLabelValues("get_chunk_data", "success").Inc()
-	return data, nil
+	// If merkleRoot is not provided or chunk not found, search all manifest directories
+	manifests, err := s.ListManifests()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list manifests for chunk search: %w", err)
+	}
+
+	for _, manifestHash := range manifests {
+		filePath := filepath.Join(s.dataPath, manifestHash.String(), chunkHash.String())
+		data, err := os.ReadFile(filePath)
+		if err == nil {
+			log.Printf("Found and retrieved chunk data for %s in %s", chunkHash.String(), filePath)
+			storageOperationsTotal.WithLabelValues("get_chunk_data", "success").Inc()
+			return data, nil
+		}
+	}
+
+	log.Printf("Chunk data not found for %s in any manifest directory", chunkHash.String())
+	storageOperationsTotal.WithLabelValues("get_chunk_data", "not_found").Inc()
+	return nil, fmt.Errorf("chunk data not found: %s", chunkHash.String())
 }
 
 // HasChunk checks if chunk metadata exists

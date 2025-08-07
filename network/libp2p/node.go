@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -497,29 +498,26 @@ func (n *Node) sendData(ctx context.Context, peerID peer.ID, protocolID protocol
 // handleContentStream handles manifest streams
 func (n *Node) handleContentStream(stream network.Stream) {
 	defer stream.Close()
-	networkMessagesTotal.WithLabelValues("manifest_received").Inc()
+	networkMessagesTotal.WithLabelValues("content_received").Inc()
 
 	remotePeer := stream.Conn().RemotePeer()
-	log.Printf("Handling manifest stream from %s", remotePeer.String())
+	log.Printf("Handling content stream from %s", remotePeer.String())
 
 	// Monitor connection health
 	n.heartbeatService.MonitorConnection(remotePeer)
 
-	data := make([]byte, 1024*1024) // Buffer for manifests
-	bytesRead, err := stream.Read(data)
+	data, err := io.ReadAll(stream)
 	if err != nil {
-		log.Printf("Failed to read manifest request from %s: %v", remotePeer.String(), err)
-		networkErrorsTotal.WithLabelValues("read_manifest_request").Inc()
-		_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: failed to read manifest request: %v", err)))
+		log.Printf("Failed to read content request from %s: %v", remotePeer.String(), err)
+		networkErrorsTotal.WithLabelValues("read_content_request").Inc()
 		return
 	}
-	hashStr := string(data[:bytesRead])
-	log.Printf("Received manifest request for %s from %s", hashStr, remotePeer.String())
+	hashStr := string(data)
+	log.Printf("Received content request for %s from %s", hashStr, remotePeer.String())
 
 	if n.storage == nil {
 		log.Printf("Error: storage not configured for %s", remotePeer.String())
 		networkErrorsTotal.WithLabelValues("storage_not_configured").Inc()
-		_, _ = stream.Write([]byte("ERROR: storage not configured"))
 		return
 	}
 
@@ -527,34 +525,43 @@ func (n *Node) handleContentStream(stream network.Stream) {
 	if err != nil {
 		log.Printf("Invalid hash %s from %s: %v", hashStr, remotePeer.String(), err)
 		networkErrorsTotal.WithLabelValues("invalid_hash").Inc()
-		_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: invalid hash: %v", err)))
 		return
 	}
 
+	// Check if it's a manifest request
 	manifest, err := n.storage.GetManifest(hash)
+	if err == nil {
+		manifestBytes, err := json.Marshal(manifest)
+		if err != nil {
+			log.Printf("Failed to marshal manifest for %s from %s: %v", hashStr, remotePeer.String(), err)
+			networkErrorsTotal.WithLabelValues("marshal_manifest").Inc()
+			return
+		}
+
+		if _, err := stream.Write(manifestBytes); err != nil {
+			log.Printf("Failed to write manifest for %s to %s: %v", hashStr, remotePeer.String(), err)
+			networkErrorsTotal.WithLabelValues("write_manifest").Inc()
+			return
+		}
+		log.Printf("Sent manifest %s to %s", hashStr, remotePeer.String())
+		return
+	}
+
+	// If not a manifest, assume it's a chunk request
+	chunkData, err := n.storage.GetChunkData(hasher.Hash{}, hash) // MerkleRoot is not known here, so we pass an empty hash
 	if err != nil {
-		log.Printf("Failed to get manifest for %s from %s: %v", hashStr, remotePeer.String(), err)
-		networkErrorsTotal.WithLabelValues("get_manifest").Inc()
-		_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: failed to get manifest: %v", err)))
+		log.Printf("Failed to get chunk %s from %s: %v", hashStr, remotePeer.String(), err)
+		networkErrorsTotal.WithLabelValues("get_chunk").Inc()
 		return
 	}
 
-	manifestBytes, err := json.Marshal(manifest)
-	if err != nil {
-		log.Printf("Failed to marshal manifest for %s from %s: %v", hashStr, remotePeer.String(), err)
-		networkErrorsTotal.WithLabelValues("marshal_manifest").Inc()
-		_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: failed to marshal manifest: %v", err)))
+	if _, err := stream.Write(chunkData); err != nil {
+		log.Printf("Failed to write chunk for %s to %s: %v", hashStr, remotePeer.String(), err)
+		networkErrorsTotal.WithLabelValues("write_chunk").Inc()
 		return
 	}
 
-	if _, err := stream.Write(manifestBytes); err != nil {
-		log.Printf("Failed to write manifest for %s to %s: %v", hashStr, remotePeer.String(), err)
-		networkErrorsTotal.WithLabelValues("write_manifest").Inc()
-		_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: failed to write manifest: %v", err)))
-		return
-	}
-
-	log.Printf("Sent manifest %s to %s", hashStr, remotePeer.String())
+	log.Printf("Sent chunk %s to %s", hashStr, remotePeer.String())
 }
 
 // handleChunkStream handles chunk streams
@@ -568,20 +575,17 @@ func (n *Node) handleChunkStream(stream network.Stream) {
 	// Monitor connection health
 	n.heartbeatService.MonitorConnection(remotePeer)
 
-	data := make([]byte, 1024*1024) // Buffer for chunks
-	bytesRead, err := stream.Read(data)
+	data, err := io.ReadAll(stream)
 	if err != nil {
 		log.Printf("Failed to read chunk stream from %s: %v", remotePeer.String(), err)
 		networkErrorsTotal.WithLabelValues("read_chunk_stream").Inc()
-		_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: failed to read chunk: %v", err)))
 		return
 	}
 
 	if n.ChunkHandler != nil {
-		if err := n.ChunkHandler(remotePeer, data[:bytesRead]); err != nil {
+		if err := n.ChunkHandler(remotePeer, data); err != nil {
 			log.Printf("Chunk handler error from %s: %v", remotePeer.String(), err)
 			networkErrorsTotal.WithLabelValues("chunk_handler").Inc()
-			_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: chunk handler failed: %v", err)))
 		}
 	}
 }
@@ -597,20 +601,17 @@ func (n *Node) handleGossipStream(stream network.Stream) {
 	// Monitor connection health
 	n.heartbeatService.MonitorConnection(remotePeer)
 
-	data := make([]byte, 64*1024) // Buffer for gossip messages
-	bytesRead, err := stream.Read(data)
+	data, err := io.ReadAll(stream)
 	if err != nil {
 		log.Printf("Failed to read gossip stream from %s: %v", remotePeer.String(), err)
 		networkErrorsTotal.WithLabelValues("read_gossip_stream").Inc()
-		_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: failed to read gossip: %v", err)))
 		return
 	}
 
 	if n.GossipHandler != nil {
-		if err := n.GossipHandler(remotePeer, data[:bytesRead]); err != nil {
+		if err := n.GossipHandler(remotePeer, data); err != nil {
 			log.Printf("Gossip handler error from %s: %v", remotePeer.String(), err)
 			networkErrorsTotal.WithLabelValues("gossip_handler").Inc()
-			_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: gossip handler failed: %v", err)))
 		}
 	}
 }
@@ -827,30 +828,6 @@ func (n *Node) RequestContentFromPeer(peerID peer.ID, contentHash string) ([]byt
 		log.Printf("Attempt %d/%d: Requesting content %s from %s", attempt, maxRetries, contentHash, peerID.String())
 		protocolID := ProtocolContentExchange
 
-		// Determine if contentHash is a manifest or chunk hash
-		if n.storage != nil {
-			hash, err := hasher.HashFromString(contentHash)
-			if err == nil {
-				manifest, err := n.storage.GetManifest(hash)
-				if err == nil {
-					// Manifest exists; check if contentHash is a chunk hash
-					for _, chunkInfo := range manifest.Chunks {
-						if chunkInfo.Hash.String() == contentHash {
-							protocolID = ProtocolChunkExchange
-							break
-						}
-					}
-				} else {
-					// No manifest found; assume contentHash is a chunk hash
-					protocolID = ProtocolChunkExchange
-				}
-			} else {
-				// Invalid hash; assume chunk for robustness
-				log.Printf("Invalid hash %s: %v; assuming chunk", contentHash, err)
-				protocolID = ProtocolChunkExchange
-			}
-		}
-
 		stream, err := n.host.NewStream(ctx, peerID, protocolID)
 		if err != nil {
 			log.Printf("Attempt %d/%d: Failed to open stream to %s: %v", attempt, maxRetries, peerID.String(), err)
@@ -880,13 +857,12 @@ func (n *Node) RequestContentFromPeer(peerID peer.ID, contentHash string) ([]byt
 		stream.CloseWrite()
 
 		stream.SetReadDeadline(time.Now().Add(60 * time.Second))
-		data := make([]byte, 1024*1024) // Buffer for manifests or chunks
-		nBytes, err := stream.Read(data)
-		if err == nil && nBytes > 0 && bytes.HasPrefix(data[:nBytes], []byte("ERROR:")) {
-			log.Printf("Received error from %s: %s", peerID.String(), string(data[:nBytes]))
+		data, err := io.ReadAll(stream)
+		if err == nil && len(data) > 0 && bytes.HasPrefix(data, []byte("ERROR:")) {
+			log.Printf("Received error from %s: %s", peerID.String(), string(data))
 			networkErrorsTotal.WithLabelValues("remote_error").Inc()
 			if attempt == maxRetries {
-				return nil, fmt.Errorf("remote error from %s: %s", peerID.String(), string(data[:nBytes]))
+				return nil, fmt.Errorf("remote error from %s: %s", peerID.String(), string(data))
 			}
 			networkRetriesTotal.Inc()
 			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
@@ -904,8 +880,8 @@ func (n *Node) RequestContentFromPeer(peerID peer.ID, contentHash string) ([]byt
 			continue
 		}
 
-		log.Printf("Successfully fetched %d bytes of content %s from %s", nBytes, contentHash, peerID.String())
-		return data[:nBytes], nil
+		log.Printf("Successfully fetched %d bytes of content %s from %s", len(data), contentHash, peerID.String())
+		return data, nil
 	}
 
 	return nil, fmt.Errorf("failed to fetch content %s from %s: max retries exceeded", contentHash, peerID.String())
