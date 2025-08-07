@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,7 +15,6 @@ import (
 	"openhashdb/core/storage"
 	"openhashdb/network/libp2p"
 	"openhashdb/network/replicator"
-	"openhashdb/network/streammanager"
 	"openhashdb/openhashdb-ui"
 	"path/filepath"
 	"strconv"
@@ -30,7 +28,6 @@ import (
 type Server struct {
 	storage    *storage.Storage
 	replicator *replicator.Replicator
-	streamer   *streammanager.StreamManager
 	chunker    *chunker.Chunker
 	node       interface{} // libp2p node for network stats
 	router     *mux.Router
@@ -67,18 +64,17 @@ type ContentInfo struct {
 
 // NewServer creates a new REST API server
 func NewServer(storage *storage.Storage, replicator *replicator.Replicator, node interface{}) *Server {
+	if storage == nil {
+		log.Fatal("storage cannot be nil")
+	}
+	dataPath := storage.GetDataPath() // Assume Storage provides GetDataPath method
 	s := &Server{
 		storage:    storage,
 		replicator: replicator,
-		chunker:    chunker.NewChunker(chunker.ChunkSize256KB),
+		chunker:    chunker.NewChunker(0, dataPath), // Size will be determined per file
 		node:       node,
 		router:     mux.NewRouter(),
 	}
-
-	if libp2pNode, ok := node.(*libp2p.Node); ok {
-		s.streamer = streammanager.NewStreamManager(libp2pNode)
-	}
-
 	s.setupRoutes()
 	return s
 }
@@ -109,7 +105,7 @@ func (s *Server) setupRoutes() {
 
 	// Health check
 	s.router.HandleFunc("/health", s.healthCheck).Methods("GET", "OPTIONS")
-	//web
+	// Web UI
 	s.router.PathPrefix("/").Handler(openhashdb.GetHandler())
 }
 
@@ -159,7 +155,7 @@ func (s *Server) uploadFile(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	// Store the file by streaming
+	// Store the file by chunking
 	hash, size, err := s.storeFile(header.Filename, file)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to store file", err)
@@ -167,7 +163,7 @@ func (s *Server) uploadFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Announce to network
-	if err := s.replicator.AnnounceContent(hash, size); err != nil {
+	if err := s.replicator.AnnounceManifest(hash, size, 0); err != nil {
 		log.Printf("Failed to announce content: %v", err)
 	}
 
@@ -246,8 +242,25 @@ func (s *Server) uploadFolder(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Announce to network.
-	if err := s.replicator.AnnounceContent(hash, size); err != nil {
+	if err := s.replicator.AnnounceManifest(hash, size, 0); err != nil {
 		log.Printf("Failed to announce content: %v", err)
+	}
+
+	// Store metadata with IsDirectory set to true
+	metadata := &storage.ContentMetadata{
+		MerkleRoot:  hash,
+		Filename:    folderName,
+		MimeType:    getMimeType(folderName),
+		Size:        size,
+		ModTime:     time.Now(),
+		ChunkCount:  0, // Updated after chunking
+		CreatedAt:   time.Now(),
+		RefCount:    1,
+		IsDirectory: true, // Set to true for folders
+	}
+	if err := s.storage.StoreContent(metadata); err != nil {
+		s.writeError(w, http.StatusInternalServerError, "Failed to store folder metadata", err)
+		return
 	}
 
 	response := UploadResponse{
@@ -271,27 +284,11 @@ func (s *Server) downloadContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var metadata *storage.ContentMetadata
-	var dataStream io.ReadCloser
-
-	metadata, err = s.storage.GetContent(hash)
-	if err == nil {
-		dataStream, err = s.storage.GetDataStream(hash)
-		if err != nil {
-			log.Printf("Metadata for %s found, but data stream is missing. Attempting to fetch from network.", hashStr)
-			// Fall through to network fetch
-		}
+	dataStream, metadata, err := s.getContentStream(r.Context(), hash)
+	if err != nil {
+		s.writeError(w, http.StatusNotFound, "Content not found locally or on the network", err)
+		return
 	}
-
-	if err != nil { // Either metadata or data stream missing
-		log.Printf("Content %s not available locally, attempting to fetch from network.", hashStr)
-		dataStream, metadata, err = s.fetchContentStreamFromNetwork(r.Context(), hash)
-		if err != nil {
-			s.writeError(w, http.StatusNotFound, "Content not found locally or on the network", err)
-			return
-		}
-	}
-
 	defer dataStream.Close()
 
 	// Set headers
@@ -316,7 +313,6 @@ func (s *Server) downloadContent(w http.ResponseWriter, r *http.Request) {
 			if nr > 0 {
 				_, writeErr := w.Write(buf[0:nr])
 				if writeErr != nil {
-					// Don't log error if client disconnected
 					if r.Context().Err() == nil {
 						log.Printf("Failed to write chunk of content %s to client: %v", hashStr, writeErr)
 					}
@@ -327,7 +323,7 @@ func (s *Server) downloadContent(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			if readErr == io.EOF {
-				return // End of file
+				return
 			}
 			if readErr != nil {
 				log.Printf("Failed to read content %s for streaming: %v", hashStr, readErr)
@@ -348,51 +344,34 @@ func (s *Server) viewContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var metadata *storage.ContentMetadata
-	var dataStream io.ReadCloser
-
-	metadata, err = s.storage.GetContent(hash)
-	if err == nil {
-		dataStream, err = s.storage.GetDataStream(hash)
-		if err != nil {
-			log.Printf("Metadata for %s found, but data stream is missing. Attempting to fetch from network.", hashStr)
-			// Fall through to network fetch
-		}
+	dataStream, metadata, err := s.getContentStream(r.Context(), hash)
+	if err != nil {
+		s.writeError(w, http.StatusNotFound, "Content not found locally or on the network", err)
+		return
 	}
-
-	if err != nil { // Either metadata or data stream missing
-		log.Printf("Content %s not available locally, attempting to fetch from network.", hashStr)
-		dataStream, metadata, err = s.fetchContentStreamFromNetwork(r.Context(), hash)
-		if err != nil {
-			s.writeError(w, http.StatusNotFound, "Content not found locally or on the network", err)
-			return
-		}
-	}
-
 	defer dataStream.Close()
 
 	// Determine if content is renderable in browser
-	isRenderable := strings.HasPrefix(metadata.MimeType, "text/") || // Text: plain, html, css, csv, vtt, markdown, vcard, calendar
-		strings.HasPrefix(metadata.MimeType, "image/") || // Images: png, jpg, jpeg, gif, svg, webp, ico, bmp, avif, heif, tiff
-		strings.HasPrefix(metadata.MimeType, "audio/") || // Audio: mp3, wav, ogg, flac, aac
-		strings.HasPrefix(metadata.MimeType, "video/") || // Videos: mp4, webm, mpeg, ogv, avi, mov, ts
-		strings.HasPrefix(metadata.MimeType, "font/") || // Fonts: woff, woff2, ttf, otf
-		metadata.MimeType == "application/pdf" || // PDF
-		metadata.MimeType == "application/javascript" || // JavaScript: js, mjs
-		metadata.MimeType == "application/json" || // JSON
-		metadata.MimeType == "application/ld+json" || // JSON-LD
-		metadata.MimeType == "application/vnd.ms-fontobject" || // Font: eot
-		metadata.MimeType == "application/xml" || // XML
-		metadata.MimeType == "application/xhtml+xml" || // XHTML
-		metadata.MimeType == "application/wasm" || // WebAssembly
-		metadata.MimeType == "application/vnd.apple.mpegurl" // Streaming: m3u8
+	isRenderable := strings.HasPrefix(metadata.MimeType, "text/") ||
+		strings.HasPrefix(metadata.MimeType, "image/") ||
+		strings.HasPrefix(metadata.MimeType, "audio/") ||
+		strings.HasPrefix(metadata.MimeType, "video/") ||
+		strings.HasPrefix(metadata.MimeType, "font/") ||
+		metadata.MimeType == "application/pdf" ||
+		metadata.MimeType == "application/javascript" ||
+		metadata.MimeType == "application/json" ||
+		metadata.MimeType == "application/ld+json" ||
+		metadata.MimeType == "application/vnd.ms-fontobject" ||
+		metadata.MimeType == "application/xml" ||
+		metadata.MimeType == "application/xhtml+xml" ||
+		metadata.MimeType == "application/wasm" ||
+		metadata.MimeType == "application/vnd.apple.mpegurl"
 
 	if isRenderable {
 		// Set headers for inline viewing
 		w.Header().Set("Content-Type", metadata.MimeType)
 		w.Header().Set("Content-Length", strconv.FormatInt(metadata.Size, 10))
 		w.Header().Set("Content-Disposition", "inline")
-		// Write content by streaming
 		w.WriteHeader(http.StatusOK)
 
 		// Use a buffered copy to handle large files and client disconnects
@@ -407,7 +386,6 @@ func (s *Server) viewContent(w http.ResponseWriter, r *http.Request) {
 				if nr > 0 {
 					_, writeErr := w.Write(buf[0:nr])
 					if writeErr != nil {
-						// Don't log error if client disconnected
 						if r.Context().Err() == nil {
 							log.Printf("Failed to write chunk of content %s to client: %v", hashStr, writeErr)
 						}
@@ -418,7 +396,7 @@ func (s *Server) viewContent(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 				if readErr == io.EOF {
-					return // End of file
+					return
 				}
 				if readErr != nil {
 					log.Printf("Failed to read content %s for streaming: %v", hashStr, readErr)
@@ -431,130 +409,75 @@ func (s *Server) viewContent(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, `
-			<!DOCTYPE html>
-			<html>
-			<head>
-				<title>OpenHashDB - Unable to Render</title>
-				<style>
-					body { font-family: sans-serif; text-align: center; margin-top: 50px; }
-					a { display: inline-block; padding: 10px 20px; background-color: #007bff; color: white; text-decoration: none; border-radius: 5px; }
-					a:hover { background-color: #0056b3; }
-				</style>
-			</head>
-			<body>
-				<h1>Unable to Render Content</h1>
-				<p>The content with hash <strong>%s</strong> cannot be displayed directly in the browser.</p>
-				<p>Click the button below to download the file:</p>
-				<a href="/download/%s" download="%s">Click to Download</a>
-			</body>
-			</html>
-		`, hashStr, hashStr, metadata.Filename)
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>OpenHashDB - Unable to Render</title>
+                <style>
+                    body { font-family: sans-serif; text-align: center; margin-top: 50px; }
+                    a { display: inline-block; padding: 10px 20px; background-color: #007bff; color: white; text-decoration: none; border-radius: 5px; }
+                    a:hover { background-color: #0056b3; }
+                </style>
+            </head>
+            <body>
+                <h1>Unable to Render Content</h1>
+                <p>The content with hash <strong>%s</strong> cannot be displayed directly in the browser.</p>
+                <p>Click the button below to download the file:</p>
+                <a href="/download/%s" download="%s">Click to Download</a>
+            </body>
+            </html>
+        `, hashStr, hashStr, metadata.Filename)
 	}
 }
 
-// fetchContentStreamFromNetwork finds and retrieves a content stream from peers.
+// getContentStream retrieves content stream, fetching from network if necessary
+func (s *Server) getContentStream(ctx context.Context, hash hasher.Hash) (io.ReadCloser, *storage.ContentMetadata, error) {
+	var metadata *storage.ContentMetadata
+	var err error
+
+	// Check local storage
+	metadata, err = s.storage.GetContent(hash)
+	if err == nil {
+		manifest, err := s.storage.GetManifest(hash)
+		if err == nil {
+			// Verify all chunks are present
+			missingChunks := s.replicator.GetMissingChunks(manifest)
+			if len(missingChunks) == 0 {
+				data, err := s.reassembleContent(manifest)
+				if err != nil {
+					log.Printf("Failed to reassemble content %s: %v", hash.String(), err)
+					return nil, nil, err
+				}
+				return io.NopCloser(bytes.NewReader(data)), metadata, nil
+			}
+			// Fetch missing chunks
+			if err := s.replicator.FetchChunks(manifest, missingChunks); err != nil {
+				log.Printf("Failed to fetch missing chunks for %s: %v", hash.String(), err)
+			} else {
+				data, err := s.reassembleContent(manifest)
+				if err != nil {
+					log.Printf("Failed to reassemble content %s: %v", hash.String(), err)
+					return nil, nil, err
+				}
+				return io.NopCloser(bytes.NewReader(data)), metadata, nil
+			}
+		}
+		log.Printf("Metadata for %s found, but manifest or chunks missing. Attempting network fetch.", hash.String())
+	}
+
+	// Fetch from network
+	dataStream, metadata, err := s.fetchContentStreamFromNetwork(ctx, hash)
+	if err != nil {
+		return nil, nil, err
+	}
+	return dataStream, metadata, nil
+}
+
+// fetchContentStreamFromNetwork fetches content by retrieving its manifest and chunks
 func (s *Server) fetchContentStreamFromNetwork(ctx context.Context, hash hasher.Hash) (io.ReadCloser, *storage.ContentMetadata, error) {
 	libp2pNode, ok := s.node.(*libp2p.Node)
-	if !ok || s.streamer == nil {
-		return nil, nil, fmt.Errorf("network node is not available or does not support streaming")
-	}
-
-	hashStr := hash.String()
-	log.Printf("Searching for providers of content %s", hashStr)
-	providers, err := libp2pNode.FindContentProviders(hashStr)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to find content providers: %w", err)
-	}
-	if len(providers) == 0 {
-		return nil, nil, fmt.Errorf("no providers found for content %s", hashStr)
-	}
-
-	log.Printf("Found %d provider(s) for %s. Attempting to fetch stream...", len(providers), hashStr)
-	var lastErr error
-	for _, p := range providers {
-		if p.ID == libp2pNode.ID() {
-			log.Printf("Skipping self as provider: %s", p.ID)
-			continue // Don't try to fetch from ourselves
-		}
-
-		stream, err := s.streamer.RequestTransfer(ctx, hash, p.ID)
-		if err != nil {
-			lastErr = fmt.Errorf("failed to fetch stream from peer %s: %w", p.ID, err)
-			log.Printf("Error fetching stream from peer: %v", lastErr)
-			continue
-		}
-
-		// Since RequestTransfer now returns metadata, we need to get it.
-		// This is a bit of a hack, as we don't have the metadata yet.
-		// We'll get it from the stream itself.
-		var metadata *storage.ContentMetadata
-
-		// TODO: Add content verification for streams if possible, though it's tricky.
-
-		// Store content in the background while streaming
-		go func(stream io.ReadCloser) {
-			// Create a tee reader to save the content as it's read
-			pr, pw := io.Pipe()
-			tee := io.TeeReader(stream, pw)
-
-			// Goroutine to read from the tee and store the data
-			go func() {
-				data, err := io.ReadAll(tee)
-				if err != nil {
-					log.Printf("Error reading from tee for storage: %v", err)
-					return
-				}
-
-				if metadata != nil { // metadata should be available here
-					if err := s.storage.StoreContent(metadata); err != nil {
-						log.Printf("Warning: failed to store fetched metadata for %s: %v", hashStr, err)
-					}
-					if err := s.storage.StoreData(hash, data); err != nil {
-						log.Printf("Warning: failed to store fetched data for %s: %v", hashStr, err)
-					}
-					log.Printf("Successfully stored streamed content %s in the background", hashStr)
-				}
-			}()
-
-			// now we can read the metadata from the pipe reader
-			// and then the rest of the data will be read by the other goroutine
-			// and sent to the client
-			// This is a bit of a hack, but it works for now.
-			// A better solution would be to have the metadata sent first.
-			// But that would require a change in the protocol.
-			// So we'll stick with this for now.
-
-			// read metadata from the stream
-			var metaLen uint32
-			if err := binary.Read(pr, binary.BigEndian, &metaLen); err != nil {
-				log.Printf("Error reading metadata length from stream: %v", err)
-				return
-			}
-
-			metaBytes := make([]byte, metaLen)
-			if _, err := io.ReadFull(pr, metaBytes); err != nil {
-				log.Printf("Error reading metadata from stream: %v", err)
-				return
-			}
-
-			if err := json.Unmarshal(metaBytes, &metadata); err != nil {
-				log.Printf("Error unmarshaling metadata from stream: %v", err)
-				return
-			}
-
-		}(stream)
-
-		return stream, metadata, nil
-	}
-
-	return nil, nil, fmt.Errorf("failed to fetch content stream from all found providers: %w", lastErr)
-}
-
-// fetchContentFromNetwork finds and retrieves content from peers.
-func (s *Server) fetchContentFromNetwork(ctx context.Context, hash hasher.Hash) ([]byte, *storage.ContentMetadata, error) {
-	libp2pNode, ok := s.node.(*libp2p.Node)
 	if !ok {
-		return nil, nil, fmt.Errorf("network node is not available or does not support fetching")
+		return nil, nil, fmt.Errorf("network node is not available")
 	}
 
 	hashStr := hash.String()
@@ -567,138 +490,98 @@ func (s *Server) fetchContentFromNetwork(ctx context.Context, hash hasher.Hash) 
 		return nil, nil, fmt.Errorf("no providers found for content %s", hashStr)
 	}
 
-	log.Printf("Found %d provider(s) for %s. Attempting to fetch...", len(providers), hashStr)
+	log.Printf("Found %d provider(s) for %s. Attempting to fetch manifest...", len(providers), hashStr)
 	var lastErr error
 	for _, p := range providers {
 		if p.ID == libp2pNode.ID() {
 			log.Printf("Skipping self as provider: %s", p.ID)
-			continue // Don't try to fetch from ourselves
+			continue
 		}
-		log.Printf("Requesting content %s from peer %s", hashStr, p.ID)
-		data, metadata, err := libp2pNode.RequestContentFromPeer(p.ID, hashStr)
+
+		manifest, err := s.replicator.RequestManifest(hash)
 		if err != nil {
-			lastErr = fmt.Errorf("failed to fetch from peer %s: %w", p.ID, err)
-			log.Printf("Error fetching from peer: %v", lastErr)
+			lastErr = fmt.Errorf("failed to fetch manifest from peer %s: %w", p.ID, err)
+			log.Printf("Error fetching manifest from peer: %v", lastErr)
 			continue
 		}
 
-		// The metadata.Hash from the peer should match the requested hash (random hash)
-		if metadata.Hash != hash {
-			lastErr = fmt.Errorf("requested hash mismatch: expected %s, got %s from peer %s",
-				hash.String(), metadata.Hash.String(), p.ID)
-			log.Printf("Warning: %v", lastErr)
+		// Reassemble content
+		data, err := s.reassembleContent(manifest)
+		if err != nil {
+			lastErr = fmt.Errorf("failed to reassemble content %s: %w", hashStr, err)
+			log.Printf("Error reassembling content: %v", lastErr)
 			continue
 		}
 
-		// Compute the actual content hash of the received data
-		actualContentHash := hasher.HashBytes(data)
-		log.Printf("Received data from peer %s for hash %s: computed content hash=%s", p.ID, hashStr, actualContentHash.String())
-
-		// Determine the expected content hash for verification
-		var expectedContentHash hasher.Hash
-		usePeerContentHashForVerification := false
-
-		// Get local metadata to compare ContentHash
-		localMetadata, err := s.storage.GetContent(hash)
-		if err == nil && localMetadata.ContentHash != (hasher.Hash{}) {
-			// If local metadata exists and has a content hash, use it
-			expectedContentHash = localMetadata.ContentHash
-			log.Printf("Local metadata found for %s: expected ContentHash=%s", hashStr, expectedContentHash.String())
-		} else if metadata.ContentHash != (hasher.Hash{}) {
-			// If no local content hash, but peer provides one, use peer's for verification
-			expectedContentHash = metadata.ContentHash
-			usePeerContentHashForVerification = true
-			log.Printf("No local ContentHash for %s, using peer's ContentHash for verification: %s", hashStr, expectedContentHash.String())
-		} else {
-			// Neither local nor peer provides a content hash, skip verification
-			log.Printf("Warning: no ContentHash provided by local storage or peer for %s, skipping content verification.", hashStr)
-			// No expectedContentHash, so the verification block below will be skipped.
-		}
-
-		// Verify content-based hash if an expected hash is present
-		if expectedContentHash != (hasher.Hash{}) {
-			if !hasher.Verify(data, expectedContentHash) {
-				lastErr = fmt.Errorf("content hash mismatch for %s from peer %s: expected %s, got %s",
-					hashStr, p.ID, expectedContentHash.String(), actualContentHash.String())
-				log.Printf("Error: %v", lastErr)
-				continue
+		// Get or create metadata
+		metadata, err := s.storage.GetContent(hash)
+		if err != nil {
+			metadata = &storage.ContentMetadata{
+				MerkleRoot: hash,
+				Filename:   fmt.Sprintf("content-%s", hashStr),
+				MimeType:   "application/octet-stream",
+				Size:       int64(len(data)),
+				ModTime:    time.Now(),
+				ChunkCount: len(manifest.Chunks),
+				CreatedAt:  time.Now(),
+				RefCount:   1,
+			}
+			if err := s.storage.StoreContent(metadata); err != nil {
+				log.Printf("Warning: failed to store metadata for %s: %v", hashStr, err)
 			}
 		}
 
-		// If we used the peer's content hash for verification and it passed,
-		// or if no content hash was available and we accepted the data,
-		// ensure the metadata stored locally has the correct content hash.
-		if usePeerContentHashForVerification || expectedContentHash == (hasher.Hash{}) {
-			// If we used peer's content hash and it passed, or if no content hash was available,
-			// update the metadata with the actual content hash for future verification.
-			metadata.ContentHash = actualContentHash
-		}
+		// Store content in the background
+		go func(data []byte, manifest *chunker.Manifest) {
+			if err := s.storage.StoreManifest(manifest); err != nil {
+				log.Printf("Warning: failed to store manifest for %s: %v", hashStr, err)
+			}
+			for _, chunkInfo := range manifest.Chunks {
+				chunkData, err := s.storage.GetChunkData(hash, chunkInfo.Hash)
+				if err != nil {
+					log.Printf("Warning: failed to get chunk %s for %s: %v", chunkInfo.Hash.String(), hashStr, err)
+					continue
+				}
+				if err := s.storage.StoreChunkData(hash, chunkInfo.Hash, chunkData); err != nil {
+					log.Printf("Warning: failed to store chunk %s for %s: %v", chunkInfo.Hash.String(), hashStr, err)
+				}
+			}
+			log.Printf("Successfully stored fetched content %s in the background", hashStr)
+		}(data, manifest)
 
-		// Store fetched content
-		log.Printf("Successfully fetched %d bytes for content %s from peer %s. Storing locally.",
-			len(data), hashStr, p.ID)
-		if err := s.storage.StoreContent(metadata); err != nil {
-			log.Printf("Warning: failed to store fetched metadata for %s: %v", hashStr, err)
-		}
-		if err := s.storage.StoreData(hash, data); err != nil {
-			log.Printf("Warning: failed to store fetched data for %s: %v", hashStr, err)
-		}
-
-		return data, metadata, nil
+		return io.NopCloser(bytes.NewReader(data)), metadata, nil
 	}
 
-	return nil, nil, fmt.Errorf("failed to fetch content from all found providers: %w", lastErr)
+	return nil, nil, fmt.Errorf("failed to fetch content from all providers: %w", lastErr)
 }
 
-// func (s *Server) fetchContentFromNetwork(ctx context.Context, hash hasher.Hash) ([]byte, error) {
-// 	libp2pNode, ok := s.node.(*libp2p.Node)
-// 	if !ok {
-// 		return nil, fmt.Errorf("network node is not available or does not support fetching")
-// 	}
+// reassembleContent reassembles content from its chunks
+func (s *Server) reassembleContent(manifest *chunker.Manifest) ([]byte, error) {
+	var chunks []chunker.Chunk
+	for _, chunkInfo := range manifest.Chunks {
+		data, err := s.storage.GetChunkData(manifest.MerkleRoot, chunkInfo.Hash)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get chunk %s: %w", chunkInfo.Hash.String(), err)
+		}
+		chunks = append(chunks, chunker.Chunk{
+			Hash:     chunkInfo.Hash,
+			Data:     data,
+			Size:     chunkInfo.Size,
+			Sequence: chunkInfo.Sequence,
+		})
+	}
 
-// 	hashStr := hash.String()
-// 	log.Printf("Searching for providers of content %s", hashStr)
-// 	providers, err := libp2pNode.FindContentProviders(hashStr)
-// 	if err != nil {
-// 		return nil, fmt.Errorf("failed to find content providers: %w", err)
-// 	}
-// 	if len(providers) == 0 {
-// 		return nil, fmt.Errorf("no providers found for content")
-// 	}
+	// Verify and reassemble
+	if err := chunker.VerifyManifest(manifest, chunks); err != nil {
+		return nil, fmt.Errorf("manifest verification failed: %w", err)
+	}
 
-// 	log.Printf("Found %d provider(s) for %s. Attempting to fetch...", len(providers), hashStr)
-// 	var lastErr error
-// 	for _, p := range providers {
-// 		if p.ID == libp2pNode.ID() {
-// 			continue // Don't try to fetch from ourselves
-// 		}
-// 		log.Printf("Requesting content %s from peer %s", hashStr, p.ID)
-// 		data, metadata, err := libp2pNode.RequestContentFromPeer(p.ID, hashStr)
-// 		if err != nil {
-// 			lastErr = fmt.Errorf("failed to fetch from peer %s: %w", p.ID, err)
-// 			log.Printf("Error fetching from peer: %v", err)
-// 			continue
-// 		}
+	data, err := chunker.ReassembleChunks(chunks)
+	if err != nil {
+		return nil, fmt.Errorf("failed to reassemble chunks: %w", err)
+	}
 
-// 		// Content fetched successfully, now store it with its metadata.
-// 		log.Printf("Successfully fetched %d bytes for content %s from peer %s. Storing locally.", len(data), hashStr, p.ID)
-// 		if err := s.storage.StoreContent(metadata); err != nil {
-// 			log.Printf("Warning: failed to store fetched metadata for %s: %v", hashStr, err)
-// 			// We have the data but failed to store it. Log the error but still return the data.
-// 		}
-// 		if err := s.storage.StoreData(metadata.Hash, data); err != nil {
-// 			log.Printf("Warning: failed to store fetched data for %s: %v", hashStr, err)
-// 		}
-
-// 		return data, nil
-// 	}
-
-// 	return nil, fmt.Errorf("failed to fetch content from all found providers: %w", lastErr)
-// }
-
-// viewContentPath handles viewing content at a specific path (for directories)
-func (s *Server) viewContentPath(w http.ResponseWriter, r *http.Request) {
-	s.writeError(w, http.StatusNotImplemented, "Path-based content viewing not yet implemented", nil)
+	return data, nil
 }
 
 // getContentInfo returns information about content
@@ -729,7 +612,7 @@ func (s *Server) getContentInfo(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Content found on network, start background replication
-		go s.fetchContentFromNetwork(context.Background(), hash)
+		go s.replicator.RequestManifest(hash)
 
 		s.writeJSON(w, http.StatusAccepted, map[string]string{
 			"message": "Content found on network, replication started in background.",
@@ -738,7 +621,7 @@ func (s *Server) getContentInfo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	info := ContentInfo{
-		Hash:        metadata.Hash.String(),
+		Hash:        metadata.MerkleRoot.String(),
 		Filename:    metadata.Filename,
 		MimeType:    metadata.MimeType,
 		Size:        metadata.Size,
@@ -754,7 +637,7 @@ func (s *Server) getContentInfo(w http.ResponseWriter, r *http.Request) {
 
 // listContent lists all content
 func (s *Server) listContent(w http.ResponseWriter, r *http.Request) {
-	hashes, err := s.storage.ListContent()
+	hashes, err := s.storage.ListManifests()
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to list content", err)
 		return
@@ -768,7 +651,7 @@ func (s *Server) listContent(w http.ResponseWriter, r *http.Request) {
 		}
 
 		info := ContentInfo{
-			Hash:        metadata.Hash.String(),
+			Hash:        metadata.MerkleRoot.String(),
 			Filename:    metadata.Filename,
 			MimeType:    metadata.MimeType,
 			Size:        metadata.Size,
@@ -814,7 +697,7 @@ func (s *Server) pinContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.replicator.PinContent(hash); err != nil {
+	if err := s.replicator.PinManifest(hash); err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to pin content", err)
 		return
 	}
@@ -838,7 +721,7 @@ func (s *Server) unpinContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.replicator.UnpinContent(hash); err != nil {
+	if err := s.replicator.UnpinManifest(hash); err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to unpin content", err)
 		return
 	}
@@ -853,7 +736,7 @@ func (s *Server) unpinContent(w http.ResponseWriter, r *http.Request) {
 
 // listPins lists all pinned content hashes
 func (s *Server) listPins(w http.ResponseWriter, r *http.Request) {
-	pins := s.replicator.GetPinnedContent()
+	pins := s.replicator.GetPinnedManifests()
 	s.writeJSON(w, http.StatusOK, pins)
 }
 
@@ -878,89 +761,52 @@ func (s *Server) storeFile(filename string, reader io.Reader) (hasher.Hash, int6
 	}
 	hash := hasher.HashBytes(randomBytes)
 
-	// Create a buffer to read the content and calculate its hash and size
-	var b bytes.Buffer
-	size, err := io.Copy(&b, reader)
-	if err != nil {
-		return hasher.Hash{}, 0, fmt.Errorf("failed to read content for hashing: %w", err)
-	}
-	contentHash := hasher.HashBytes(b.Bytes())
-
-	log.Printf("Storing file %s: random hash=%s, content hash=%s, size=%d", filename, hash.String(), contentHash.String(), size)
-
 	// Check if content with this random hash already exists
 	if s.storage.HasContent(hash) {
+		metadata, err := s.storage.GetContent(hash)
+		if err != nil {
+			return hasher.Hash{}, 0, fmt.Errorf("failed to get existing metadata: %w", err)
+		}
 		log.Printf("Content with hash %s already exists", hash.String())
-		return hash, size, nil
+		return hash, metadata.Size, nil
 	}
 
-	// Create metadata
+	// Create a temporary buffer to determine size and chunk the data
+	var buf bytes.Buffer
+	tee := io.TeeReader(reader, &buf)
+	manifest, err := s.chunker.ChunkReader(tee)
+	if err != nil {
+		return hasher.Hash{}, 0, fmt.Errorf("failed to chunk content: %w", err)
+	}
+
+	// Ensure the manifest uses the random hash as MerkleRoot
+	manifest.MerkleRoot = hash
+
+	// Store manifest
+	if err := s.storage.StoreManifest(manifest); err != nil {
+		return hasher.Hash{}, 0, fmt.Errorf("failed to store manifest: %w", err)
+	}
+
+	// Create and store metadata
 	metadata := &storage.ContentMetadata{
-		Hash:        hash,
-		ContentHash: contentHash, // Store content-based hash
+		MerkleRoot:  hash,
 		Filename:    filename,
 		MimeType:    getMimeType(filename),
-		Size:        size,
+		Size:        manifest.TotalSize,
 		ModTime:     time.Now(),
-		IsDirectory: false,
+		ChunkCount:  len(manifest.Chunks),
 		CreatedAt:   time.Now(),
 		RefCount:    1,
+		IsDirectory: false,
 	}
 
-	// Store metadata
 	if err := s.storage.StoreContent(metadata); err != nil {
 		return hasher.Hash{}, 0, fmt.Errorf("failed to store metadata: %w", err)
 	}
 
-	// Store data using the buffered content
-	if err := s.storage.StoreDataStream(hash, bytes.NewReader(b.Bytes()), size); err != nil {
-		return hasher.Hash{}, 0, fmt.Errorf("failed to store data stream: %w", err)
-	}
-
-	log.Printf("Successfully stored file %s with random hash %s and content hash %s", filename, hash.String(), contentHash.String())
-	return hash, size, nil
+	log.Printf("Successfully stored file %s with hash %s, %d chunks", filename, hash.String(), len(manifest.Chunks))
+	return hash, manifest.TotalSize, nil
 }
-
-// func (s *Server) storeFile(filename string, content []byte) (hasher.Hash, error) {
-// 	// Compute hash
-// 	// Generate 32 random bytes
-// 	randomBytes := make([]byte, 32)
-// 	_, err := rand.Read(randomBytes)
-// 	if err != nil {
-// 		panic(err)
-// 	}
-
-// 	// Hash the random bytes using SHA-256
-// 	hash := sha256.Sum256(randomBytes)
-// 	// Check if already exists
-// 	if s.storage.HasContent(hash) {
-// 		return hash, nil
-// 	}
-
-// 	// Create metadata
-// 	metadata := &storage.ContentMetadata{
-// 		Hash:        hash,
-// 		Filename:    filename,
-// 		MimeType:    getMimeType(filename),
-// 		Size:        int64(len(content)),
-// 		ModTime:     time.Now(),
-// 		IsDirectory: false,
-// 		CreatedAt:   time.Now(),
-// 		RefCount:    1,
-// 	}
-
-// 	// Store metadata
-// 	if err := s.storage.StoreContent(metadata); err != nil {
-// 		return hasher.Hash{}, fmt.Errorf("failed to store metadata: %w", err)
-// 	}
-
-// 	// Store data
-// 	if err := s.storage.StoreData(hash, content); err != nil {
-// 		return hasher.Hash{}, fmt.Errorf("failed to store data: %w", err)
-// 	}
-
-// 	return hash, nil
-// }
 
 // getMimeType determines MIME type from filename
 func getMimeType(filename string) string {
@@ -1046,8 +892,6 @@ func getMimeType(filename string) string {
 		return "video/mp2t"
 	case ".m3u8":
 		return "application/vnd.apple.mpegurl"
-
-	// Browser-unrenderable MIME types
 	case ".pdf":
 		return "application/pdf"
 	case ".zip":
@@ -1138,7 +982,6 @@ func getMimeType(filename string) string {
 		return "application/vnd.google-earth.kmz"
 	case ".gpx":
 		return "application/gpx+xml"
-
 	default:
 		return "application/octet-stream"
 	}

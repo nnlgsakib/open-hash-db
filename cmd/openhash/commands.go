@@ -10,8 +10,6 @@ import (
 	"mime/multipart"
 	"net/http"
 	"openhashdb/api/rest"
-	"openhashdb/core/dag"
-	"openhashdb/core/hasher"
 	"openhashdb/core/storage"
 	"openhashdb/network/bootnode"
 	"openhashdb/network/libp2p"
@@ -27,21 +25,21 @@ import (
 var (
 	// Global flags
 	dbPath    string
-	keyPath   string // New flag for key path
-	apiPort   int
-	p2pPort   int
-	verbose   bool
-	bootnodes string
-	apiURL    string
+	keyPath   string // Path to the node's private key file
+	apiPort   int    // REST API port
+	p2pPort   int    // P2P port
+	verbose   bool   // Verbose output
+	bootnodes string // Comma-separated list of bootnode addresses
+	apiURL    string // REST API URL
 
-	// Global instances
+	// Global instances (only used in daemon mode)
 	store     *storage.Storage
 	node      *libp2p.Node
 	repl      *replicator.Replicator
 	apiServer *rest.Server
 )
 
-// rootCmd represents the base command when called without any subcommands
+// rootCmd represents the base command
 var rootCmd = &cobra.Command{
 	Use:   "openhash",
 	Short: "OpenHashDB is a content-addressable, distributed database system",
@@ -53,160 +51,81 @@ It provides:
 - Distributed peer-to-peer networking via libp2p
 - File and folder upload with automatic chunking
 - REST API for web integration
-- CLI for direct command-line usage`,
+- CLI for command-line usage via REST API
+
+Run 'openhash daemon' to start the server before using other commands.`,
 	Run: func(cmd *cobra.Command, args []string) {
-		// Default behavior when no subcommand is provided
 		cmd.Help()
 	},
 }
 
-// addCmd represents the add command
+// addCmd adds a file or folder via the REST API
 var addCmd = &cobra.Command{
 	Use:   "add [file/folder]",
 	Short: "Add a file or folder to OpenHashDB",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := checkAPIConnection(); err != nil {
+			return fmt.Errorf("API connection failed: %w (ensure 'openhash daemon' is running)", err)
+		}
+
 		path := args[0]
-
-		// Check if using API mode
-		if shouldUseAPI() {
-			if err := checkAPIConnection(); err != nil {
-				return fmt.Errorf("API connection failed: %w", err)
-			}
-
-			// Check if path is a file or directory
-			info, err := os.Stat(path)
-			if err != nil {
-				return fmt.Errorf("failed to stat path: %w", err)
-			}
-
-			if info.IsDir() {
-				return uploadFolderViaAPI(path)
-			}
-
-			return uploadFileViaAPI(path)
-		}
-
-		// Direct database mode
-		// Initialize storage
-		if err := initStorage(); err != nil {
-			return err
-		}
-		defer store.Close()
-
-		// Check if path exists
 		info, err := os.Stat(path)
 		if err != nil {
-			return fmt.Errorf("path does not exist: %s", path)
+			return fmt.Errorf("failed to stat path: %w", err)
 		}
 
 		if info.IsDir() {
-			return addFolder(path)
-		} else {
-			return addFile(path)
+			return uploadFolderViaAPI(path)
 		}
+		return uploadFileViaAPI(path)
 	},
 }
 
-// getCmd represents the get command
+// getCmd retrieves content by hash via the REST API
 var getCmd = &cobra.Command{
 	Use:   "get [hash]",
 	Short: "Retrieve content by hash",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		hashStr := args[0]
-
-		// Check if using API mode
-		if shouldUseAPI() {
-			if err := checkAPIConnection(); err != nil {
-				return fmt.Errorf("API connection failed: %w", err)
-			}
-
-			return getContentViaAPI(hashStr)
+		if err := checkAPIConnection(); err != nil {
+			return fmt.Errorf("API connection failed: %w (ensure 'openhash daemon' is running)", err)
 		}
-
-		// Direct database mode
-		// Initialize storage
-		if err := initStorage(); err != nil {
-			return err
-		}
-		defer store.Close()
-
-		hash, err := hasher.HashFromString(hashStr)
-		if err != nil {
-			return fmt.Errorf("invalid hash: %w", err)
-		}
-
-		return getContent(hash)
+		return getContentViaAPI(args[0])
 	},
 }
 
-// viewCmd represents the view command
+// viewCmd views content information via the REST API
 var viewCmd = &cobra.Command{
 	Use:   "view [hash]",
 	Short: "View content information",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		hashStr := args[0]
-
-		// Check if using API mode
-		if shouldUseAPI() {
-			if err := checkAPIConnection(); err != nil {
-				return fmt.Errorf("API connection failed: %w", err)
-			}
-
-			return getContentViaAPI(hashStr) // Same as get for now
+		if err := checkAPIConnection(); err != nil {
+			return fmt.Errorf("API connection failed: %w (ensure 'openhash daemon' is running)", err)
 		}
-
-		// Direct database mode
-		// Initialize storage
-		if err := initStorage(); err != nil {
-			return err
-		}
-		defer store.Close()
-
-		hash, err := hasher.HashFromString(hashStr)
-		if err != nil {
-			return fmt.Errorf("invalid hash: %w", err)
-		}
-
-		return viewContent(hash)
+		return viewContentViaAPI(args[0])
 	},
 }
 
-// listCmd represents the list command
+// listCmd lists all stored content via the REST API
 var listCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List all stored content",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		// Check if using API mode
-		if shouldUseAPI() {
-			if err := checkAPIConnection(); err != nil {
-				return fmt.Errorf("API connection failed: %w", err)
-			}
-
-			return listContentViaAPI()
+		if err := checkAPIConnection(); err != nil {
+			return fmt.Errorf("API connection failed: %w (ensure 'openhash daemon' is running)", err)
 		}
-
-		// Direct database mode
-		// Initialize storage
-		if err := initStorage(); err != nil {
-			return err
-		}
-		defer store.Close()
-
-		return listContent()
+		return listContentViaAPI()
 	},
 }
 
-// daemonCmd represents the daemon command
+// daemonCmd starts the OpenHashDB daemon with REST API
 var daemonCmd = &cobra.Command{
 	Use:   "daemon",
 	Short: "Start OpenHashDB daemon with REST API",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		enableRest, _ := cmd.Flags().GetBool("enable-rest")
-
-		// Initialize all components
 		if err := initAll(); err != nil {
 			return err
 		}
@@ -220,11 +139,9 @@ var daemonCmd = &cobra.Command{
 		}
 
 		if enableRest {
-			// Initialize API server
 			apiServer = rest.NewServer(store, repl, node)
 			addr := fmt.Sprintf("0.0.0.0:%d", apiPort)
 			fmt.Printf("REST API available at: http://%s\n", addr)
-
 			go func() {
 				if err := apiServer.Start(addr); err != nil {
 					log.Printf("REST API server error: %v", err)
@@ -232,11 +149,11 @@ var daemonCmd = &cobra.Command{
 			}()
 		}
 
-		// Wait for interrupt
 		select {}
 	},
 }
 
+// bootnodeCmd runs a standalone bootnode and relayer
 var bootnodeCmd = &cobra.Command{
 	Use:   "bootnode",
 	Short: "Run a standalone bootnode and relayer",
@@ -244,13 +161,11 @@ var bootnodeCmd = &cobra.Command{
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		// Determine key path
 		actualKeyPath := keyPath
 		if actualKeyPath == "" {
 			actualKeyPath = filepath.Join(dbPath, "peer.key")
 		}
 
-		// Parse bootnode addresses
 		var bootnodeAddrs []string
 		if bootnodes != "" {
 			bootnodeAddrs = strings.Split(bootnodes, ",")
@@ -259,7 +174,6 @@ var bootnodeCmd = &cobra.Command{
 			}
 		}
 
-		// Initialize bootnode
 		node, err := bootnode.NewBootNode(ctx, actualKeyPath, bootnodeAddrs, p2pPort)
 		if err != nil {
 			return fmt.Errorf("failed to create bootnode: %w", err)
@@ -273,7 +187,6 @@ var bootnodeCmd = &cobra.Command{
 			fmt.Printf("  %s\n", addr)
 		}
 
-		// Wait for interrupt
 		select {}
 	},
 }
@@ -286,18 +199,13 @@ func init() {
 	rootCmd.PersistentFlags().IntVar(&p2pPort, "p2p-port", 0, "P2P port (0 for random)")
 	rootCmd.PersistentFlags().BoolVar(&verbose, "verbose", false, "Verbose output")
 	rootCmd.PersistentFlags().StringVar(&bootnodes, "bootnode", "", "Comma-separated list of bootnode addresses (e.g., /ip4/1.2.3.4/tcp/4001/p2p/Qm...)")
-	rootCmd.PersistentFlags().StringVar(&apiURL, "api", "", "REST API URL for remote operations (e.g., http://localhost:8080)")
+	rootCmd.PersistentFlags().StringVar(&apiURL, "api", "", "REST API URL (e.g., http://localhost:8080)")
 
-	// Command-specific flags
+	// Daemon-specific flags
 	daemonCmd.Flags().Bool("enable-rest", true, "Enable REST API")
 
 	// Add commands
-	rootCmd.AddCommand(addCmd)
-	rootCmd.AddCommand(getCmd)
-	rootCmd.AddCommand(viewCmd)
-	rootCmd.AddCommand(daemonCmd)
-	rootCmd.AddCommand(listCmd)
-	rootCmd.AddCommand(bootnodeCmd)
+	rootCmd.AddCommand(addCmd, getCmd, viewCmd, listCmd, daemonCmd, bootnodeCmd)
 }
 
 func main() {
@@ -307,24 +215,14 @@ func main() {
 	}
 }
 
-// initStorage initializes the storage layer
-func initStorage() error {
+// initAll initializes all components for daemon mode
+func initAll() error {
 	var err error
 	store, err = storage.NewStorage(dbPath)
 	if err != nil {
 		return fmt.Errorf("failed to initialize storage: %w", err)
 	}
-	return nil
-}
 
-// initAll initializes all components
-func initAll() error {
-	// Initialize storage
-	if err := initStorage(); err != nil {
-		return err
-	}
-
-	// Parse bootnode addresses
 	var bootnodeAddrs []string
 	if bootnodes != "" {
 		bootnodeAddrs = strings.Split(bootnodes, ",")
@@ -333,25 +231,20 @@ func initAll() error {
 		}
 	}
 
-	// Determine key path
 	actualKeyPath := keyPath
 	if actualKeyPath == "" {
 		actualKeyPath = filepath.Join(dbPath, "peer.key")
 	}
 
-	// Initialize libp2p node
 	ctx := context.Background()
-	var err error
 	node, err = libp2p.NewNodeWithKeyPath(ctx, bootnodeAddrs, actualKeyPath, p2pPort)
 	if err != nil {
+		store.Close() // Clean up storage if node initialization fails
 		return fmt.Errorf("failed to initialize libp2p node: %w", err)
 	}
-	// Set storage for the node to handle content requests
 	node.SetStorage(store)
 
-	// Initialize replicator
 	repl = replicator.NewReplicator(store, node, replicator.DefaultReplicationFactor)
-
 	return nil
 }
 
@@ -373,456 +266,9 @@ func cleanup() {
 	}
 }
 
-// addFile adds a single file
-func addFile(path string) error {
-	// Read file
-	content, err := os.ReadFile(path)
-	if err != nil {
-		return fmt.Errorf("failed to read file: %w", err)
-	}
+// API interaction functions
 
-	// Get file info
-	info, err := os.Stat(path)
-	if err != nil {
-		return fmt.Errorf("failed to stat file: %w", err)
-	}
-
-	// Compute hash
-	hash := hasher.HashBytes(content)
-
-	// Create metadata
-	metadata := &storage.ContentMetadata{
-		Hash:        hash,
-		Filename:    filepath.Base(path),
-		MimeType:    getMimeType(path),
-		Size:        info.Size(),
-		ModTime:     info.ModTime(),
-		IsDirectory: false,
-		CreatedAt:   time.Now(),
-		RefCount:    1,
-	}
-
-	// Store metadata
-	if err := store.StoreContent(metadata); err != nil {
-		return fmt.Errorf("failed to store metadata: %w", err)
-	}
-
-	// Store data
-	if err := store.StoreData(hash, content); err != nil {
-		return fmt.Errorf("failed to store data: %w", err)
-	}
-
-	// Announce to DHT if node is available
-	if node != nil {
-		if err := node.AnnounceContent(hash.String()); err != nil {
-			log.Printf("Warning: failed to announce content to DHT: %v", err)
-		}
-	}
-
-	fmt.Printf("✅ File added: %s\n", hash.String())
-	fmt.Printf("   Size: %d bytes\n", len(content))
-	fmt.Printf("   Name: %s\n", filepath.Base(path))
-
-	return nil
-}
-
-// addFolder adds a folder (simplified implementation)
-func addFolder(path string) error {
-	// Build DAG
-	builder := dag.NewDAGBuilder()
-	if verbose {
-		builder.ProgressCallback = func(path string, processed, total int) {
-			fmt.Printf("Processing: %s (%d/%d)\n", path, processed, total)
-		}
-	}
-
-	dagNode, err := builder.BuildFromPath(path)
-	if err != nil {
-		return fmt.Errorf("failed to build DAG: %w", err)
-	}
-
-	// Serialize DAG
-	dagData, err := dagNode.Serialize()
-	if err != nil {
-		return fmt.Errorf("failed to serialize DAG: %w", err)
-	}
-
-	// Create metadata
-	metadata := &storage.ContentMetadata{
-		Hash:        dagNode.Hash,
-		Filename:    filepath.Base(path),
-		MimeType:    "application/x-directory",
-		Size:        dagNode.Size,
-		ModTime:     time.Now(),
-		IsDirectory: true,
-		CreatedAt:   time.Now(),
-		RefCount:    1,
-	}
-
-	// Store metadata
-	if err := store.StoreContent(metadata); err != nil {
-		return fmt.Errorf("failed to store metadata: %w", err)
-	}
-
-	// Store DAG data
-	if err := store.StoreData(dagNode.Hash, dagData); err != nil {
-		return fmt.Errorf("failed to store DAG data: %w", err)
-	}
-
-	fmt.Printf("✅ Folder added: %s\n", dagNode.Hash.String())
-	fmt.Printf("   Size: %d bytes\n", dagNode.Size)
-	fmt.Printf("   Name: %s\n", filepath.Base(path))
-	fmt.Printf("   Files: %d\n", len(dagNode.Links))
-
-	return nil
-}
-
-// getContent retrieves and displays content
-func getContent(hash hasher.Hash) error {
-	// First try to get from local storage
-	metadata, err := store.GetContent(hash)
-	if err == nil {
-		// Content found locally
-		data, err := store.GetData(hash)
-		if err == nil {
-			return displayContent(metadata, data, hash)
-		}
-	}
-
-	// Content not found locally, try DHT lookup if node is available
-	if node != nil {
-		log.Printf("Content not found locally, searching DHT...")
-		providers, err := node.FindContentProviders(hash.String())
-		if err != nil {
-			return fmt.Errorf("failed to find content providers: %w", err)
-		}
-
-		if len(providers) == 0 {
-			return fmt.Errorf("content not found: no providers available for hash %s", hash.String())
-		}
-
-		// Try to retrieve content from providers
-		for _, provider := range providers {
-			if provider.ID == node.ID() {
-				continue // Skip self
-			}
-			log.Printf("Attempting to retrieve content from provider: %s", provider.ID.String())
-			data, retrievedMetadata, err := node.RequestContentFromPeer(provider.ID, hash.String())
-			if err != nil {
-				log.Printf("Failed to retrieve from provider %s: %v", provider.ID.String(), err)
-				continue
-			}
-
-			// Store locally for future use
-			if err := store.StoreContent(retrievedMetadata); err != nil {
-				log.Printf("Warning: failed to store retrieved metadata: %v", err)
-			}
-
-			if err := store.StoreData(hash, data); err != nil {
-				log.Printf("Warning: failed to store retrieved data: %v", err)
-			}
-
-			log.Printf("Successfully retrieved and stored content from %s", provider.ID.String())
-			return displayContent(retrievedMetadata, data, hash)
-		}
-
-		return fmt.Errorf("failed to retrieve content from any provider")
-	}
-
-	return fmt.Errorf("content not found: %w", err)
-}
-
-// displayContent displays content information and data
-func displayContent(metadata *storage.ContentMetadata, data []byte, hash hasher.Hash) error {
-	if metadata.IsDirectory {
-		// Parse as DAG
-		dagNode, err := dag.Deserialize(data)
-		if err != nil {
-			return fmt.Errorf("failed to deserialize DAG: %w", err)
-		}
-
-		fmt.Printf("📁 Directory: %s\n", metadata.Filename)
-		fmt.Printf("   Hash: %s\n", hash.String())
-		fmt.Printf("   Size: %d bytes\n", metadata.Size)
-		fmt.Printf("   Files:\n")
-
-		for _, link := range dagNode.Links {
-			typeIcon := "📄"
-			if link.Type == dag.NodeTypeDirectory {
-				typeIcon = "📁"
-			}
-			fmt.Printf("     %s %s (%s, %d bytes)\n", typeIcon, link.Name, link.Hash.String()[:8], link.Size)
-		}
-	} else {
-		// Regular file
-		fmt.Printf("📄 File: %s\n", metadata.Filename)
-		fmt.Printf("   Hash: %s\n", hash.String())
-		fmt.Printf("   Size: %d bytes\n", metadata.Size)
-		fmt.Printf("   MIME: %s\n", metadata.MimeType)
-
-		// If it's a text file and small enough, show content
-		if isTextFile(metadata.MimeType) && len(data) < 1024 {
-			fmt.Printf("   Content:\n")
-			fmt.Printf("   %s\n", string(data))
-		}
-	}
-
-	return nil
-}
-
-// viewContent displays content information
-func viewContent(hash hasher.Hash) error {
-	metadata, err := store.GetContent(hash)
-	if err != nil {
-		return fmt.Errorf("content not found: %w", err)
-	}
-
-	fmt.Printf("Hash: %s\n", metadata.Hash.String())
-	fmt.Printf("Filename: %s\n", metadata.Filename)
-	fmt.Printf("MIME Type: %s\n", metadata.MimeType)
-	fmt.Printf("Size: %d bytes\n", metadata.Size)
-	fmt.Printf("Modified: %s\n", metadata.ModTime.Format(time.RFC3339))
-	fmt.Printf("Created: %s\n", metadata.CreatedAt.Format(time.RFC3339))
-	fmt.Printf("Reference Count: %d\n", metadata.RefCount)
-	fmt.Printf("Is Directory: %t\n", metadata.IsDirectory)
-
-	if metadata.ChunkCount > 0 {
-		fmt.Printf("Chunk Count: %d\n", metadata.ChunkCount)
-	}
-
-	return nil
-}
-
-// listContent lists all stored content
-func listContent() error {
-	hashes, err := store.ListContent()
-	if err != nil {
-		return fmt.Errorf("failed to list content: %w", err)
-	}
-
-	if len(hashes) == 0 {
-		fmt.Println("No content stored")
-		return nil
-	}
-
-	fmt.Printf("Stored content (%d items):\n", len(hashes))
-	fmt.Println()
-
-	for _, hash := range hashes {
-		metadata, err := store.GetContent(hash)
-		if err != nil {
-			continue
-		}
-
-		typeIcon := "📄"
-		if metadata.IsDirectory {
-			typeIcon = "📁"
-		}
-
-		fmt.Printf("%s %s\n", typeIcon, metadata.Filename)
-		fmt.Printf("   Hash: %s\n", hash.String())
-		fmt.Printf("   Size: %d bytes\n", metadata.Size)
-		fmt.Printf("   Created: %s\n", metadata.CreatedAt.Format("2006-01-02 15:04:05"))
-		fmt.Println()
-	}
-
-	return nil
-}
-
-// Helper functions
-
-func getMimeType(path string) string {
-	ext := filepath.Ext(path)
-	switch ext {
-	case ".txt":
-		return "text/plain"
-	case ".html", ".htm":
-		return "text/html"
-	case ".css":
-		return "text/css"
-	case ".js", ".mjs":
-		return "application/javascript"
-	case ".json":
-		return "application/json"
-	case ".jsonld":
-		return "application/ld+json"
-	case ".png":
-		return "image/png"
-	case ".jpg", ".jpeg":
-		return "image/jpeg"
-	case ".gif":
-		return "image/gif"
-	case ".svg":
-		return "image/svg+xml"
-	case ".webp":
-		return "image/webp"
-	case ".ico":
-		return "image/x-icon"
-	case ".bmp":
-		return "image/bmp"
-	case ".avif":
-		return "image/avif"
-	case ".heif", ".heic":
-		return "image/heif"
-	case ".tiff", ".tif":
-		return "image/tiff"
-	case ".mp3":
-		return "audio/mpeg"
-	case ".wav":
-		return "audio/wav"
-	case ".ogg":
-		return "audio/ogg"
-	case ".flac":
-		return "audio/flac"
-	case ".aac":
-		return "audio/aac"
-	case ".mp4":
-		return "video/mp4"
-	case ".webm":
-		return "video/webm"
-	case ".mpeg", ".mpg":
-		return "video/mpeg"
-	case ".ogv":
-		return "video/ogg"
-	case ".avi":
-		return "video/x-msvideo"
-	case ".mov":
-		return "video/quicktime"
-	case ".woff":
-		return "font/woff"
-	case ".woff2":
-		return "font/woff2"
-	case ".ttf":
-		return "font/ttf"
-	case ".otf":
-		return "font/otf"
-	case ".eot":
-		return "application/vnd.ms-fontobject"
-	case ".xml":
-		return "application/xml"
-	case ".xhtml":
-		return "application/xhtml+xml"
-	case ".wasm":
-		return "application/wasm"
-	case ".csv":
-		return "text/csv"
-	case ".vtt":
-		return "text/vtt"
-	case ".md", ".markdown":
-		return "text/markdown"
-	case ".ts":
-		return "video/mp2t"
-	case ".m3u8":
-		return "application/vnd.apple.mpegurl"
-
-	// Browser-unrenderable MIME types
-	case ".pdf":
-		return "application/pdf"
-	case ".zip":
-		return "application/zip"
-	case ".rar":
-		return "application/x-rar-compressed"
-	case ".7z":
-		return "application/x-7z-compressed"
-	case ".tar":
-		return "application/x-tar"
-	case ".gz":
-		return "application/gzip"
-	case ".bz2":
-		return "application/x-bzip2"
-	case ".xz":
-		return "application/x-xz"
-	case ".zst":
-		return "application/zstd"
-	case ".exe":
-		return "application/x-msdownload"
-	case ".doc":
-		return "application/msword"
-	case ".docx":
-		return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-	case ".xls":
-		return "application/vnd.ms-excel"
-	case ".xlsx":
-		return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-	case ".ppt":
-		return "application/vnd.ms-powerpoint"
-	case ".pptx":
-		return "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-	case ".odt":
-		return "application/vnd.oasis.opendocument.text"
-	case ".ods":
-		return "application/vnd.oasis.opendocument.spreadsheet"
-	case ".odp":
-		return "application/vnd.oasis.opendocument.presentation"
-	case ".odg":
-		return "application/vnd.oasis.opendocument.graphics"
-	case ".rtf":
-		return "application/rtf"
-	case ".epub":
-		return "application/epub+zip"
-	case ".jar":
-		return "application/java-archive"
-	case ".war":
-		return "application/x-webarchive"
-	case ".bin":
-		return "application/octet-stream"
-	case ".iso":
-		return "application/x-iso9660-image"
-	case ".dmg":
-		return "application/x-apple-diskimage"
-	case ".torrent":
-		return "application/x-bittorrent"
-	case ".sql":
-		return "application/sql"
-	case ".db", ".sqlite":
-		return "application/x-sqlite3"
-	case ".psd":
-		return "image/vnd.adobe.photoshop"
-	case ".ai":
-		return "application/postscript"
-	case ".eps":
-		return "application/postscript"
-	case ".vcf", ".vcard":
-		return "text/vcard"
-	case ".ics", ".ical":
-		return "text/calendar"
-	case ".apk":
-		return "application/vnd.android.package-archive"
-	case ".deb":
-		return "application/vnd.debian.binary-package"
-	case ".rpm":
-		return "application/x-rpm"
-	case ".swf":
-		return "application/x-shockwave-flash"
-	case ".mkv":
-		return "video/x-matroska"
-	case ".flv":
-		return "video/x-flv"
-	case ".dwg":
-		return "image/vnd.dwg"
-	case ".kml":
-		return "application/vnd.google-earth.kml+xml"
-	case ".kmz":
-		return "application/vnd.google-earth.kmz"
-	case ".gpx":
-		return "application/gpx+xml"
-
-	default:
-		return "application/octet-stream"
-	}
-}
-
-func isTextFile(mimeType string) bool {
-	return mimeType == "text/plain" ||
-		mimeType == "text/html" ||
-		mimeType == "application/json" ||
-		mimeType == "text/css" ||
-		mimeType == "application/javascript"
-}
-
-// HTTP client functions for API operations
-
-// getAPIURL returns the API URL to use, with fallback to default
+// getAPIURL returns the API URL, defaulting to localhost if not set
 func getAPIURL() string {
 	if apiURL != "" {
 		return strings.TrimSuffix(apiURL, "/")
@@ -830,41 +276,45 @@ func getAPIURL() string {
 	return fmt.Sprintf("http://localhost:%d", apiPort)
 }
 
+// checkAPIConnection verifies API connectivity
+func checkAPIConnection() error {
+	resp, err := http.Get(getAPIURL() + "/health")
+	if err != nil {
+		return fmt.Errorf("failed to connect to API at %s: %w", getAPIURL(), err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("API health check failed, status: %d", resp.StatusCode)
+	}
+	return nil
+}
+
 // uploadFileViaAPI uploads a file via REST API
 func uploadFileViaAPI(filePath string) error {
-	baseURL := getAPIURL()
-
-	// Open file
 	file, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to open file: %w", err)
 	}
 	defer file.Close()
 
-	// Create multipart form
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
-
-	// Add file field
 	fileWriter, err := writer.CreateFormFile("file", filepath.Base(filePath))
 	if err != nil {
 		return fmt.Errorf("failed to create form file: %w", err)
 	}
-
 	if _, err := io.Copy(fileWriter, file); err != nil {
 		return fmt.Errorf("failed to copy file data: %w", err)
 	}
-
 	writer.Close()
 
-	// Make request
-	resp, err := http.Post(baseURL+"/upload/file", writer.FormDataContentType(), &buf)
+	resp, err := http.Post(getAPIURL()+"/upload/file", writer.FormDataContentType(), &buf)
 	if err != nil {
 		return fmt.Errorf("failed to upload file: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// Parse response
 	var result map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return fmt.Errorf("failed to parse response: %w", err)
@@ -877,7 +327,6 @@ func uploadFileViaAPI(filePath string) error {
 		return fmt.Errorf("upload failed with status: %d", resp.StatusCode)
 	}
 
-	// Display result
 	if hash, ok := result["hash"].(string); ok {
 		fmt.Printf("✅ File uploaded: %s\n", hash)
 		if size, ok := result["size"].(float64); ok {
@@ -887,14 +336,11 @@ func uploadFileViaAPI(filePath string) error {
 			fmt.Printf("   Name: %s\n", filename)
 		}
 	}
-
 	return nil
 }
 
 // uploadFolderViaAPI uploads a folder via REST API
 func uploadFolderViaAPI(dirPath string) error {
-	baseURL := getAPIURL()
-
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
 
@@ -919,20 +365,17 @@ func uploadFolderViaAPI(dirPath string) error {
 				return err
 			}
 			_, err = io.Copy(part, file)
-			if err != nil {
-				return err
-			}
+			return err
 		}
 		return nil
 	})
-
 	if err != nil {
 		return fmt.Errorf("failed to walk directory: %w", err)
 	}
 
 	writer.Close()
 
-	resp, err := http.Post(baseURL+"/upload/folder", writer.FormDataContentType(), &buf)
+	resp, err := http.Post(getAPIURL()+"/upload/folder", writer.FormDataContentType(), &buf)
 	if err != nil {
 		return fmt.Errorf("failed to upload folder: %w", err)
 	}
@@ -959,36 +402,45 @@ func uploadFolderViaAPI(dirPath string) error {
 			fmt.Printf("   Name: %s\n", filename)
 		}
 	}
-
 	return nil
 }
 
 // getContentViaAPI retrieves content via REST API
 func getContentViaAPI(hash string) error {
-	baseURL := getAPIURL()
-
-	// First get content info
-	resp, err := http.Get(baseURL + "/info/" + hash)
+	resp, err := http.Get(getAPIURL() + "/download/" + hash)
 	if err != nil {
-		return fmt.Errorf("failed to get content info: %w", err)
+		return fmt.Errorf("failed to download content: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
 		return fmt.Errorf("content not found: %s", hash)
 	}
-
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("failed to get content info, status: %d", resp.StatusCode)
+		var result map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err == nil {
+			if errMsg, ok := result["error"].(string); ok {
+				return fmt.Errorf("failed to get content: %s", errMsg)
+			}
+		}
+		return fmt.Errorf("failed to get content, status: %d", resp.StatusCode)
 	}
 
+	// Get content info for metadata
+	infoResp, err := http.Get(getAPIURL() + "/info/" + hash)
+	if err != nil {
+		return fmt.Errorf("failed to get content info: %w", err)
+	}
+	defer infoResp.Body.Close()
+
 	var info map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+	if err := json.NewDecoder(infoResp.Body).Decode(&info); err != nil {
 		return fmt.Errorf("failed to parse content info: %w", err)
 	}
 
-	// Display content info
-	fmt.Printf("📄 File: %s\n", info["filename"])
+	// Display metadata
+	filename := info["filename"].(string)
+	fmt.Printf("📄 File: %s\n", filename)
 	fmt.Printf("   Hash: %s\n", hash)
 	if size, ok := info["size"].(float64); ok {
 		fmt.Printf("   Size: %.0f bytes\n", size)
@@ -997,40 +449,97 @@ func getContentViaAPI(hash string) error {
 		fmt.Printf("   MIME: %s\n", mimeType)
 	}
 
-	// If it's a small text file, show content
-	if mimeType, ok := info["mime_type"].(string); ok && strings.HasPrefix(mimeType, "text/") {
-		if size, ok := info["size"].(float64); ok && size < 1024 {
-			// Download content
-			resp, err := http.Get(baseURL + "/download/" + hash)
-			if err != nil {
-				return fmt.Errorf("failed to download content: %w", err)
-			}
-			defer resp.Body.Close()
+	// Save content to file
+	outputPath := filename
+	if _, err := os.Stat(outputPath); err == nil {
+		outputPath = fmt.Sprintf("%s-%s%s", strings.TrimSuffix(filename, filepath.Ext(filename)), hash[:8], filepath.Ext(filename))
+	}
+	outputFile, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("failed to create output file: %w", err)
+	}
+	defer outputFile.Close()
 
-			if resp.StatusCode == http.StatusOK {
-				content, err := io.ReadAll(resp.Body)
-				if err == nil {
-					fmt.Printf("   Content:\n")
-					fmt.Printf("   %s\n", string(content))
-				}
+	if _, err := io.Copy(outputFile, resp.Body); err != nil {
+		return fmt.Errorf("failed to save content: %w", err)
+	}
+	fmt.Printf("   Saved to: %s\n", outputPath)
+	return nil
+}
+
+// viewContentViaAPI views content information via REST API
+func viewContentViaAPI(hash string) error {
+	resp, err := http.Get(getAPIURL() + "/info/" + hash)
+	if err != nil {
+		return fmt.Errorf("failed to get content info: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("content not found: %s", hash)
+	}
+	if resp.StatusCode != http.StatusOK {
+		var result map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err == nil {
+			if errMsg, ok := result["error"].(string); ok {
+				return fmt.Errorf("failed to get content info: %s", errMsg)
 			}
 		}
+		return fmt.Errorf("failed to get content info, status: %d", resp.StatusCode)
 	}
 
+	var info map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return fmt.Errorf("failed to parse content info: %w", err)
+	}
+
+	fmt.Printf("Hash: %s\n", hash)
+	if filename, ok := info["filename"].(string); ok {
+		fmt.Printf("Filename: %s\n", filename)
+	}
+	if mimeType, ok := info["mime_type"].(string); ok {
+		fmt.Printf("MIME Type: %s\n", mimeType)
+	}
+	if size, ok := info["size"].(float64); ok {
+		fmt.Printf("Size: %.0f bytes\n", size)
+	}
+	if modTime, ok := info["mod_time"].(string); ok {
+		if t, err := time.Parse(time.RFC3339, modTime); err == nil {
+			fmt.Printf("Modified: %s\n", t.Format(time.RFC3339))
+		}
+	}
+	if createdAt, ok := info["created_at"].(string); ok {
+		if t, err := time.Parse(time.RFC3339, createdAt); err == nil {
+			fmt.Printf("Created: %s\n", t.Format(time.RFC3339))
+		}
+	}
+	if refCount, ok := info["ref_count"].(float64); ok {
+		fmt.Printf("Reference Count: %d\n", int(refCount))
+	}
+	if isDir, ok := info["is_directory"].(bool); ok {
+		fmt.Printf("Is Directory: %t\n", isDir)
+	}
+	if chunkCount, ok := info["chunk_count"].(float64); ok {
+		fmt.Printf("Chunk Count: %d\n", int(chunkCount))
+	}
 	return nil
 }
 
 // listContentViaAPI lists content via REST API
 func listContentViaAPI() error {
-	baseURL := getAPIURL()
-
-	resp, err := http.Get(baseURL + "/list")
+	resp, err := http.Get(getAPIURL() + "/list")
 	if err != nil {
 		return fmt.Errorf("failed to list content: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		var result map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err == nil {
+			if errMsg, ok := result["error"].(string); ok {
+				return fmt.Errorf("failed to list content: %s", errMsg)
+			}
+		}
 		return fmt.Errorf("failed to list content, status: %d", resp.StatusCode)
 	}
 
@@ -1040,53 +549,30 @@ func listContentViaAPI() error {
 	}
 
 	fmt.Printf("📋 Stored Content (%d items):\n\n", len(items))
-
 	for _, item := range items {
 		if hash, ok := item["hash"].(string); ok {
-			fmt.Printf("📄 %s\n", hash)
+			typeIcon := "📄"
+			if isDir, ok := item["is_directory"].(bool); ok && isDir {
+				typeIcon = "📁"
+			}
 			if filename, ok := item["filename"].(string); ok {
-				fmt.Printf("   Name: %s\n", filename)
+				fmt.Printf("%s %s\n", typeIcon, filename)
+				fmt.Printf("   Hash: %s\n", hash)
+				if size, ok := item["size"].(float64); ok {
+					fmt.Printf("   Size: %.0f bytes\n", size)
+				}
+				if createdAt, ok := item["created_at"].(string); ok {
+					if t, err := time.Parse(time.RFC3339, createdAt); err == nil {
+						fmt.Printf("   Created: %s\n", t.Format("2006-01-02 15:04:05"))
+					}
+				}
+				fmt.Println()
 			}
-			if size, ok := item["size"].(float64); ok {
-				fmt.Printf("   Size: %.0f bytes\n", size)
-			}
-			if mimeType, ok := item["mime_type"].(string); ok {
-				fmt.Printf("   Type: %s\n", mimeType)
-			}
-			fmt.Println()
 		}
 	}
 
 	if len(items) == 0 {
 		fmt.Println("📋 No content stored")
 	}
-
-	return nil
-}
-
-// shouldUseAPI determines if API mode should be used
-func shouldUseAPI() bool {
-	// If --api flag was provided (even with empty value), use API mode
-	cmd := rootCmd
-	if cmd.Flags().Changed("api") {
-		return true
-	}
-	return apiURL != ""
-}
-
-// checkAPIConnection verifies API connectivity
-func checkAPIConnection() error {
-	baseURL := getAPIURL()
-
-	resp, err := http.Get(baseURL + "/health")
-	if err != nil {
-		return fmt.Errorf("failed to connect to API at %s: %w", baseURL, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("API health check failed, status: %d", resp.StatusCode)
-	}
-
 	return nil
 }
