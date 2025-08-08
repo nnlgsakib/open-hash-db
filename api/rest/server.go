@@ -453,60 +453,12 @@ func (s *Server) viewContent(w http.ResponseWriter, r *http.Request) {
 
 // fetchContentStreamFromNetwork finds and retrieves a content stream from peers.
 func (s *Server) fetchContentStreamFromNetwork(ctx context.Context, hash hasher.Hash) (io.ReadCloser, *storage.ContentMetadata, error) {
-	libp2pNode, ok := s.node.(*libp2p.Node)
-	if !ok || s.streamer == nil {
-		return nil, nil, fmt.Errorf("network node is not available or does not support streaming")
-	}
-
-	hashStr := hash.String()
-	log.Printf("Searching for providers of content %s", hashStr)
-	providers, err := libp2pNode.FindContentProviders(hashStr)
+	data, metadata, err := s.fetchContentFromNetwork(ctx, hash)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to find content providers: %w", err)
-	}
-	if len(providers) == 0 {
-		return nil, nil, fmt.Errorf("no providers found for content %s", hashStr)
+		return nil, nil, err
 	}
 
-	log.Printf("Found %d provider(s) for %s. Attempting to fetch stream...", len(providers), hashStr)
-	var lastErr error
-	for _, p := range providers {
-		if p.ID == libp2pNode.ID() {
-			log.Printf("Skipping self as provider: %s", p.ID)
-			continue // Don't try to fetch from ourselves
-		}
-
-		stream, metadata, err := libp2pNode.RequestContentStreamFromPeer(ctx, p.ID, hashStr)
-		if err != nil {
-			lastErr = fmt.Errorf("failed to fetch stream from peer %s: %w", p.ID, err)
-			log.Printf("Error fetching stream from peer: %v", lastErr)
-			continue
-		}
-
-		// Store content in the background while streaming
-		go func(stream io.ReadCloser, metadata *storage.ContentMetadata) {
-			defer stream.Close()
-			data, err := io.ReadAll(stream)
-			if err != nil {
-				log.Printf("Error reading from stream for storage: %v", err)
-				return
-			}
-
-			if metadata != nil { // metadata should be available here
-				if err := s.storage.StoreContent(metadata); err != nil {
-					log.Printf("Warning: failed to store fetched metadata for %s: %v", hashStr, err)
-				}
-				if err := s.storage.StoreData(hash, data); err != nil {
-					log.Printf("Warning: failed to store fetched data for %s: %v", hashStr, err)
-				}
-				log.Printf("Successfully stored streamed content %s in the background", hashStr)
-			}
-		}(stream, metadata)
-
-		return stream, metadata, nil
-	}
-
-	return nil, nil, fmt.Errorf("failed to fetch content stream from all found providers: %w", lastErr)
+	return io.NopCloser(bytes.NewReader(data)), metadata, nil
 }
 
 // fetchContentFromNetwork finds and retrieves content from peers.
