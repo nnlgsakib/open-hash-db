@@ -482,8 +482,6 @@ func (n *Node) sendData(ctx context.Context, peerID peer.ID, protocolID protocol
 			continue
 		}
 		defer stream.Close()
-
-		stream.SetWriteDeadline(time.Now().Add(30 * time.Second))
 		if _, err := stream.Write(data); err != nil {
 			log.Printf("Attempt %d/%d: Failed to write data to %s: %v", attempt, maxRetries, peerID.String(), err)
 			networkErrorsTotal.WithLabelValues("send_data").Inc()
@@ -507,9 +505,8 @@ func (n *Node) handleContentStream(stream network.Stream) {
 	remotePeer := stream.Conn().RemotePeer()
 	log.Printf("Handling content stream from %s", remotePeer.String())
 
-	// Monitor the stream using heartbeats
-	stopMonitor := n.heartbeatService.MonitorStream(stream)
-	defer stopMonitor()
+	// Monitor the connection using heartbeats
+	n.heartbeatService.MonitorConnection(remotePeer)
 
 	buf := make([]byte, 256)
 	bytesRead, err := stream.Read(buf)
@@ -606,7 +603,7 @@ func (n *Node) handleChunkStream(stream network.Stream) {
 	remotePeer := stream.Conn().RemotePeer()
 	log.Printf("Handling chunk stream from %s", remotePeer.String())
 
-	stream.SetReadDeadline(time.Now().Add(30 * time.Second))
+	n.heartbeatService.MonitorConnection(remotePeer)
 	data := make([]byte, 1024*1024)
 	bytesRead, err := stream.Read(data)
 	if err != nil {
@@ -633,7 +630,7 @@ func (n *Node) handleGossipStream(stream network.Stream) {
 	remotePeer := stream.Conn().RemotePeer()
 	log.Printf("Handling gossip stream from %s", remotePeer.String())
 
-	stream.SetReadDeadline(time.Now().Add(30 * time.Second))
+	n.heartbeatService.MonitorConnection(remotePeer)
 	data := make([]byte, 64*1024)
 	bytesRead, err := stream.Read(data)
 	if err != nil {
@@ -868,7 +865,7 @@ func (n *Node) RequestContentFromPeer(peerID peer.ID, contentHash string) ([]byt
 			continue
 		}
 
-		stream.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		n.heartbeatService.MonitorConnection(peerID)
 		if _, err := stream.Write([]byte(contentHash)); err != nil {
 			log.Printf("Attempt %d/%d: Failed to send content request to %s: %v", attempt, maxRetries, peerID.String(), err)
 			networkErrorsTotal.WithLabelValues("write_content_request").Inc()
@@ -882,7 +879,6 @@ func (n *Node) RequestContentFromPeer(peerID peer.ID, contentHash string) ([]byt
 		}
 		stream.CloseWrite()
 
-		stream.SetReadDeadline(time.Now().Add(60 * time.Second))
 		buf := make([]byte, 256)
 		nBytes, err := stream.Read(buf)
 		if err == nil && nBytes > 0 && bytes.HasPrefix(buf[:nBytes], []byte("ERROR:")) {
@@ -1003,20 +999,8 @@ func (n *Node) RequestContentStreamFromPeer(ctx context.Context, peerID peer.ID,
 		}
 	}()
 
-	// Monitor the stream using heartbeats
-	stopMonitor := n.heartbeatService.MonitorStream(stream)
-	go func() {
-		for {
-			time.Sleep(1 * time.Second)
-			buf := make([]byte, 1)
-			stream.SetReadDeadline(time.Now().Add(1 * time.Millisecond))
-			_, err := stream.Read(buf)
-			if err == io.EOF {
-				stopMonitor()
-				return
-			}
-		}
-	}()
+	// Monitor the connection using heartbeats
+	n.heartbeatService.MonitorConnection(peerID)
 
 	if _, err := stream.Write([]byte(contentHash)); err != nil {
 		stream.Reset()
@@ -1050,9 +1034,8 @@ func (n *Node) handleStreamExchange(stream network.Stream) {
 	remotePeer := stream.Conn().RemotePeer()
 	log.Printf("Handling stream exchange from %s", remotePeer.String())
 
-	// Monitor the stream using heartbeats
-	stopMonitor := n.heartbeatService.MonitorStream(stream)
-	defer stopMonitor()
+	// Monitor the connection using heartbeats
+	n.heartbeatService.MonitorConnection(remotePeer)
 
 	buf := make([]byte, 256)
 	bytesRead, err := stream.Read(buf)
