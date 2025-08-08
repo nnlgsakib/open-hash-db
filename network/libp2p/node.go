@@ -348,6 +348,7 @@ func (n *networkNotifiee) Connected(net network.Network, conn network.Conn) {
 	}
 	n.node.logPeerEvent(conn.RemotePeer(), "connected", addrs)
 	n.node.PeerConnectedCallback(conn.RemotePeer())
+	n.node.heartbeatService.MonitorConnection(conn.RemotePeer())
 }
 
 func (n *networkNotifiee) Disconnected(net network.Network, conn network.Conn) {
@@ -357,6 +358,7 @@ func (n *networkNotifiee) Disconnected(net network.Network, conn network.Conn) {
 		addrs = append(addrs, addr.String())
 	}
 	n.node.logPeerEvent(conn.RemotePeer(), "disconnected", addrs)
+	n.node.heartbeatService.StopMonitoring(conn.RemotePeer())
 }
 
 func (n *networkNotifiee) Listen(net network.Network, addr multiaddr.Multiaddr)      {}
@@ -506,10 +508,6 @@ func (n *Node) handleContentStream(stream network.Stream) {
 
 	remotePeer := stream.Conn().RemotePeer()
 	log.Printf("Handling content stream from %s", remotePeer.String())
-
-	// Monitor the stream using heartbeats
-	stopMonitor := n.heartbeatService.MonitorStream(stream)
-	defer stopMonitor()
 
 	buf := make([]byte, 256)
 	bytesRead, err := stream.Read(buf)
@@ -1003,21 +1001,6 @@ func (n *Node) RequestContentStreamFromPeer(ctx context.Context, peerID peer.ID,
 		}
 	}()
 
-	// Monitor the stream using heartbeats
-	stopMonitor := n.heartbeatService.MonitorStream(stream)
-	go func() {
-		for {
-			time.Sleep(1 * time.Second)
-			buf := make([]byte, 1)
-			stream.SetReadDeadline(time.Now().Add(1 * time.Millisecond))
-			_, err := stream.Read(buf)
-			if err == io.EOF {
-				stopMonitor()
-				return
-			}
-		}
-	}()
-
 	if _, err := stream.Write([]byte(contentHash)); err != nil {
 		stream.Reset()
 		return nil, nil, fmt.Errorf("failed to send content request to %s: %w", peerID.String(), err)
@@ -1049,10 +1032,6 @@ func (n *Node) RequestContentStreamFromPeer(ctx context.Context, peerID peer.ID,
 func (n *Node) handleStreamExchange(stream network.Stream) {
 	remotePeer := stream.Conn().RemotePeer()
 	log.Printf("Handling stream exchange from %s", remotePeer.String())
-
-	// Monitor the stream using heartbeats
-	stopMonitor := n.heartbeatService.MonitorStream(stream)
-	defer stopMonitor()
 
 	buf := make([]byte, 256)
 	bytesRead, err := stream.Read(buf)
