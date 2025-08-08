@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -477,72 +476,32 @@ func (s *Server) fetchContentStreamFromNetwork(ctx context.Context, hash hasher.
 			continue // Don't try to fetch from ourselves
 		}
 
-		stream, err := s.streamer.RequestTransfer(ctx, hash, p.ID)
+		stream, metadata, err := libp2pNode.RequestContentStreamFromPeer(ctx, p.ID, hashStr)
 		if err != nil {
 			lastErr = fmt.Errorf("failed to fetch stream from peer %s: %w", p.ID, err)
 			log.Printf("Error fetching stream from peer: %v", lastErr)
 			continue
 		}
 
-		// Since RequestTransfer now returns metadata, we need to get it.
-		// This is a bit of a hack, as we don't have the metadata yet.
-		// We'll get it from the stream itself.
-		var metadata *storage.ContentMetadata
-
-		// TODO: Add content verification for streams if possible, though it's tricky.
-
 		// Store content in the background while streaming
-		go func(stream io.ReadCloser) {
-			// Create a tee reader to save the content as it's read
-			pr, pw := io.Pipe()
-			tee := io.TeeReader(stream, pw)
+		go func(stream io.ReadCloser, metadata *storage.ContentMetadata) {
+			defer stream.Close()
+			data, err := io.ReadAll(stream)
+			if err != nil {
+				log.Printf("Error reading from stream for storage: %v", err)
+				return
+			}
 
-			// Goroutine to read from the tee and store the data
-			go func() {
-				data, err := io.ReadAll(tee)
-				if err != nil {
-					log.Printf("Error reading from tee for storage: %v", err)
-					return
+			if metadata != nil { // metadata should be available here
+				if err := s.storage.StoreContent(metadata); err != nil {
+					log.Printf("Warning: failed to store fetched metadata for %s: %v", hashStr, err)
 				}
-
-				if metadata != nil { // metadata should be available here
-					if err := s.storage.StoreContent(metadata); err != nil {
-						log.Printf("Warning: failed to store fetched metadata for %s: %v", hashStr, err)
-					}
-					if err := s.storage.StoreData(hash, data); err != nil {
-						log.Printf("Warning: failed to store fetched data for %s: %v", hashStr, err)
-					}
-					log.Printf("Successfully stored streamed content %s in the background", hashStr)
+				if err := s.storage.StoreData(hash, data); err != nil {
+					log.Printf("Warning: failed to store fetched data for %s: %v", hashStr, err)
 				}
-			}()
-
-			// now we can read the metadata from the pipe reader
-			// and then the rest of the data will be read by the other goroutine
-			// and sent to the client
-			// This is a bit of a hack, but it works for now.
-			// A better solution would be to have the metadata sent first.
-			// But that would require a change in the protocol.
-			// So we'll stick with this for now.
-
-			// read metadata from the stream
-			var metaLen uint32
-			if err := binary.Read(pr, binary.BigEndian, &metaLen); err != nil {
-				log.Printf("Error reading metadata length from stream: %v", err)
-				return
+				log.Printf("Successfully stored streamed content %s in the background", hashStr)
 			}
-
-			metaBytes := make([]byte, metaLen)
-			if _, err := io.ReadFull(pr, metaBytes); err != nil {
-				log.Printf("Error reading metadata from stream: %v", err)
-				return
-			}
-
-			if err := json.Unmarshal(metaBytes, &metadata); err != nil {
-				log.Printf("Error unmarshaling metadata from stream: %v", err)
-				return
-			}
-
-		}(stream)
+		}(stream, metadata)
 
 		return stream, metadata, nil
 	}
