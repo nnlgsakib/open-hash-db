@@ -370,7 +370,8 @@ func (r *Replicator) handleContentAnnouncement(peerID peer.ID, announcement *Con
 	ctx, cancel := context.WithTimeout(r.ctx, RequestTimeout)
 	defer cancel()
 
-	dataStream, metadata, err := r.node.RequestContentStreamFromPeer(ctx, peerID, announcement.Hash.String())
+		dataStream, metadata, err := r.node.RequestContentStreamFromPeer(ctx, peerID, announcement.Hash.String(), 0)
+
 	if err != nil {
 		replicationFailuresTotal.Inc()
 		log.Printf("Failed to fetch content stream %s from %s: %v", announcement.Hash.String(), peerID.String(), err)

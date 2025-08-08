@@ -15,7 +15,6 @@ import (
 	"openhashdb/core/storage"
 	"openhashdb/network/libp2p"
 	"openhashdb/network/replicator"
-	"openhashdb/network/streammanager"
 	"openhashdb/openhashdb-ui"
 	"path/filepath"
 	"strconv"
@@ -29,9 +28,8 @@ import (
 type Server struct {
 	storage    *storage.Storage
 	replicator *replicator.Replicator
-	streamer   *streammanager.StreamManager
 	chunker    *chunker.Chunker
-	node       interface{} // libp2p node for network stats
+	node       *libp2p.Node // libp2p node for network operations
 	router     *mux.Router
 	server     *http.Server
 }
@@ -65,17 +63,13 @@ type ContentInfo struct {
 }
 
 // NewServer creates a new REST API server
-func NewServer(storage *storage.Storage, replicator *replicator.Replicator, node interface{}) *Server {
+func NewServer(storage *storage.Storage, replicator *replicator.Replicator, node *libp2p.Node) *Server {
 	s := &Server{
 		storage:    storage,
 		replicator: replicator,
 		chunker:    chunker.NewChunker(chunker.ChunkSize256KB),
 		node:       node,
 		router:     mux.NewRouter(),
-	}
-
-	if libp2pNode, ok := node.(*libp2p.Node); ok {
-		s.streamer = streammanager.NewStreamManager(libp2pNode)
 	}
 
 	s.setupRoutes()
@@ -182,7 +176,7 @@ func (s *Server) uploadFile(w http.ResponseWriter, r *http.Request) {
 
 // uploadFolder handles folder uploads by accepting multiple files, zipping them in-memory, and storing the zip.
 func (s *Server) uploadFolder(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseMultipartForm(32 << 20); err != nil { // 32MB max memory
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		s.writeError(w, http.StatusBadRequest, "Failed to parse multipart form", err)
 		return
 	}
@@ -453,14 +447,13 @@ func (s *Server) viewContent(w http.ResponseWriter, r *http.Request) {
 
 // fetchContentStreamFromNetwork finds and retrieves a content stream from peers.
 func (s *Server) fetchContentStreamFromNetwork(ctx context.Context, hash hasher.Hash) (io.ReadCloser, *storage.ContentMetadata, error) {
-	libp2pNode, ok := s.node.(*libp2p.Node)
-	if !ok || s.streamer == nil {
+	if s.node == nil {
 		return nil, nil, fmt.Errorf("network node is not available or does not support streaming")
 	}
 
 	hashStr := hash.String()
 	log.Printf("Searching for providers of content %s", hashStr)
-	providers, err := libp2pNode.FindContentProviders(hashStr)
+	providers, err := s.node.FindContentProviders(hashStr)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to find content providers: %w", err)
 	}
@@ -471,12 +464,12 @@ func (s *Server) fetchContentStreamFromNetwork(ctx context.Context, hash hasher.
 	log.Printf("Found %d provider(s) for %s. Attempting to fetch stream...", len(providers), hashStr)
 	var lastErr error
 	for _, p := range providers {
-		if p.ID == libp2pNode.ID() {
+		if p.ID == s.node.ID() {
 			log.Printf("Skipping self as provider: %s", p.ID)
 			continue // Don't try to fetch from ourselves
 		}
 
-		stream, metadata, err := libp2pNode.RequestContentStreamFromPeer(ctx, p.ID, hashStr)
+		stream, metadata, err := s.node.RequestContentStreamFromPeer(ctx, p.ID, hashStr, 0)
 		if err != nil {
 			lastErr = fmt.Errorf("failed to fetch stream from peer %s: %w", p.ID, err)
 			log.Printf("Error fetching stream from peer: %v", lastErr)
@@ -511,14 +504,13 @@ func (s *Server) fetchContentStreamFromNetwork(ctx context.Context, hash hasher.
 
 // fetchContentFromNetwork finds and retrieves content from peers.
 func (s *Server) fetchContentFromNetwork(ctx context.Context, hash hasher.Hash) ([]byte, *storage.ContentMetadata, error) {
-	libp2pNode, ok := s.node.(*libp2p.Node)
-	if !ok {
+	if s.node == nil {
 		return nil, nil, fmt.Errorf("network node is not available or does not support fetching")
 	}
 
 	hashStr := hash.String()
 	log.Printf("Searching for providers of content %s", hashStr)
-	providers, err := libp2pNode.FindContentProviders(hashStr)
+	providers, err := s.node.FindContentProviders(hashStr)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to find content providers: %w", err)
 	}
@@ -529,12 +521,12 @@ func (s *Server) fetchContentFromNetwork(ctx context.Context, hash hasher.Hash) 
 	log.Printf("Found %d provider(s) for %s. Attempting to fetch...", len(providers), hashStr)
 	var lastErr error
 	for _, p := range providers {
-		if p.ID == libp2pNode.ID() {
+		if p.ID == s.node.ID() {
 			log.Printf("Skipping self as provider: %s", p.ID)
 			continue // Don't try to fetch from ourselves
 		}
 		log.Printf("Requesting content %s from peer %s", hashStr, p.ID)
-		data, metadata, err := libp2pNode.RequestContentFromPeer(p.ID, hashStr)
+		data, metadata, err := s.node.RequestContentFromPeer(p.ID, hashStr)
 		if err != nil {
 			lastErr = fmt.Errorf("failed to fetch from peer %s: %w", p.ID, err)
 			log.Printf("Error fetching from peer: %v", lastErr)
@@ -635,7 +627,7 @@ func (s *Server) fetchContentFromNetwork(ctx context.Context, hash hasher.Hash) 
 // 		data, metadata, err := libp2pNode.RequestContentFromPeer(p.ID, hashStr)
 // 		if err != nil {
 // 			lastErr = fmt.Errorf("failed to fetch from peer %s: %w", p.ID, err)
-// 			log.Printf("Error fetching from peer: %v", err)
+// 			log.Printf("Error fetching from peer: %v", lastErr)
 // 			continue
 // 		}
 
@@ -675,13 +667,12 @@ func (s *Server) getContentInfo(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// If not found locally, check the network
 		log.Printf("Content %s not found locally, checking network...", hashStr)
-		libp2pNode, ok := s.node.(*libp2p.Node)
-		if !ok {
+		if s.node == nil {
 			s.writeError(w, http.StatusNotFound, "Content not found", err)
 			return
 		}
 
-		providers, err := libp2pNode.FindContentProviders(hashStr)
+		providers, err := s.node.FindContentProviders(hashStr)
 		if err != nil || len(providers) == 0 {
 			s.writeError(w, http.StatusNotFound, "Content not found on the network", err)
 			return
@@ -1140,14 +1131,6 @@ func (s *Server) getNetworkStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Type assert to get network stats
-	if nodeWithStats, ok := s.node.(interface{ GetNetworkStats() map[string]interface{} }); ok {
-		stats := nodeWithStats.GetNetworkStats()
-		s.writeJSON(w, http.StatusOK, stats)
-	} else {
-		stats := map[string]interface{}{
-			"error": "Network stats not supported by this node type",
-		}
-		s.writeJSON(w, http.StatusServiceUnavailable, stats)
-	}
+	stats := s.node.GetNetworkStats()
+	s.writeJSON(w, http.StatusOK, stats)
 }
