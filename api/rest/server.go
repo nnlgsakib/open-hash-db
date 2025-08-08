@@ -477,14 +477,18 @@ func (s *Server) fetchContentStreamFromNetwork(ctx context.Context, hash hasher.
 		}
 
 		// Store content in the background while streaming
-		go func(stream io.ReadCloser, metadata *storage.ContentMetadata) {
-			defer stream.Close()
-			data, err := io.ReadAll(stream)
+		var buf bytes.Buffer
+		tee := io.TeeReader(stream, &buf)
+
+		go func() {
+			// Read from tee to drain the stream and fill the buffer
+			_, err := io.ReadAll(tee)
 			if err != nil {
-				log.Printf("Error reading from stream for storage: %v", err)
+				log.Printf("Error reading from tee for storage: %v", err)
 				return
 			}
 
+			data := buf.Bytes()
 			if metadata != nil { // metadata should be available here
 				if err := s.storage.StoreContent(metadata); err != nil {
 					log.Printf("Warning: failed to store fetched metadata for %s: %v", hashStr, err)
@@ -494,7 +498,7 @@ func (s *Server) fetchContentStreamFromNetwork(ctx context.Context, hash hasher.
 				}
 				log.Printf("Successfully stored streamed content %s in the background", hashStr)
 			}
-		}(stream, metadata)
+		}()
 
 		return stream, metadata, nil
 	}
