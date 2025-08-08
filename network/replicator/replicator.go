@@ -48,7 +48,7 @@ const (
 	MinReplicationFactor     ReplicationFactor = 1
 	MaxReplicationFactor     ReplicationFactor = 10
 	RelayThreshold                             = 5
-	RequestTimeout                             = 30 * time.Second
+	RequestTimeout                             = 5 * time.Minute
 	CleanupInterval                            = 1 * time.Minute
 	LargeFileSizeThreshold                     = 200 * 1024 * 1024 // 200MB
 )
@@ -156,8 +156,6 @@ func (r *Replicator) AnnounceContent(hash hasher.Hash, size int64) error {
 
 	return r.node.BroadcastGossip(r.ctx, data)
 }
-
-
 
 // RequestChunk requests a chunk from the network or relays it
 func (r *Replicator) RequestChunk(hash hasher.Hash) ([]byte, error) {
@@ -337,10 +335,7 @@ func (r *Replicator) handleGossipMessage(peerID peer.ID, data []byte) error {
 
 // handleContentAnnouncement handles content announcements
 func (r *Replicator) handleContentAnnouncement(peerID peer.ID, announcement *ContentAnnouncement) error {
-	// log.Printf("Received content announcement from %s: %s", peerID.String(), announcement.Hash.String())
-
 	if r.storage.HasContent(announcement.Hash) {
-		// log.Printf("Content %s already exists locally, skipping replication and announcement", announcement.Hash.String())
 		return nil
 	}
 
@@ -372,22 +367,26 @@ func (r *Replicator) handleContentAnnouncement(peerID peer.ID, announcement *Con
 		return nil
 	}
 
-	data, metadata, err := r.node.RequestContentFromPeer(peerID, announcement.Hash.String())
+	ctx, cancel := context.WithTimeout(r.ctx, RequestTimeout)
+	defer cancel()
+
+	dataStream, metadata, err := r.node.RequestContentStreamFromPeer(ctx, peerID, announcement.Hash.String())
 	if err != nil {
 		replicationFailuresTotal.Inc()
-		log.Printf("Failed to fetch content %s from %s: %v", announcement.Hash.String(), peerID.String(), err)
+		log.Printf("Failed to fetch content stream %s from %s: %v", announcement.Hash.String(), peerID.String(), err)
 		return nil
 	}
-
-	if err := r.storage.StoreData(announcement.Hash, data); err != nil {
-		replicationFailuresTotal.Inc()
-		log.Printf("Failed to store replicated content %s: %v", announcement.Hash.String(), err)
-		return nil
-	}
+	defer dataStream.Close()
 
 	if err := r.storage.StoreContent(metadata); err != nil {
 		replicationFailuresTotal.Inc()
 		log.Printf("Failed to store replicated metadata %s: %v", announcement.Hash.String(), err)
+		return nil
+	}
+
+	if err := r.storage.StoreDataStream(announcement.Hash, dataStream, metadata.Size); err != nil {
+		replicationFailuresTotal.Inc()
+		log.Printf("Failed to store replicated content stream %s: %v", announcement.Hash.String(), err)
 		return nil
 	}
 
