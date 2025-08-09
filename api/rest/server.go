@@ -21,7 +21,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -405,89 +404,47 @@ func (s *Server) fetchAndSaveStreamFromNetwork(ctx context.Context, hash hasher.
 			continue
 		}
 
-		// Use a pipe to decouple the network read from the HTTP response write.
-		// The HTTP handler will read from pr.
-		pr, pw := io.Pipe()
+		// Pipe for the client response
+		clientPipeReader, clientPipeWriter := io.Pipe()
+		// Pipe for the background storage
+		storagePipeReader, storagePipeWriter := io.Pipe()
 
-		// This goroutine will read from the network and write to the pipe.
-		// A TeeReader will simultaneously write the data to our background storage process.
+		// Goroutine to save the content from its pipe
 		go func() {
-			// When this function finishes, close the network stream and the pipe writer.
-			defer stream.Close()
-			defer pw.Close()
-
-			// This writer will handle saving the data to storage in the background.
-			storageWriter := &storageWriter{
-				storage:  s.storage,
-				hash:     hash,
-				metadata: &metadata,
+			defer storagePipeReader.Close()
+			if err := s.storage.StoreContent(&metadata); err != nil {
+				log.Printf("Background storage failed to store metadata for %s: %v", hash.String(), err)
+				return
 			}
-			defer storageWriter.Close() // Ensure the writer is closed to finalize storage.
-
-			// TeeReader reads from the network stream and writes to both the storageWriter and the pipe writer.
-			// We actually just need to write to the storage writer, and then copy the stream to the pipe writer.
-			tee := io.TeeReader(stream, storageWriter)
-
-			// Copy from the tee (which reads from network and writes to storage) to the pipe writer (which feeds the HTTP response).
-			if _, err := io.Copy(pw, tee); err != nil {
-				log.Printf("Error copying stream to pipe for hash %s: %v", hashStr, err)
-				pw.CloseWithError(err) // Propagate the error to the reader.
+			if err := s.storage.StoreDataStream(hash, storagePipeReader, metadata.Size); err != nil {
+				log.Printf("Background storage failed for %s: %v", hash.String(), err)
+			} else {
+				log.Printf("Successfully stored streamed content %s in the background", hash.String())
 			}
 		}()
 
-		return pr, &metadata, nil
+		// Goroutine to copy from the network to both pipes
+		go func() {
+			defer stream.Close()
+			defer clientPipeWriter.Close()
+			defer storagePipeWriter.Close()
+
+			// MultiWriter ensures that data read from the network is written to both the client and storage pipes
+			multiWriter := io.MultiWriter(clientPipeWriter, storagePipeWriter)
+
+			if _, err := io.Copy(multiWriter, stream); err != nil {
+				// Propagate the error to the pipe readers so the consumers know something went wrong
+				clientPipeWriter.CloseWithError(fmt.Errorf("failed to copy network stream to pipes: %w", err))
+				storagePipeWriter.CloseWithError(fmt.Errorf("failed to copy network stream to pipes: %w", err))
+				log.Printf("Error multicasting network stream for hash %s: %v", hashStr, err)
+			}
+		}()
+
+		// Return the client's pipe reader, allowing the handler to stream the response immediately
+		return clientPipeReader, &metadata, nil
 	}
 
 	return nil, nil, fmt.Errorf("failed to fetch content from all providers. last error: %w", lastErr)
-}
-
-// storageWriter is a helper struct that implements io.WriteCloser to save content to storage.
-type storageWriter struct {
-	storage  *storage.Storage
-	hash     hasher.Hash
-	metadata *storage.ContentMetadata
-	pr       *io.PipeReader
-	pw       *io.PipeWriter
-	once     sync.Once
-	wg       sync.WaitGroup
-}
-
-// Write implements the io.Writer interface.
-func (sw *storageWriter) Write(p []byte) (n int, err error) {
-	// On the first write, initialize the pipe and start the background storage goroutine.
-	sw.once.Do(func() {
-		sw.pr, sw.pw = io.Pipe()
-		sw.wg.Add(1)
-		go func() {
-			defer sw.wg.Done()
-			defer sw.pr.Close()
-
-			if err := sw.storage.StoreContent(sw.metadata); err != nil {
-				log.Printf("Background storage failed to store metadata for %s: %v", sw.hash.String(), err)
-				sw.pw.CloseWithError(fmt.Errorf("failed to store metadata: %w", err))
-				return
-			}
-
-			if err := sw.storage.StoreDataStream(sw.hash, sw.pr, sw.metadata.Size); err != nil {
-				log.Printf("Background storage failed for %s: %v", sw.hash.String(), err)
-				sw.pw.CloseWithError(fmt.Errorf("failed to store data stream: %w", err))
-			} else {
-				log.Printf("Successfully stored streamed content %s in the background", sw.hash.String())
-			}
-		}()
-	})
-
-	// Write the data to the pipe, which will be read by the storage goroutine.
-	return sw.pw.Write(p)
-}
-
-// Close implements the io.Closer interface.
-func (sw *storageWriter) Close() error {
-	if sw.pw != nil {
-		sw.pw.Close() // Close the writer, signaling EOF to the reader.
-	}
-	sw.wg.Wait() // Wait for the storage goroutine to finish.
-	return nil
 }
 
 // streamResponse sets the appropriate headers and streams the content to the client efficiently.
