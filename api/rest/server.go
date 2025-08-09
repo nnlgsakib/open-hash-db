@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -271,70 +272,27 @@ func (s *Server) downloadContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var metadata *storage.ContentMetadata
-	var dataStream io.ReadCloser
-
-	metadata, err = s.storage.GetContent(hash)
+	// Try to get content from local storage first
+	metadata, err := s.storage.GetContent(hash)
 	if err == nil {
-		dataStream, err = s.storage.GetDataStream(hash)
-		if err != nil {
-			log.Printf("Metadata for %s found, but data stream is missing. Attempting to fetch from network.", hashStr)
-			// Fall through to network fetch
-		}
-	}
-
-	if err != nil { // Either metadata or data stream missing
-		log.Printf("Content %s not available locally, attempting to fetch from network.", hashStr)
-		dataStream, metadata, err = s.fetchContentStreamFromNetwork(r.Context(), hash)
-		if err != nil {
-			s.writeError(w, http.StatusNotFound, "Content not found locally or on the network", err)
+		dataStream, err := s.storage.GetDataStream(hash)
+		if err == nil {
+			// Content is available locally, stream it
+			s.streamResponse(w, r, dataStream, metadata, "attachment")
 			return
 		}
+		log.Printf("Metadata for %s found, but data stream is missing. Attempting to fetch from network.", hashStr)
 	}
 
-	defer dataStream.Close()
-
-	// Set headers
-	w.Header().Set("Content-Type", metadata.MimeType)
-	w.Header().Set("Content-Length", strconv.FormatInt(metadata.Size, 10))
-	if metadata.Filename != "" {
-		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", metadata.Filename))
+	// Content not available locally, fetch from network
+	log.Printf("Content %s not available locally, attempting to fetch from network.", hashStr)
+	stream, netMetadata, err := s.fetchAndSaveStreamFromNetwork(r.Context(), hash)
+	if err != nil {
+		s.writeError(w, http.StatusNotFound, "Content not found locally or on the network", err)
+		return
 	}
-
-	// Write content by streaming
-	w.WriteHeader(http.StatusOK)
-
-	// Use a buffered copy to handle large files and client disconnects
-	buf := make([]byte, 32*1024) // 32KB buffer
-	for {
-		select {
-		case <-r.Context().Done():
-			log.Printf("Client disconnected before content %s could be fully sent.", hashStr)
-			return
-		default:
-			nr, readErr := dataStream.Read(buf)
-			if nr > 0 {
-				_, writeErr := w.Write(buf[0:nr])
-				if writeErr != nil {
-					// Don't log error if client disconnected
-					if r.Context().Err() == nil {
-						log.Printf("Failed to write chunk of content %s to client: %v", hashStr, writeErr)
-					}
-					return
-				}
-				if f, ok := w.(http.Flusher); ok {
-					f.Flush()
-				}
-			}
-			if readErr == io.EOF {
-				return // End of file
-			}
-			if readErr != nil {
-				log.Printf("Failed to read content %s for streaming: %v", hashStr, readErr)
-				return
-			}
-		}
-	}
+	// Stream the content from the network to the user
+	s.streamResponse(w, r, stream, netMetadata, "attachment")
 }
 
 // viewContent handles content viewing, fetching from the network if not available locally.
@@ -348,112 +306,50 @@ func (s *Server) viewContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var metadata *storage.ContentMetadata
+	// We need metadata to proceed. Try local first.
+	metadata, err := s.storage.GetContent(hash)
 	var dataStream io.ReadCloser
 
-	metadata, err = s.storage.GetContent(hash)
 	if err == nil {
+		// Metadata found locally. Check if renderable.
+		if !s.isMimeTypeRenderable(metadata.MimeType) {
+			s.showDownloadPage(w, hashStr, metadata.Filename)
+			return
+		}
+		// It's renderable, try to get the data stream.
 		dataStream, err = s.storage.GetDataStream(hash)
 		if err != nil {
-			log.Printf("Metadata for %s found, but data stream is missing. Attempting to fetch from network.", hashStr)
+			log.Printf("Metadata for %s found, but data stream is missing. Will fetch from network.", hashStr)
 			// Fall through to network fetch
 		}
 	}
 
-	if err != nil { // Either metadata or data stream missing
+	// If dataStream is still nil, it means we need to fetch from the network.
+	// This happens if metadata was not found, or if data stream was missing.
+	if dataStream == nil {
 		log.Printf("Content %s not available locally, attempting to fetch from network.", hashStr)
-		dataStream, metadata, err = s.fetchContentStreamFromNetwork(r.Context(), hash)
-		if err != nil {
-			s.writeError(w, http.StatusNotFound, "Content not found locally or on the network", err)
+		stream, netMetadata, fetchErr := s.fetchAndSaveStreamFromNetwork(r.Context(), hash)
+		if fetchErr != nil {
+			s.writeError(w, http.StatusNotFound, "Content not found locally or on the network", fetchErr)
 			return
 		}
-	}
-
-	defer dataStream.Close()
-
-	// Determine if content is renderable in browser
-	isRenderable := strings.HasPrefix(metadata.MimeType, "text/") || // Text: plain, html, css, csv, vtt, markdown, vcard, calendar
-		strings.HasPrefix(metadata.MimeType, "image/") || // Images: png, jpg, jpeg, gif, svg, webp, ico, bmp, avif, heif, tiff
-		strings.HasPrefix(metadata.MimeType, "audio/") || // Audio: mp3, wav, ogg, flac, aac
-		strings.HasPrefix(metadata.MimeType, "video/") || // Videos: mp4, webm, mpeg, ogv, avi, mov, ts
-		strings.HasPrefix(metadata.MimeType, "font/") || // Fonts: woff, woff2, ttf, otf
-		metadata.MimeType == "application/pdf" || // PDF
-		metadata.MimeType == "application/javascript" || // JavaScript: js, mjs
-		metadata.MimeType == "application/json" || // JSON
-		metadata.MimeType == "application/ld+json" || // JSON-LD
-		metadata.MimeType == "application/vnd.ms-fontobject" || // Font: eot
-		metadata.MimeType == "application/xml" || // XML
-		metadata.MimeType == "application/xhtml+xml" || // XHTML
-		metadata.MimeType == "application/wasm" || // WebAssembly
-		metadata.MimeType == "application/vnd.apple.mpegurl" // Streaming: m3u8
-
-	if isRenderable {
-		// Set headers for inline viewing
-		w.Header().Set("Content-Type", metadata.MimeType)
-		w.Header().Set("Content-Length", strconv.FormatInt(metadata.Size, 10))
-		w.Header().Set("Content-Disposition", "inline")
-		// Write content by streaming
-		w.WriteHeader(http.StatusOK)
-
-		// Use a buffered copy to handle large files and client disconnects
-		buf := make([]byte, 32*1024) // 32KB buffer
-		for {
-			select {
-			case <-r.Context().Done():
-				log.Printf("Client disconnected before content %s could be fully sent.", hashStr)
-				return
-			default:
-				nr, readErr := dataStream.Read(buf)
-				if nr > 0 {
-					_, writeErr := w.Write(buf[0:nr])
-					if writeErr != nil {
-						// Don't log error if client disconnected
-						if r.Context().Err() == nil {
-							log.Printf("Failed to write chunk of content %s to client: %v", hashStr, writeErr)
-						}
-						return
-					}
-					if f, ok := w.(http.Flusher); ok {
-						f.Flush()
-					}
-				}
-				if readErr == io.EOF {
-					return // End of file
-				}
-				if readErr != nil {
-					log.Printf("Failed to read content %s for streaming: %v", hashStr, readErr)
-					return
-				}
-			}
+		// Now we have the stream and metadata from the network.
+		if !s.isMimeTypeRenderable(netMetadata.MimeType) {
+			s.showDownloadPage(w, hashStr, netMetadata.Filename)
+			stream.Close() // Close the stream as we are not using it
+			return
 		}
-	} else {
-		// For non-renderable content, provide a download link
-		w.Header().Set("Content-Type", "text/html")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, `
-			<!DOCTYPE html>
-			<html>
-			<head>
-				<title>OpenHashDB - Unable to Render</title>
-				<style>
-					body { font-family: sans-serif; text-align: center; margin-top: 50px; }
-					a { display: inline-block; padding: 10px 20px; background-color: #007bff; color: white; text-decoration: none; border-radius: 5px; }
-					a:hover { background-color: #0056b3; }
-				</style>
-			</head>
-			<body>
-				<h1>Unable to Render Content</h1>
-				<p>The content with hash <strong>%s</strong> cannot be displayed directly in the browser.</p>
-				<p>Click the button below to download the file:</p>
-				<a href="/download/%s" download="%s">Click to Download</a>
-			</body>
-			</html>
-		`, hashStr, hashStr, metadata.Filename)
+		dataStream = stream
+		metadata = netMetadata
 	}
+
+	// At this point, we have a valid dataStream and metadata, and we know it's renderable.
+	s.streamResponse(w, r, dataStream, metadata, "inline")
 }
 
-// fetchContentStreamFromNetwork finds and retrieves a content stream from peers.
-func (s *Server) fetchContentStreamFromNetwork(ctx context.Context, hash hasher.Hash) (io.ReadCloser, *storage.ContentMetadata, error) {
+// fetchAndSaveStreamFromNetwork finds a content provider, reads the metadata, and then returns a stream
+// for the client to read from. In the background, it saves the content to local storage.
+func (s *Server) fetchAndSaveStreamFromNetwork(ctx context.Context, hash hasher.Hash) (io.ReadCloser, *storage.ContentMetadata, error) {
 	libp2pNode, ok := s.node.(*libp2p.Node)
 	if !ok || s.streamer == nil {
 		return nil, nil, fmt.Errorf("network node is not available or does not support streaming")
@@ -474,80 +370,202 @@ func (s *Server) fetchContentStreamFromNetwork(ctx context.Context, hash hasher.
 	for _, p := range providers {
 		if p.ID == libp2pNode.ID() {
 			log.Printf("Skipping self as provider: %s", p.ID)
-			continue // Don't try to fetch from ourselves
+			continue
 		}
 
 		stream, err := s.streamer.RequestTransfer(ctx, hash, p.ID)
 		if err != nil {
-			lastErr = fmt.Errorf("failed to fetch stream from peer %s: %w", p.ID, err)
-			log.Printf("Error fetching stream from peer: %v", lastErr)
+			lastErr = fmt.Errorf("failed to request transfer from peer %s: %w", p.ID, err)
+			log.Printf("%v", lastErr)
 			continue
 		}
 
-		// Since RequestTransfer now returns metadata, we need to get it.
-		// This is a bit of a hack, as we don't have the metadata yet.
-		// We'll get it from the stream itself.
-		var metadata *storage.ContentMetadata
+		// The protocol is that the peer first sends the metadata length, then the metadata, then the content.
+		var metaLen uint32
+		if err := binary.Read(stream, binary.BigEndian, &metaLen); err != nil {
+			stream.Close()
+			lastErr = fmt.Errorf("failed to read metadata length from peer %s: %w", p.ID, err)
+			log.Printf("%v", lastErr)
+			continue
+		}
 
-		// TODO: Add content verification for streams if possible, though it's tricky.
+		metaBytes := make([]byte, metaLen)
+		if _, err := io.ReadFull(stream, metaBytes); err != nil {
+			stream.Close()
+			lastErr = fmt.Errorf("failed to read metadata bytes from peer %s: %w", p.ID, err)
+			log.Printf("%v", lastErr)
+			continue
+		}
 
-		// Store content in the background while streaming
-		go func(stream io.ReadCloser) {
-			// Create a tee reader to save the content as it's read
-			pr, pw := io.Pipe()
-			tee := io.TeeReader(stream, pw)
+		var metadata storage.ContentMetadata
+		if err := json.Unmarshal(metaBytes, &metadata); err != nil {
+			stream.Close()
+			lastErr = fmt.Errorf("failed to unmarshal metadata from peer %s: %w", p.ID, err)
+			log.Printf("%v", lastErr)
+			continue
+		}
 
-			// Goroutine to read from the tee and store the data
-			go func() {
-				data, err := io.ReadAll(tee)
-				if err != nil {
-					log.Printf("Error reading from tee for storage: %v", err)
-					return
-				}
+		// Use a pipe to decouple the network read from the HTTP response write.
+		// The HTTP handler will read from pr.
+		pr, pw := io.Pipe()
 
-				if metadata != nil { // metadata should be available here
-					if err := s.storage.StoreContent(metadata); err != nil {
-						log.Printf("Warning: failed to store fetched metadata for %s: %v", hashStr, err)
-					}
-					if err := s.storage.StoreData(hash, data); err != nil {
-						log.Printf("Warning: failed to store fetched data for %s: %v", hashStr, err)
-					}
-					log.Printf("Successfully stored streamed content %s in the background", hashStr)
-				}
-			}()
+		// This goroutine will read from the network and write to the pipe.
+		// A TeeReader will simultaneously write the data to our background storage process.
+		go func() {
+			// When this function finishes, close the network stream and the pipe writer.
+			defer stream.Close()
+			defer pw.Close()
 
-			// now we can read the metadata from the pipe reader
-			// and then the rest of the data will be read by the other goroutine
-			// and sent to the client
-			// This is a bit of a hack, but it works for now.
-			// A better solution would be to have the metadata sent first.
-			// But that would require a change in the protocol.
-			// So we'll stick with this for now.
-
-			// read metadata from the stream
-			var metaLen uint32
-			if err := binary.Read(pr, binary.BigEndian, &metaLen); err != nil {
-				log.Printf("Error reading metadata length from stream: %v", err)
-				return
+			// This writer will handle saving the data to storage in the background.
+			storageWriter := &storageWriter{
+				storage:  s.storage,
+				hash:     hash,
+				metadata: &metadata,
 			}
+			defer storageWriter.Close() // Ensure the writer is closed to finalize storage.
 
-			metaBytes := make([]byte, metaLen)
-			if _, err := io.ReadFull(pr, metaBytes); err != nil {
-				log.Printf("Error reading metadata from stream: %v", err)
-				return
+			// TeeReader reads from the network stream and writes to both the storageWriter and the pipe writer.
+			// We actually just need to write to the storage writer, and then copy the stream to the pipe writer.
+			tee := io.TeeReader(stream, storageWriter)
+
+			// Copy from the tee (which reads from network and writes to storage) to the pipe writer (which feeds the HTTP response).
+			if _, err := io.Copy(pw, tee); err != nil {
+				log.Printf("Error copying stream to pipe for hash %s: %v", hashStr, err)
+				pw.CloseWithError(err) // Propagate the error to the reader.
 			}
+		}()
 
-			if err := json.Unmarshal(metaBytes, &metadata); err != nil {
-				log.Printf("Error unmarshaling metadata from stream: %v", err)
-				return
-			}
-
-		}(stream)
-
-		return stream, metadata, nil
+		return pr, &metadata, nil
 	}
 
-	return nil, nil, fmt.Errorf("failed to fetch content stream from all found providers: %w", lastErr)
+	return nil, nil, fmt.Errorf("failed to fetch content from all providers. last error: %w", lastErr)
+}
+
+// storageWriter is a helper struct that implements io.WriteCloser to save content to storage.
+type storageWriter struct {
+	storage  *storage.Storage
+	hash     hasher.Hash
+	metadata *storage.ContentMetadata
+	pr       *io.PipeReader
+	pw       *io.PipeWriter
+	once     sync.Once
+	wg       sync.WaitGroup
+}
+
+// Write implements the io.Writer interface.
+func (sw *storageWriter) Write(p []byte) (n int, err error) {
+	// On the first write, initialize the pipe and start the background storage goroutine.
+	sw.once.Do(func() {
+		sw.pr, sw.pw = io.Pipe()
+		sw.wg.Add(1)
+		go func() {
+			defer sw.wg.Done()
+			defer sw.pr.Close()
+
+			if err := sw.storage.StoreContent(sw.metadata); err != nil {
+				log.Printf("Background storage failed to store metadata for %s: %v", sw.hash.String(), err)
+				sw.pw.CloseWithError(fmt.Errorf("failed to store metadata: %w", err))
+				return
+			}
+
+			if err := sw.storage.StoreDataStream(sw.hash, sw.pr, sw.metadata.Size); err != nil {
+				log.Printf("Background storage failed for %s: %v", sw.hash.String(), err)
+				sw.pw.CloseWithError(fmt.Errorf("failed to store data stream: %w", err))
+			} else {
+				log.Printf("Successfully stored streamed content %s in the background", sw.hash.String())
+			}
+		}()
+	})
+
+	// Write the data to the pipe, which will be read by the storage goroutine.
+	return sw.pw.Write(p)
+}
+
+// Close implements the io.Closer interface.
+func (sw *storageWriter) Close() error {
+	if sw.pw != nil {
+		sw.pw.Close() // Close the writer, signaling EOF to the reader.
+	}
+	sw.wg.Wait() // Wait for the storage goroutine to finish.
+	return nil
+}
+
+// streamResponse sets the appropriate headers and streams the content to the client efficiently.
+func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, dataStream io.ReadCloser, metadata *storage.ContentMetadata, disposition string) {
+	defer dataStream.Close()
+
+	w.Header().Set("Content-Type", metadata.MimeType)
+	w.Header().Set("Content-Length", strconv.FormatInt(metadata.Size, 10))
+
+	if disposition == "attachment" {
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", metadata.Filename))
+	} else {
+		w.Header().Set("Content-Disposition", "inline")
+	}
+
+	w.WriteHeader(http.StatusOK)
+
+	// Use io.Copy for efficient streaming. It handles buffering and potential OS-level optimizations.
+	bytesCopied, err := io.Copy(w, dataStream)
+	if err != nil {
+		// Check if the error is due to a client disconnect. This is common and not a server error.
+		// We check for context cancellation or specific network error strings that indicate a closed connection.
+		errStr := err.Error()
+		if r.Context().Err() != nil || strings.Contains(errStr, "forcibly closed") || strings.Contains(errStr, "connection reset by peer") || strings.Contains(errStr, "broken pipe") || strings.Contains(errStr, "connection was aborted") {
+			// Log as info, not an error, because this is expected client behavior.
+			log.Printf("Info: Client disconnected during stream of %s after %d bytes.", metadata.Hash.String(), bytesCopied)
+		} else {
+			// Log actual, unexpected errors.
+			log.Printf("Error streaming content %s to client after %d bytes: %v", metadata.Hash.String(), bytesCopied, err)
+		}
+	}
+}
+
+// isMimeTypeRenderable checks if a MIME type can be displayed directly by most browsers.
+func (s *Server) isMimeTypeRenderable(mimeType string) bool {
+	return strings.HasPrefix(mimeType, "text/") ||
+		strings.HasPrefix(mimeType, "image/") ||
+		strings.HasPrefix(mimeType, "audio/") ||
+		strings.HasPrefix(mimeType, "video/") ||
+		strings.HasPrefix(mimeType, "font/") ||
+		mimeType == "application/pdf" ||
+		mimeType == "application/javascript" ||
+		mimeType == "application/json" ||
+		mimeType == "application/ld+json" ||
+		mimeType == "application/vnd.ms-fontobject" ||
+		mimeType == "application/xml" ||
+		mimeType == "application/xhtml+xml" ||
+		mimeType == "application/wasm" ||
+		mimeType == "application/vnd.apple.mpegurl"
+}
+
+// showDownloadPage displays a simple HTML page with a download button for non-renderable content.
+func (s *Server) showDownloadPage(w http.ResponseWriter, hashStr, filename string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, `
+		<!DOCTYPE html>
+		<html>
+		<head>
+			<title>OpenHashDB - Content View</title>
+			<style>
+				body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; text-align: center; margin-top: 50px; color: #333; }
+				.container { max-width: 600px; margin: auto; padding: 20px; }
+				strong { color: #0056b3; }
+				a.button { display: inline-block; margin-top: 20px; padding: 12px 24px; background-color: #007bff; color: white; text-decoration: none; border-radius: 5px; font-weight: bold; }
+				a.button:hover { background-color: #0056b3; }
+			</style>
+		</head>
+		<body>
+			<div class="container">
+				<h2>Unable to Display Content</h2>
+				<p>The content with hash <strong>%s</strong> (filename: %s) cannot be displayed directly in the browser.</p>
+				<p>Click the button below to download the file instead.</p>
+				<a href="/download/%s" download="%s" class="button">Download File</a>
+			</div>
+		</body>
+		</html>
+	`, hashStr, filename, hashStr, filename)
 }
 
 // fetchContentFromNetwork finds and retrieves content from peers.
