@@ -509,11 +509,16 @@ func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, dataStre
 	bytesCopied, err := io.Copy(w, dataStream)
 	if err != nil {
 		// Check if the error is due to a client disconnect. This is common and not a server error.
-		// We check for context cancellation or specific network error strings that indicate a closed connection.
+		// We check for context cancellation or specific network error strings that indicate a closed connection or timeout.
 		errStr := err.Error()
-		if r.Context().Err() != nil || strings.Contains(errStr, "forcibly closed") || strings.Contains(errStr, "connection reset by peer") || strings.Contains(errStr, "broken pipe") || strings.Contains(errStr, "connection was aborted") {
+		if r.Context().Err() != nil ||
+			strings.Contains(errStr, "forcibly closed") ||
+			strings.Contains(errStr, "connection reset by peer") ||
+			strings.Contains(errStr, "broken pipe") ||
+			strings.Contains(errStr, "connection was aborted") ||
+			strings.Contains(errStr, "i/o timeout") {
 			// Log as info, not an error, because this is expected client behavior.
-			log.Printf("Info: Client disconnected during stream of %s after %d bytes.", metadata.Hash.String(), bytesCopied)
+			log.Printf("Info: Client disconnected during stream of %s after %d bytes. Reason: %v", metadata.Hash.String(), bytesCopied, err)
 		} else {
 			// Log actual, unexpected errors.
 			log.Printf("Error streaming content %s to client after %d bytes: %v", metadata.Hash.String(), bytesCopied, err)
