@@ -261,7 +261,7 @@ func (s *Server) uploadFolder(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, response)
 }
 
-// downloadContent handles content downloads, fetching from the network if not available locally.
+// downloadContent handles content downloads. It ensures content is local before serving.
 func (s *Server) downloadContent(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	hashStr := vars["hash"]
@@ -272,30 +272,35 @@ func (s *Server) downloadContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Try to get content from local storage first
-	metadata, err := s.storage.GetContent(hash)
-	if err == nil {
-		dataStream, err := s.storage.GetDataStream(hash)
-		if err == nil {
-			// Content is available locally, stream it
-			s.streamResponse(w, r, dataStream, metadata, "attachment")
+	// Check if the data file exists locally.
+	if !s.storage.HasData(hash) {
+		// Content not available locally, fetch from network and store it first.
+		log.Printf("Content %s not available locally, attempting to fetch and store from network.", hashStr)
+		_, err := s.fetchAndStoreFromNetwork(r.Context(), hash)
+		if err != nil {
+			s.writeError(w, http.StatusNotFound, "Content not found on the network or failed to fetch", err)
 			return
 		}
-		log.Printf("Metadata for %s found, but data stream is missing. Attempting to fetch from network.", hashStr)
+		log.Printf("Content %s successfully fetched and stored.", hashStr)
 	}
 
-	// Content not available locally, fetch from network
-	log.Printf("Content %s not available locally, attempting to fetch from network.", hashStr)
-	stream, netMetadata, err := s.fetchAndSaveStreamFromNetwork(r.Context(), hash)
+	// Now, the content is guaranteed to be local.
+	metadata, err := s.storage.GetContent(hash)
 	if err != nil {
-		s.writeError(w, http.StatusNotFound, "Content not found locally or on the network", err)
+		s.writeError(w, http.StatusInternalServerError, "Failed to get local content metadata after fetching", err)
 		return
 	}
-	// Stream the content from the network to the user
-	s.streamResponse(w, r, stream, netMetadata, "attachment")
+	dataStream, err := s.storage.GetDataStream(hash)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "Failed to get local data stream after fetching", err)
+		return
+	}
+
+	// Content is available locally, stream it with Range support.
+	s.streamResponse(w, r, dataStream, metadata, "attachment")
 }
 
-// viewContent handles content viewing, fetching from the network if not available locally.
+// viewContent handles content viewing. It ensures content is local before serving.
 func (s *Server) viewContent(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	hashStr := vars["hash"]
@@ -306,66 +311,60 @@ func (s *Server) viewContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// We need metadata to proceed. Try local first.
-	metadata, err := s.storage.GetContent(hash)
-	var dataStream io.ReadCloser
-
-	if err == nil {
-		// Metadata found locally. Check if renderable.
-		if !s.isMimeTypeRenderable(metadata.MimeType) {
-			s.showDownloadPage(w, hashStr, metadata.Filename)
-			return
-		}
-		// It's renderable, try to get the data stream.
-		dataStream, err = s.storage.GetDataStream(hash)
+	// Check if the data file exists locally.
+	if !s.storage.HasData(hash) {
+		// Content not available locally, fetch from network and store it first.
+		log.Printf("Content %s not available locally, attempting to fetch and store from network.", hashStr)
+		_, err := s.fetchAndStoreFromNetwork(r.Context(), hash)
 		if err != nil {
-			log.Printf("Metadata for %s found, but data stream is missing. Will fetch from network.", hashStr)
-			// Fall through to network fetch
-		}
-	}
-
-	// If dataStream is still nil, it means we need to fetch from the network.
-	// This happens if metadata was not found, or if data stream was missing.
-	if dataStream == nil {
-		log.Printf("Content %s not available locally, attempting to fetch from network.", hashStr)
-		stream, netMetadata, fetchErr := s.fetchAndSaveStreamFromNetwork(r.Context(), hash)
-		if fetchErr != nil {
-			s.writeError(w, http.StatusNotFound, "Content not found locally or on the network", fetchErr)
+			s.writeError(w, http.StatusNotFound, "Content not found on the network or failed to fetch", err)
 			return
 		}
-		// Now we have the stream and metadata from the network.
-		if !s.isMimeTypeRenderable(netMetadata.MimeType) {
-			s.showDownloadPage(w, hashStr, netMetadata.Filename)
-			stream.Close() // Close the stream as we are not using it
-			return
-		}
-		dataStream = stream
-		metadata = netMetadata
+		log.Printf("Content %s successfully fetched and stored.", hashStr)
 	}
 
-	// At this point, we have a valid dataStream and metadata, and we know it's renderable.
+	// Now, the content is guaranteed to be local.
+	metadata, err := s.storage.GetContent(hash)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "Failed to get local content metadata after fetching", err)
+		return
+	}
+
+	// Check if renderable.
+	if !s.isMimeTypeRenderable(metadata.MimeType) {
+		s.showDownloadPage(w, hashStr, metadata.Filename)
+		return
+	}
+
+	dataStream, err := s.storage.GetDataStream(hash)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "Failed to get local data stream after fetching", err)
+		return
+	}
+
+	// Content is available locally, stream it with Range support.
 	s.streamResponse(w, r, dataStream, metadata, "inline")
 }
 
-// fetchAndSaveStreamFromNetwork finds a content provider, reads the metadata, and then returns a stream
-// for the client to read from. In the background, it saves the content to local storage.
-func (s *Server) fetchAndSaveStreamFromNetwork(ctx context.Context, hash hasher.Hash) (io.ReadCloser, *storage.ContentMetadata, error) {
+// fetchAndStoreFromNetwork finds a content provider, downloads the content, and stores it locally.
+// This is a blocking function that returns only after the download is complete.
+func (s *Server) fetchAndStoreFromNetwork(ctx context.Context, hash hasher.Hash) (*storage.ContentMetadata, error) {
 	libp2pNode, ok := s.node.(*libp2p.Node)
 	if !ok || s.streamer == nil {
-		return nil, nil, fmt.Errorf("network node is not available or does not support streaming")
+		return nil, fmt.Errorf("network node is not available or does not support streaming")
 	}
 
 	hashStr := hash.String()
 	log.Printf("Searching for providers of content %s", hashStr)
 	providers, err := libp2pNode.FindContentProviders(hashStr)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to find content providers: %w", err)
+		return nil, fmt.Errorf("failed to find content providers: %w", err)
 	}
 	if len(providers) == 0 {
-		return nil, nil, fmt.Errorf("no providers found for content %s", hashStr)
+		return nil, fmt.Errorf("no providers found for content %s", hashStr)
 	}
 
-	log.Printf("Found %d provider(s) for %s. Attempting to fetch stream...", len(providers), hashStr)
+	log.Printf("Found %d provider(s) for %s. Attempting to fetch and store...", len(providers), hashStr)
 	var lastErr error
 	for _, p := range providers {
 		if p.ID == libp2pNode.ID() {
@@ -373,10 +372,13 @@ func (s *Server) fetchAndSaveStreamFromNetwork(ctx context.Context, hash hasher.
 			continue
 		}
 
-		stream, err := s.streamer.RequestTransfer(ctx, hash, p.ID)
+		reqCtx, cancel := context.WithTimeout(ctx, 15*time.Minute) // 15 minute timeout for the entire transfer attempt
+		
+		stream, err := s.streamer.RequestTransfer(reqCtx, hash, p.ID)
 		if err != nil {
 			lastErr = fmt.Errorf("failed to request transfer from peer %s: %w", p.ID, err)
 			log.Printf("%v", lastErr)
+			cancel()
 			continue
 		}
 
@@ -384,6 +386,7 @@ func (s *Server) fetchAndSaveStreamFromNetwork(ctx context.Context, hash hasher.
 		var metaLen uint32
 		if err := binary.Read(stream, binary.BigEndian, &metaLen); err != nil {
 			stream.Close()
+			cancel()
 			lastErr = fmt.Errorf("failed to read metadata length from peer %s: %w", p.ID, err)
 			log.Printf("%v", lastErr)
 			continue
@@ -392,6 +395,7 @@ func (s *Server) fetchAndSaveStreamFromNetwork(ctx context.Context, hash hasher.
 		metaBytes := make([]byte, metaLen)
 		if _, err := io.ReadFull(stream, metaBytes); err != nil {
 			stream.Close()
+			cancel()
 			lastErr = fmt.Errorf("failed to read metadata bytes from peer %s: %w", p.ID, err)
 			log.Printf("%v", lastErr)
 			continue
@@ -400,92 +404,95 @@ func (s *Server) fetchAndSaveStreamFromNetwork(ctx context.Context, hash hasher.
 		var metadata storage.ContentMetadata
 		if err := json.Unmarshal(metaBytes, &metadata); err != nil {
 			stream.Close()
+			cancel()
 			lastErr = fmt.Errorf("failed to unmarshal metadata from peer %s: %w", p.ID, err)
 			log.Printf("%v", lastErr)
 			continue
 		}
 
-		// Pipe for the client response
-		clientPipeReader, clientPipeWriter := io.Pipe()
+		// Check for partial data to determine offset
+		offset, err := s.storage.GetPartialDataInfo(hash)
+		if err != nil {
+			log.Printf("Failed to get partial data info for %s: %v", hash.String(), err)
+			stream.Close()
+			cancel()
+			lastErr = err
+			continue
+		}
 
-		// Goroutine to save the content from its pipe
-		go func() {
-			defer stream.Close()
-			defer clientPipeWriter.Close()
+		// Store the data from the stream
+		err = s.storage.StorePartialDataStream(hash, stream, offset)
+		stream.Close() // Close stream after reading
+		if err != nil {
+			log.Printf("Storage failed for %s: %v", hash.String(), err)
+			cancel()
+			lastErr = err
+			continue
+		}
 
-			// Check for partial data to determine offset
-			offset, err := s.storage.GetPartialDataInfo(hash)
-			if err != nil {
-				log.Printf("Failed to get partial data info for %s: %v", hash.String(), err)
-				clientPipeWriter.CloseWithError(err)
-				return
-			}
+		// Finalize the download
+		if err := s.storage.FinalizePartialData(hash); err != nil {
+			log.Printf("Failed to finalize partial data for %s: %v", hash.String(), err)
+			cancel()
+			lastErr = err
+			continue
+		}
 
-			// TeeReader sends all data read from the network stream to the client pipe writer
-			teeReader := io.TeeReader(stream, clientPipeWriter)
+		// Store metadata after successful download
+		if err := s.storage.StoreContent(&metadata); err != nil {
+			log.Printf("Storage failed to store metadata for %s: %v", hash.String(), err)
+			// Don't return, we have the data, and this is not a fatal error for the download itself.
+		}
 
-			// Goroutine to save the data from the tee'd reader
-			err = s.storage.StorePartialDataStream(hash, teeReader, offset)
-			if err != nil {
-				log.Printf("Background storage failed for %s: %v", hash.String(), err)
-				// The error will be propagated to the client through the pipe
-				return
-			}
-
-			// Finalize the download
-			if err := s.storage.FinalizePartialData(hash); err != nil {
-				log.Printf("Failed to finalize partial data for %s: %v", hash.String(), err)
-				return
-			}
-
-			// Store metadata after successful download
-			if err := s.storage.StoreContent(&metadata); err != nil {
-				log.Printf("Background storage failed to store metadata for %s: %v", hash.String(), err)
-				return
-			}
-
-			log.Printf("Successfully stored streamed content %s in the background", hash.String())
-		}()
-
-		// Return the client's pipe reader, allowing the handler to stream the response immediately
-		return clientPipeReader, &metadata, nil
+		log.Printf("Successfully fetched and stored content %s from peer %s", hash.String(), p.ID)
+		cancel()
+		return &metadata, nil // Success
 	}
 
-	return nil, nil, fmt.Errorf("failed to fetch content from all providers. last error: %w", lastErr)
+	return nil, fmt.Errorf("failed to fetch content from all providers. last error: %w", lastErr)
 }
 
+
 // streamResponse sets the appropriate headers and streams the content to the client efficiently.
+// It supports Range requests for seekable streams (e.g., local files) for resumable downloads and video streaming.
 func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, dataStream io.ReadCloser, metadata *storage.ContentMetadata, disposition string) {
 	defer dataStream.Close()
 
-	w.Header().Set("Content-Type", metadata.MimeType)
-	w.Header().Set("Content-Length", strconv.FormatInt(metadata.Size, 10))
-
+	// Set Content-Disposition and Content-Type headers.
 	if disposition == "attachment" {
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", metadata.Filename))
 	} else {
 		w.Header().Set("Content-Disposition", "inline")
 	}
+	w.Header().Set("Content-Type", metadata.MimeType)
 
-	w.WriteHeader(http.StatusOK)
+	// Try to convert to io.ReadSeeker to support Range requests with http.ServeContent.
+	seeker, ok := dataStream.(io.ReadSeeker)
+	if ok {
+		// The stream supports seeking (it's likely a local file).
+		// http.ServeContent handles Range requests, caching headers, and efficient streaming.
+		http.ServeContent(w, r, metadata.Filename, metadata.ModTime, seeker)
+	} else {
+		// This is a fallback for non-seekable streams, though our new logic should avoid this path for downloads/views.
+		log.Printf("Warning: streaming content %s without Range support as stream is not seekable.", metadata.Hash.String())
+		w.Header().Set("Content-Length", strconv.FormatInt(metadata.Size, 10))
+		w.WriteHeader(http.StatusOK)
 
-	// Use io.Copy for efficient streaming. It handles buffering and potential OS-level optimizations.
-	bytesCopied, err := io.Copy(w, dataStream)
-	if err != nil {
-		// Check if the error is due to a client disconnect. This is common and not a server error.
-		// We check for context cancellation or specific network error strings that indicate a closed connection or timeout.
-		errStr := err.Error()
-		if r.Context().Err() != nil ||
-			strings.Contains(errStr, "forcibly closed") ||
-			strings.Contains(errStr, "connection reset by peer") ||
-			strings.Contains(errStr, "broken pipe") ||
-			strings.Contains(errStr, "connection was aborted") ||
-			strings.Contains(errStr, "i/o timeout") {
-			// Log as info, not an error, because this is expected client behavior.
-			log.Printf("Info: Client disconnected during stream of %s after %d bytes. Reason: %v", metadata.Hash.String(), bytesCopied, err)
-		} else {
-			// Log actual, unexpected errors.
-			log.Printf("Error streaming content %s to client after %d bytes: %v", metadata.Hash.String(), bytesCopied, err)
+		// Use io.Copy for efficient streaming.
+		bytesCopied, err := io.Copy(w, dataStream)
+		if err != nil {
+			// Check if the error is due to a client disconnect.
+			errStr := err.Error()
+			if r.Context().Err() != nil ||
+				strings.Contains(errStr, "forcibly closed") ||
+				strings.Contains(errStr, "connection reset by peer") ||
+				strings.Contains(errStr, "broken pipe") ||
+				strings.Contains(errStr, "connection was aborted") ||
+				strings.Contains(errStr, "i/o timeout") {
+				log.Printf("Info: Client disconnected during stream of %s after %d bytes. Reason: %v", metadata.Hash.String(), bytesCopied, err)
+			} else {
+				log.Printf("Error streaming content %s to client after %d bytes: %v", metadata.Hash.String(), bytesCopied, err)
+			}
 		}
 	}
 }
