@@ -48,14 +48,22 @@ func (pe *PeerExchanger) getPeerListJSON() ([]byte, error) {
 // and attempts to connect to the new ones, using the source as a relay if direct connection fails.
 func (pe *PeerExchanger) connectToNewPeers(addrInfos []peer.AddrInfo, sourcePeer peer.ID) {
 	var wg sync.WaitGroup
+	processed := make(map[peer.ID]bool)
+
 	for _, pi := range addrInfos {
 		// Don't connect to self
 		if pi.ID == pe.node.host.ID() {
 			continue
 		}
 
+		// Check if we have already processed this peer in this run
+		if processed[pi.ID] {
+			continue
+		}
+
 		// Check if we are already connected
 		if pe.node.host.Network().Connectedness(pi.ID) == network.Connected {
+			processed[pi.ID] = true
 			continue
 		}
 
@@ -68,6 +76,7 @@ func (pe *PeerExchanger) connectToNewPeers(addrInfos []peer.AddrInfo, sourcePeer
 		pe.connecting[pi.ID] = true
 		pe.connectingMu.Unlock()
 
+		processed[pi.ID] = true
 		wg.Add(1)
 		go func(pi peer.AddrInfo) {
 			defer wg.Done()
