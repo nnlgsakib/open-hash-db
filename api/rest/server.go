@@ -77,7 +77,7 @@ func NewServer(storage *storage.Storage, replicator *replicator.Replicator, node
 	}
 
 	if libp2pNode, ok := node.(*libp2p.Node); ok {
-		s.streamer = streammanager.NewStreamManager(libp2pNode)
+		s.streamer = streammanager.NewStreamManager(libp2pNode, storage)
 	}
 
 	s.setupRoutes()
@@ -407,38 +407,44 @@ func (s *Server) fetchAndSaveStreamFromNetwork(ctx context.Context, hash hasher.
 
 		// Pipe for the client response
 		clientPipeReader, clientPipeWriter := io.Pipe()
-		// Pipe for the background storage
-		storagePipeReader, storagePipeWriter := io.Pipe()
 
 		// Goroutine to save the content from its pipe
 		go func() {
-			defer storagePipeReader.Close()
+			defer stream.Close()
+			defer clientPipeWriter.Close()
+
+			// Check for partial data to determine offset
+			offset, err := s.storage.GetPartialDataInfo(hash)
+			if err != nil {
+				log.Printf("Failed to get partial data info for %s: %v", hash.String(), err)
+				clientPipeWriter.CloseWithError(err)
+				return
+			}
+
+			// TeeReader sends all data read from the network stream to the client pipe writer
+			teeReader := io.TeeReader(stream, clientPipeWriter)
+
+			// Goroutine to save the data from the tee'd reader
+			err = s.storage.StorePartialDataStream(hash, teeReader, offset)
+			if err != nil {
+				log.Printf("Background storage failed for %s: %v", hash.String(), err)
+				// The error will be propagated to the client through the pipe
+				return
+			}
+
+			// Finalize the download
+			if err := s.storage.FinalizePartialData(hash); err != nil {
+				log.Printf("Failed to finalize partial data for %s: %v", hash.String(), err)
+				return
+			}
+
+			// Store metadata after successful download
 			if err := s.storage.StoreContent(&metadata); err != nil {
 				log.Printf("Background storage failed to store metadata for %s: %v", hash.String(), err)
 				return
 			}
-			if err := s.storage.StoreDataStream(hash, storagePipeReader, metadata.Size); err != nil {
-				log.Printf("Background storage failed for %s: %v", hash.String(), err)
-			} else {
-				log.Printf("Successfully stored streamed content %s in the background", hash.String())
-			}
-		}()
 
-		// Goroutine to copy from the network to both pipes
-		go func() {
-			defer stream.Close()
-			defer clientPipeWriter.Close()
-			defer storagePipeWriter.Close()
-
-			// MultiWriter ensures that data read from the network is written to both the client and storage pipes
-			multiWriter := io.MultiWriter(clientPipeWriter, storagePipeWriter)
-
-			if _, err := io.Copy(multiWriter, stream); err != nil {
-				// Propagate the error to the pipe readers so the consumers know something went wrong
-				clientPipeWriter.CloseWithError(fmt.Errorf("failed to copy network stream to pipes: %w", err))
-				storagePipeWriter.CloseWithError(fmt.Errorf("failed to copy network stream to pipes: %w", err))
-				log.Printf("Error multicasting network stream for hash %s: %v", hashStr, err)
-			}
+			log.Printf("Successfully stored streamed content %s in the background", hash.String())
 		}()
 
 		// Return the client's pipe reader, allowing the handler to stream the response immediately

@@ -82,6 +82,12 @@ const (
 	MaxPeerEventLogs        = 100
 )
 
+// StreamRequest defines the structure for requesting a stream, including resumability.
+type StreamRequest struct {
+	ContentHash string `json:"content_hash"`
+	Offset      int64  `json:"offset"`
+}
+
 // PeerEvent represents a peer discovery, connection, or disconnection event
 type PeerEvent struct {
 	PeerID    peer.ID   `json:"peer_id"`
@@ -984,7 +990,7 @@ func (n *Node) RequestContentFromPeer(peerID peer.ID, contentHash string) ([]byt
 }
 
 // RequestContentStreamFromPeer requests a content stream from a peer.
-func (n *Node) RequestContentStreamFromPeer(ctx context.Context, peerID peer.ID, contentHash string) (io.ReadCloser, *storage.ContentMetadata, error) {
+func (n *Node) RequestContentStreamFromPeer(ctx context.Context, peerID peer.ID, contentHash string, offset int64) (io.ReadCloser, *storage.ContentMetadata, error) {
 	stream, err := n.host.NewStream(ctx, peerID, ProtocolStreamExchange)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to open stream to %s: %w", peerID.String(), err)
@@ -1002,7 +1008,14 @@ func (n *Node) RequestContentStreamFromPeer(ctx context.Context, peerID peer.ID,
 	// Monitor the connection using heartbeats
 	n.heartbeatService.MonitorConnection(peerID)
 
-	if _, err := stream.Write([]byte(contentHash)); err != nil {
+	req := StreamRequest{ContentHash: contentHash, Offset: offset}
+	reqBytes, err := json.Marshal(req)
+	if err != nil {
+		stream.Reset()
+		return nil, nil, fmt.Errorf("failed to marshal stream request: %w", err)
+	}
+
+	if _, err := stream.Write(reqBytes); err != nil {
 		stream.Reset()
 		return nil, nil, fmt.Errorf("failed to send content request to %s: %w", peerID.String(), err)
 	}
@@ -1037,63 +1050,62 @@ func (n *Node) handleStreamExchange(stream network.Stream) {
 	// Monitor the connection using heartbeats
 	n.heartbeatService.MonitorConnection(remotePeer)
 
-	buf := make([]byte, 256)
-	bytesRead, err := stream.Read(buf)
-	if err != nil && err != io.EOF && err != context.Canceled {
+	decoder := json.NewDecoder(stream)
+	var req StreamRequest
+	if err := decoder.Decode(&req); err != nil {
 		log.Printf("Failed to read stream request from %s: %v", remotePeer.String(), err)
 		stream.Reset()
 		return
 	}
-	contentHashStr := string(buf[:bytesRead])
 
-	hash, err := hasher.HashFromString(contentHashStr)
+	hash, err := hasher.HashFromString(req.ContentHash)
 	if err != nil {
-		log.Printf("Invalid hash %s from %s: %v", contentHashStr, remotePeer.String(), err)
+		log.Printf("Invalid hash %s from %s: %v", req.ContentHash, remotePeer.String(), err)
 		stream.Reset()
 		return
 	}
 
 	metadata, err := n.storage.GetContent(hash)
 	if err != nil {
-		log.Printf("Failed to get metadata for %s from %s: %v", contentHashStr, remotePeer.String(), err)
+		log.Printf("Failed to get metadata for %s from %s: %v", req.ContentHash, remotePeer.String(), err)
 		stream.Reset()
 		return
 	}
 
-	dataStream, err := n.storage.GetDataStream(hash)
+	dataStream, err := n.storage.GetDataStreamAt(hash, req.Offset)
 	if err != nil {
-		log.Printf("Failed to get data stream for %s from %s: %v", contentHashStr, remotePeer.String(), err)
+		log.Printf("Failed to get data stream for %s at offset %d from %s: %v", req.ContentHash, req.Offset, remotePeer.String(), err)
 		stream.Reset()
 		return
 	}
 
 	metaBytes, err := json.Marshal(metadata)
 	if err != nil {
-		log.Printf("Failed to marshal metadata for %s from %s: %v", contentHashStr, remotePeer.String(), err)
+		log.Printf("Failed to marshal metadata for %s from %s: %v", req.ContentHash, remotePeer.String(), err)
 		stream.Reset()
 		return
 	}
 
 	if err := binary.Write(stream, binary.BigEndian, uint32(len(metaBytes))); err != nil {
-		log.Printf("Failed to write metadata length for %s to %s: %v", contentHashStr, remotePeer.String(), err)
+		log.Printf("Failed to write metadata length for %s to %s: %v", req.ContentHash, remotePeer.String(), err)
 		stream.Reset()
 		return
 	}
 
 	if _, err := stream.Write(metaBytes); err != nil {
-		log.Printf("Failed to write metadata for %s to %s: %v", contentHashStr, remotePeer.String(), err)
+		log.Printf("Failed to write metadata for %s to %s: %v", req.ContentHash, remotePeer.String(), err)
 		stream.Reset()
 		return
 	}
 
 	bytesSent, err := io.Copy(stream, dataStream)
 	if err != nil {
-		log.Printf("Failed to write content for %s to %s: %v", contentHashStr, remotePeer.String(), err)
+		log.Printf("Failed to write content for %s to %s: %v", req.ContentHash, remotePeer.String(), err)
 		stream.Reset()
 		return
 	}
 
-	log.Printf("Sent %d bytes of content %s to %s via stream", bytesSent, contentHashStr, remotePeer.String())
+	log.Printf("Sent %d bytes of content %s to %s via stream from offset %d", bytesSent, req.ContentHash, remotePeer.String(), req.Offset)
 	stream.Close()
 }
 

@@ -71,6 +71,14 @@ type Storage struct {
 	mu       sync.RWMutex // Mutex for thread-safe database and filesystem access
 }
 
+// PartialContentMetadata represents metadata for a partially downloaded file.
+type PartialContentMetadata struct {
+	Hash          hasher.Hash `json:"hash"`
+	Downloaded    int64       `json:"downloaded"`
+	TotalSize     int64       `json:"total_size"`
+	LastWriteTime time.Time   `json:"last_write_time"`
+}
+
 // NewStorage creates a new storage instance
 func NewStorage(dbPath string) (*Storage, error) {
 	db, err := leveldb.OpenFile(dbPath, &opt.Options{
@@ -740,4 +748,69 @@ func (s *Storage) GetStats() (map[string]interface{}, error) {
 	log.Printf("Retrieved storage stats: %+v", stats)
 	storageOperationsTotal.WithLabelValues("get_stats", "success").Inc()
 	return stats, nil
+}
+
+// GetPartialDataInfo checks for a partial file and returns its size.
+func (s *Storage) GetPartialDataInfo(hash hasher.Hash) (int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	filePath := filepath.Join(s.dataPath, hash.String()+".partial")
+	info, err := os.Stat(filePath)
+	if os.IsNotExist(err) {
+		return 0, nil // No partial file, so size is 0
+	}
+	if err != nil {
+		return 0, fmt.Errorf("failed to stat partial file for %s: %w", hash.String(), err)
+	}
+	return info.Size(), nil
+}
+
+// StorePartialDataStream appends data from a reader to a partial file.
+func (s *Storage) StorePartialDataStream(hash hasher.Hash, reader io.Reader, offset int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	filePath := filepath.Join(s.dataPath, hash.String()+".partial")
+	file, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open partial file for %s: %w", hash.String(), err)
+	}
+	defer file.Close()
+
+	if _, err := file.Seek(offset, io.SeekStart); err != nil {
+		return fmt.Errorf("failed to seek partial file for %s: %w", hash.String(), err)
+	}
+
+	_, err = io.Copy(file, reader)
+	return err
+}
+
+// FinalizePartialData renames the partial file to its final name.
+func (s *Storage) FinalizePartialData(hash hasher.Hash) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	partialPath := filepath.Join(s.dataPath, hash.String()+".partial")
+	finalPath := filepath.Join(s.dataPath, hash.String())
+
+	return os.Rename(partialPath, finalPath)
+}
+
+// GetDataStreamAt returns a reader for the raw data from the filesystem, starting at an offset.
+func (s *Storage) GetDataStreamAt(hash hasher.Hash, offset int64) (*os.File, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	file, err := s.GetDataStream(hash)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := file.Seek(offset, io.SeekStart); err != nil {
+		file.Close()
+		return nil, fmt.Errorf("failed to seek data stream for %s: %w", hash.String(), err)
+	}
+
+	return file, nil
 }
