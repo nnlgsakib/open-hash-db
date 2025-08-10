@@ -13,15 +13,18 @@ import (
 
 // PeerExchanger handles exchanging peer lists.
 type PeerExchanger struct {
-	node *Node
-	ctx  context.Context
+	node         *Node
+	ctx          context.Context
+	connecting   map[peer.ID]bool // Keep track of in-flight connections
+	connectingMu sync.Mutex
 }
 
 // NewPeerExchanger creates a new PeerExchanger.
 func NewPeerExchanger(ctx context.Context, node *Node) *PeerExchanger {
 	return &PeerExchanger{
-		node: node,
-		ctx:  ctx,
+		node:       node,
+		ctx:        ctx,
+		connecting: make(map[peer.ID]bool),
 	}
 }
 
@@ -56,9 +59,29 @@ func (pe *PeerExchanger) connectToNewPeers(addrInfos []peer.AddrInfo, sourcePeer
 			continue
 		}
 
+		// Check if we are already trying to connect to avoid race conditions
+		pe.connectingMu.Lock()
+		if pe.connecting[pi.ID] {
+			pe.connectingMu.Unlock()
+			continue
+		}
+		pe.connecting[pi.ID] = true
+		pe.connectingMu.Unlock()
+
 		wg.Add(1)
 		go func(pi peer.AddrInfo) {
 			defer wg.Done()
+			defer func() {
+				pe.connectingMu.Lock()
+				delete(pe.connecting, pi.ID)
+				pe.connectingMu.Unlock()
+			}()
+
+			// Re-check connectedness inside the goroutine to be safe
+			if pe.node.host.Network().Connectedness(pi.ID) == network.Connected {
+				return
+			}
+
 			log.Printf("Discovered new peer %s from %s, attempting to connect", pi.ID.String(), sourcePeer.String())
 
 			// Attempt direct connection first
@@ -67,6 +90,12 @@ func (pe *PeerExchanger) connectToNewPeers(addrInfos []peer.AddrInfo, sourcePeer
 				return
 			} else {
 				log.Printf("Failed to connect directly to new peer %s: %v. Trying via relay.", pi.ID.String(), err)
+			}
+
+			// After a failed direct attempt, it's possible a connection was established concurrently.
+			if pe.node.host.Network().Connectedness(pi.ID) == network.Connected {
+				log.Printf("Already connected to %s, aborting relay attempt.", pi.ID.String())
+				return
 			}
 
 			// If direct connection fails, try connecting via the source peer as a relay
