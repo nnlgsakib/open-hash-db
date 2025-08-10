@@ -28,6 +28,9 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/core/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+	"github.com/libp2p/go-libp2p/p2p/net/swarm"
+	relayv2client "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
+	circuit "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	quic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
@@ -247,20 +250,6 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 		libp2p.ListenAddrStrings(listenAddrs...),
 		libp2p.EnableRelay(),
 		libp2p.EnableHolePunching(),
-		libp2p.EnableAutoRelayWithPeerSource(func(ctx context.Context, numPeers int) <-chan peer.AddrInfo {
-			peerChan := make(chan peer.AddrInfo, numPeers)
-			go func() {
-				defer close(peerChan)
-				for _, pi := range addrInfos {
-					select {
-					case peerChan <- pi:
-					case <-ctx.Done():
-						return
-					}
-				}
-			}()
-			return peerChan
-		}),
 		libp2p.Security(noise.ID, noise.New),
 		libp2p.Transport(tcp.NewTCPTransport),
 		libp2p.Transport(quic.NewTransport),
@@ -280,6 +269,11 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 		return nil, fmt.Errorf("failed to create libp2p host: %w", err)
 	}
 
+	// Enable the circuit relay v2 service
+	if _, err := circuit.New(h); err != nil {
+		return nil, fmt.Errorf("failed to create circuit relay: %w", err)
+	}
+
 	nodeCtx, cancel := context.WithCancel(ctx)
 	node := &Node{
 		host:                  h,
@@ -289,7 +283,7 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 		peerEvents:            make([]PeerEvent, 0, MaxPeerEventLogs),
 		PeerConnectedCallback: func(p peer.ID) {},
 	}
-	node.heartbeatService = NewHeartbeatService(nodeCtx, h)
+	node.heartbeatService = NewHeartbeatService(nodeCtx, node)
 
 	// Set up network notifiee
 	n := &networkNotifiee{node: node}
@@ -353,6 +347,7 @@ func (n *networkNotifiee) Connected(net network.Network, conn network.Conn) {
 		addrs = append(addrs, addr.String())
 	}
 	n.node.logPeerEvent(conn.RemotePeer(), "connected", addrs)
+	n.node.heartbeatService.MonitorConnection(conn.RemotePeer())
 	n.node.PeerConnectedCallback(conn.RemotePeer())
 }
 
@@ -363,6 +358,7 @@ func (n *networkNotifiee) Disconnected(net network.Network, conn network.Conn) {
 		addrs = append(addrs, addr.String())
 	}
 	n.node.logPeerEvent(conn.RemotePeer(), "disconnected", addrs)
+	n.node.heartbeatService.StopMonitoring(conn.RemotePeer())
 }
 
 func (n *networkNotifiee) Listen(net network.Network, addr multiaddr.Multiaddr)      {}
@@ -420,6 +416,12 @@ func (n *Node) Connect(ctx context.Context, peerAddr string) error {
 		return fmt.Errorf("failed to parse peer address %s: %w", peerAddr, err)
 	}
 
+	// Clear any existing backoff for the peer, which can be useful
+	// if a previous direct dial failed and we now want to try via a relay.
+	if swarm, ok := n.host.Network().(*swarm.Swarm); ok {
+		swarm.Backoff().Clear(maddr.ID)
+	}
+
 	const maxRetries = 5
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		// Increase timeout for each attempt
@@ -440,6 +442,20 @@ func (n *Node) Connect(ctx context.Context, peerAddr string) error {
 		}
 	}
 	return fmt.Errorf("failed to connect to peer %s after %d attempts: %w", maddr.ID.String(), maxRetries, err)
+}
+
+// ConnectViaRelay attempts to connect to a peer via a known relay peer.
+// The node must already be connected to the relay peer for this to succeed.
+func (n *Node) ConnectViaRelay(ctx context.Context, targetPeerID, relayID peer.ID) error {
+	log.Printf("Attempting to connect to %s via relay %s", targetPeerID, relayID)
+
+	// Construct the multiaddress for the target peer, routed through the relay.
+	// This address format tells libp2p to use the circuit relay protocol.
+	relayAddrStr := fmt.Sprintf("/p2p/%s/p2p-circuit/p2p/%s", relayID.String(), targetPeerID.String())
+
+	// Use the existing Connect function which has retry logic.
+	// The AddrInfoFromString inside Connect will parse the address.
+	return n.Connect(ctx, relayAddrStr)
 }
 
 // SendContent sends content to a peer
@@ -476,7 +492,7 @@ func (n *Node) sendData(ctx context.Context, peerID peer.ID, protocolID protocol
 		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
 
-		stream, err := n.host.NewStream(ctx, peerID, protocolID)
+		stream, err := n.host.NewStream(network.WithAllowLimitedConn(ctx, "send-data"), peerID, protocolID)
 		if err != nil {
 			log.Printf("Attempt %d/%d: Failed to open stream to %s: %v", attempt, maxRetries, peerID.String(), err)
 			networkErrorsTotal.WithLabelValues("send_data").Inc()
@@ -511,8 +527,6 @@ func (n *Node) handleContentStream(stream network.Stream) {
 	remotePeer := stream.Conn().RemotePeer()
 	log.Printf("Handling content stream from %s", remotePeer.String())
 
-	// Monitor the connection using heartbeats
-	n.heartbeatService.MonitorConnection(remotePeer)
 
 	buf := make([]byte, 256)
 	bytesRead, err := stream.Read(buf)
@@ -609,7 +623,6 @@ func (n *Node) handleChunkStream(stream network.Stream) {
 	remotePeer := stream.Conn().RemotePeer()
 	log.Printf("Handling chunk stream from %s", remotePeer.String())
 
-	n.heartbeatService.MonitorConnection(remotePeer)
 	data := make([]byte, 1024*1024)
 	bytesRead, err := stream.Read(data)
 	if err != nil {
@@ -636,7 +649,6 @@ func (n *Node) handleGossipStream(stream network.Stream) {
 	remotePeer := stream.Conn().RemotePeer()
 	log.Printf("Handling gossip stream from %s", remotePeer.String())
 
-	n.heartbeatService.MonitorConnection(remotePeer)
 	data := make([]byte, 64*1024)
 	bytesRead, err := stream.Read(data)
 	if err != nil {
@@ -741,6 +753,18 @@ func (n *Node) connectToBootnodes(bootnodes []string) error {
 				mu.Lock()
 				connectedCount++
 				mu.Unlock()
+				pinfo, err := peer.AddrInfoFromString(addr)
+				if err != nil {
+					log.Printf("Could not parse bootnode address %s for reservation: %v", addr, err)
+					return
+				}
+				log.Printf("Attempting to reserve slot with bootnode %s", pinfo.ID)
+				_, err = relayv2client.Reserve(ctx, n.host, *pinfo)
+				if err != nil {
+					log.Printf("Failed to reserve slot with %s: %v", pinfo.ID, err)
+				} else {
+					log.Printf("Successfully reserved slot with %s.", pinfo.ID)
+				}
 			}
 		}(bootnode)
 	}
@@ -859,7 +883,7 @@ func (n *Node) RequestContentFromPeer(peerID peer.ID, contentHash string) ([]byt
 		defer cancel()
 
 		log.Printf("Attempt %d/%d: Requesting content %s from %s", attempt, maxRetries, contentHash, peerID.String())
-		stream, err := n.host.NewStream(ctx, peerID, ProtocolContentExchange)
+		stream, err := n.host.NewStream(network.WithAllowLimitedConn(ctx, "request-content"), peerID, ProtocolContentExchange)
 		if err != nil {
 			log.Printf("Attempt %d/%d: Failed to open stream to %s: %v", attempt, maxRetries, peerID.String(), err)
 			networkErrorsTotal.WithLabelValues("open_stream").Inc()
@@ -871,7 +895,6 @@ func (n *Node) RequestContentFromPeer(peerID peer.ID, contentHash string) ([]byt
 			continue
 		}
 
-		n.heartbeatService.MonitorConnection(peerID)
 		if _, err := stream.Write([]byte(contentHash)); err != nil {
 			log.Printf("Attempt %d/%d: Failed to send content request to %s: %v", attempt, maxRetries, peerID.String(), err)
 			networkErrorsTotal.WithLabelValues("write_content_request").Inc()
@@ -991,7 +1014,7 @@ func (n *Node) RequestContentFromPeer(peerID peer.ID, contentHash string) ([]byt
 
 // RequestContentStreamFromPeer requests a content stream from a peer.
 func (n *Node) RequestContentStreamFromPeer(ctx context.Context, peerID peer.ID, contentHash string, offset int64) (io.ReadCloser, *storage.ContentMetadata, error) {
-	stream, err := n.host.NewStream(ctx, peerID, ProtocolStreamExchange)
+	stream, err := n.host.NewStream(network.WithAllowLimitedConn(ctx, "request-stream"), peerID, ProtocolStreamExchange)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to open stream to %s: %w", peerID.String(), err)
 	}
@@ -1005,8 +1028,7 @@ func (n *Node) RequestContentStreamFromPeer(ctx context.Context, peerID peer.ID,
 		}
 	}()
 
-	// Monitor the connection using heartbeats
-	n.heartbeatService.MonitorConnection(peerID)
+	
 
 	req := StreamRequest{ContentHash: contentHash, Offset: offset}
 	reqBytes, err := json.Marshal(req)
@@ -1047,8 +1069,6 @@ func (n *Node) handleStreamExchange(stream network.Stream) {
 	remotePeer := stream.Conn().RemotePeer()
 	log.Printf("Handling stream exchange from %s", remotePeer.String())
 
-	// Monitor the connection using heartbeats
-	n.heartbeatService.MonitorConnection(remotePeer)
 
 	decoder := json.NewDecoder(stream)
 	var req StreamRequest

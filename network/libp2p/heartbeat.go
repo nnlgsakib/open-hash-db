@@ -2,13 +2,10 @@ package libp2p
 
 import (
 	"context"
-	"fmt"
-	"io"
 	"log"
 	"sync"
 	"time"
 
-	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
@@ -20,7 +17,6 @@ const (
 	ProtocolHeartbeat = protocol.ID("/openhashdb/heartbeat/1.0.0")
 	HeartbeatInterval = 15 * time.Second
 	HeartbeatTimeout  = 30 * time.Second
-	MaxRetries        = 3
 )
 
 // Metrics
@@ -45,30 +41,31 @@ var (
 	)
 )
 
-// HeartbeatService manages peer connection liveness
+// HeartbeatService manages peer connection liveness and peer exchange.
 type HeartbeatService struct {
-	host        host.Host
-	ctx         context.Context
-	monitored   map[peer.ID]context.CancelFunc // Tracks monitored peers
-	monitoredMu sync.Mutex                     // Protects monitored map
+	node          *Node
+	ctx           context.Context
+	monitored     map[peer.ID]context.CancelFunc // Tracks monitored peers
+	monitoredMu   sync.Mutex                     // Protects monitored map
+	peerExchanger *PeerExchanger
 }
 
 // NewHeartbeatService creates a new HeartbeatService
-func NewHeartbeatService(ctx context.Context, host host.Host) *HeartbeatService {
+func NewHeartbeatService(ctx context.Context, node *Node) *HeartbeatService {
 	hs := &HeartbeatService{
-		host:      host,
-		ctx:       ctx,
-		monitored: make(map[peer.ID]context.CancelFunc),
+		node:          node,
+		ctx:           ctx,
+		monitored:     make(map[peer.ID]context.CancelFunc),
+		peerExchanger: NewPeerExchanger(ctx, node),
 	}
-	host.SetStreamHandler(ProtocolHeartbeat, hs.handleHeartbeatStream)
+	node.host.SetStreamHandler(ProtocolHeartbeat, hs.handleHeartbeatStream)
 	return hs
 }
 
-// handleHeartbeatStream handles incoming heartbeat requests
+// handleHeartbeatStream handles incoming heartbeat requests and peer exchange
 func (hs *HeartbeatService) handleHeartbeatStream(stream network.Stream) {
-	defer stream.Close()
-	log.Printf("Received heartbeat from %s", stream.Conn().RemotePeer().String())
-	// Stream is closed immediately to signal liveness
+	log.Printf("Received heartbeat from %s, starting peer exchange.", stream.Conn().RemotePeer().String())
+	hs.peerExchanger.handleExchange(stream)
 }
 
 // MonitorConnection starts monitoring a peer’s connection health
@@ -114,7 +111,7 @@ func (hs *HeartbeatService) monitor(ctx context.Context, peerID peer.ID) {
 				log.Printf("Heartbeat to %s failed: %v", peerID.String(), err)
 				heartbeatFailureTotal.Inc()
 				// Reset all connections to the peer on failure
-				hs.host.Network().ClosePeer(peerID)
+				hs.node.host.Network().ClosePeer(peerID)
 				connectionResetTotal.Inc()
 				log.Printf("Connection to %s reset due to heartbeat failure", peerID.String())
 				return
@@ -125,36 +122,23 @@ func (hs *HeartbeatService) monitor(ctx context.Context, peerID peer.ID) {
 	}
 }
 
-// sendHeartbeat sends a single heartbeat to a peer with retries
+// sendHeartbeat sends a single heartbeat to a peer and initiates peer exchange
 func (hs *HeartbeatService) sendHeartbeat(peerID peer.ID) error {
-	for attempt := 1; attempt <= MaxRetries; attempt++ {
-		ctx, cancel := context.WithTimeout(hs.ctx, HeartbeatTimeout)
-		defer cancel()
+	ctx, cancel := context.WithTimeout(hs.ctx, HeartbeatTimeout)
+	defer cancel()
 
-		stream, err := hs.host.NewStream(ctx, peerID, ProtocolHeartbeat)
-		if err != nil {
-			log.Printf("Attempt %d/%d: Failed to open heartbeat stream to %s: %v", attempt, MaxRetries, peerID.String(), err)
-			if attempt == MaxRetries {
-				return err
-			}
-			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond) // Exponential backoff
-			continue
-		}
-		defer stream.Close()
-
-		// Wait for the remote peer to close the stream, indicating liveness
-		buf := make([]byte, 1)
-		stream.SetReadDeadline(time.Now().Add(HeartbeatTimeout))
-		_, err = stream.Read(buf)
-		if err == io.EOF {
-			return nil // Expected EOF from graceful close
-		}
-		log.Printf("Attempt %d/%d: Unexpected response from %s: %v", attempt, MaxRetries, peerID.String(), err)
-		stream.Reset()
-		if attempt == MaxRetries {
-			return err
-		}
-		time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
+	stream, err := hs.node.host.NewStream(network.WithAllowLimitedConn(ctx, "heartbeat"), peerID, ProtocolHeartbeat)
+	if err != nil {
+		log.Printf("Failed to open heartbeat stream to %s: %v", peerID.String(), err)
+		return err
 	}
-	return fmt.Errorf("failed to send heartbeat to %s after %d attempts", peerID.String(), MaxRetries)
+
+	// The actual exchange logic is handled by the PeerExchanger
+	// It will close the stream
+	if err := hs.peerExchanger.initiateExchange(stream); err != nil {
+		log.Printf("Peer exchange with %s failed: %v", peerID.String(), err)
+		return err
+	}
+
+	return nil
 }
