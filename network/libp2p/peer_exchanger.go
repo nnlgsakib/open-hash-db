@@ -48,26 +48,14 @@ func (pe *PeerExchanger) getPeerListJSON() ([]byte, error) {
 // and attempts to connect to the new ones, using the source as a relay if direct connection fails.
 func (pe *PeerExchanger) connectToNewPeers(addrInfos []peer.AddrInfo, sourcePeer peer.ID) {
 	var wg sync.WaitGroup
-	processed := make(map[peer.ID]bool)
 
 	for _, pi := range addrInfos {
-		// Don't connect to self
-		if pi.ID == pe.node.host.ID() {
+		// Don't connect to self or already connected peers
+		if pi.ID == pe.node.host.ID() || pe.node.host.Network().Connectedness(pi.ID) == network.Connected {
 			continue
 		}
 
-		// Check if we have already processed this peer in this run
-		if processed[pi.ID] {
-			continue
-		}
-
-		// Check if we are already connected
-		if pe.node.host.Network().Connectedness(pi.ID) == network.Connected {
-			processed[pi.ID] = true
-			continue
-		}
-
-		// Check if we are already trying to connect to avoid race conditions
+		// Check if a connection is already in progress
 		pe.connectingMu.Lock()
 		if pe.connecting[pi.ID] {
 			pe.connectingMu.Unlock()
@@ -76,43 +64,38 @@ func (pe *PeerExchanger) connectToNewPeers(addrInfos []peer.AddrInfo, sourcePeer
 		pe.connecting[pi.ID] = true
 		pe.connectingMu.Unlock()
 
-		processed[pi.ID] = true
 		wg.Add(1)
 		go func(pi peer.AddrInfo) {
 			defer wg.Done()
-			defer func() {
-				pe.connectingMu.Lock()
-				delete(pe.connecting, pi.ID)
-				pe.connectingMu.Unlock()
-			}()
 
-			// Re-check connectedness inside the goroutine to be safe
+			// Double-check connection status inside the goroutine
 			if pe.node.host.Network().Connectedness(pi.ID) == network.Connected {
 				return
 			}
 
 			log.Printf("Discovered new peer %s from %s, attempting to connect", pi.ID.String(), sourcePeer.String())
 
-			// Attempt direct connection first
-			if err := pe.node.host.Connect(pe.ctx, pi); err == nil {
+			// Attempt direct connection
+			err := pe.node.host.Connect(pe.ctx, pi)
+			if err == nil {
 				log.Printf("Successfully connected directly to new peer %s", pi.ID.String())
-				return
-			} else {
-				log.Printf("Failed to connect directly to new peer %s: %v. Trying via relay.", pi.ID.String(), err)
-			}
-
-			// After a failed direct attempt, it's possible a connection was established concurrently.
-			if pe.node.host.Network().Connectedness(pi.ID) == network.Connected {
-				log.Printf("Already connected to %s, aborting relay attempt.", pi.ID.String())
+				// On success, leave the peer in the `connecting` map to prevent race conditions.
+				// A disconnect notifier should eventually clear this flag.
 				return
 			}
 
-			// If direct connection fails, try connecting via the source peer as a relay
-			log.Printf("Attempting to connect to %s via relay %s", pi.ID.String(), sourcePeer.String())
+			log.Printf("Failed to connect directly to %s: %v. Trying via relay.", pi.ID.String(), err)
+
+			// If direct connection fails, try via relay
 			if err := pe.node.ConnectViaRelay(pe.ctx, pi.ID, sourcePeer); err != nil {
-				log.Printf("Failed to connect to new peer %s via relay %s: %v", pi.ID.String(), sourcePeer.String(), err)
+				log.Printf("Failed to connect to %s via relay %s: %v", pi.ID.String(), sourcePeer.String(), err)
+				// If all attempts fail, remove the peer from the connecting map
+				pe.connectingMu.Lock()
+				delete(pe.connecting, pi.ID)
+				pe.connectingMu.Unlock()
 			} else {
-				log.Printf("Successfully connected to new peer %s via relay %s", pi.ID.String(), sourcePeer.String())
+				log.Printf("Successfully connected to %s via relay %s", pi.ID.String(), sourcePeer.String())
+				// On success, leave the peer in the `connecting` map
 			}
 		}(pi)
 	}
