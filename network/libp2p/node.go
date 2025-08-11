@@ -759,7 +759,9 @@ func (n *Node) connectToBootnodes(bootnodes []string) error {
 					return
 				}
 				log.Printf("Attempting to reserve slot with bootnode %s", pinfo.ID)
-				_, err = relayv2client.Reserve(ctx, n.host, *pinfo)
+				reserveCtx, reserveCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer reserveCancel()
+				_, err = relayv2client.Reserve(reserveCtx, n.host, *pinfo)
 				if err != nil {
 					log.Printf("Failed to reserve slot with %s: %v", pinfo.ID, err)
 				} else {

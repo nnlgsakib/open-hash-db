@@ -372,11 +372,32 @@ func (r *Replicator) handleContentAnnouncement(peerID peer.ID, announcement *Con
 		return nil
 	}
 
-	data, metadata, err := r.node.RequestContentFromPeer(peerID, announcement.Hash.String())
+	sourcePeerID, err := peer.Decode(announcement.PeerID)
+	if err != nil {
+		log.Printf("Failed to decode source peer ID from announcement '%s': %v", announcement.PeerID, err)
+		return nil
+	}
+
+	if sourcePeerID == r.node.ID() {
+		return nil
+	}
+
+	data, metadata, err := r.node.RequestContentFromPeer(sourcePeerID, announcement.Hash.String())
 	if err != nil {
 		replicationFailuresTotal.Inc()
-		log.Printf("Failed to fetch content %s from %s: %v", announcement.Hash.String(), peerID.String(), err)
-		return nil
+		log.Printf("Failed to fetch content %s from %s: %v. Attempting relay via %s", announcement.Hash.String(), sourcePeerID, err, peerID)
+
+		if relayErr := r.node.ConnectViaRelay(r.ctx, sourcePeerID, peerID); relayErr != nil {
+			log.Printf("Failed to connect to source peer %s via relay %s: %v", sourcePeerID, peerID, relayErr)
+			return nil
+		}
+
+		log.Printf("Successfully connected to %s via relay. Retrying content fetch.", sourcePeerID)
+		data, metadata, err = r.node.RequestContentFromPeer(sourcePeerID, announcement.Hash.String())
+		if err != nil {
+			log.Printf("Failed to fetch content %s from %s even after relay: %v", announcement.Hash.String(), sourcePeerID, err)
+			return nil
+		}
 	}
 
 	if err := r.storage.StoreData(announcement.Hash, data); err != nil {
