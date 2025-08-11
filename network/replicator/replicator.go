@@ -96,6 +96,7 @@ type Replicator struct {
 	pendingRequests   map[string]chan ChunkResponse
 	requestTracker    map[string]*RequestTracker
 	relayCache        map[string][]byte
+	replicatingNow    map[string]struct{}
 	mu                sync.RWMutex
 	ctx               context.Context
 	cancel            context.CancelFunc
@@ -112,6 +113,7 @@ func NewReplicator(storage *storage.Storage, node *libp2p.Node, replicationFacto
 		pendingRequests:   make(map[string]chan ChunkResponse),
 		requestTracker:    make(map[string]*RequestTracker),
 		relayCache:        make(map[string][]byte),
+		replicatingNow:    make(map[string]struct{}),
 		ctx:               ctx,
 		cancel:            cancel,
 	}
@@ -344,6 +346,21 @@ func (r *Replicator) handleContentAnnouncement(peerID peer.ID, announcement *Con
 		return nil
 	}
 
+	r.mu.Lock()
+	if _, ongoing := r.replicatingNow[announcement.Hash.String()]; ongoing {
+		r.mu.Unlock()
+		log.Printf("Replication for %s already in progress, skipping announcement from %s", announcement.Hash.String(), peerID.String())
+		return nil
+	}
+	r.replicatingNow[announcement.Hash.String()] = struct{}{}
+	r.mu.Unlock()
+
+	defer func() {
+		r.mu.Lock()
+		delete(r.replicatingNow, announcement.Hash.String())
+		r.mu.Unlock()
+	}()
+
 	// Skip automatic replication for large files
 	if announcement.Size > LargeFileSizeThreshold {
 		log.Printf("Content %s is larger than %d bytes, skipping automatic replication", announcement.Hash.String(), LargeFileSizeThreshold)
@@ -372,32 +389,60 @@ func (r *Replicator) handleContentAnnouncement(peerID peer.ID, announcement *Con
 		return nil
 	}
 
-	sourcePeerID, err := peer.Decode(announcement.PeerID)
-	if err != nil {
-		log.Printf("Failed to decode source peer ID from announcement '%s': %v", announcement.PeerID, err)
-		return nil
+	connectedPeers := r.node.ConnectedPeers()
+	connectedPeerSet := make(map[peer.ID]struct{})
+	for _, p := range connectedPeers {
+		connectedPeerSet[p] = struct{}{}
 	}
 
-	if sourcePeerID == r.node.ID() {
-		return nil
+	var directProviders, otherProviders []peer.AddrInfo
+	for _, p := range providers {
+		if _, ok := connectedPeerSet[p.ID]; ok {
+			directProviders = append(directProviders, p)
+		} else {
+			otherProviders = append(otherProviders, p)
+		}
 	}
 
-	data, metadata, err := r.node.RequestContentFromPeer(sourcePeerID, announcement.Hash.String())
-	if err != nil {
+	var data []byte
+	var metadata *storage.ContentMetadata
+	var fetchErr error
+	var successPeer peer.ID
+
+	// Try direct peers first
+	for _, p := range directProviders {
+		if p.ID == r.node.ID() {
+			continue
+		}
+		log.Printf("Attempting to fetch %s from directly connected peer %s", announcement.Hash.String(), p.ID)
+		data, metadata, fetchErr = r.node.RequestContentFromPeer(p.ID, announcement.Hash.String())
+		if fetchErr == nil {
+			successPeer = p.ID
+			break // Found it
+		}
+		log.Printf("Failed to fetch %s from direct peer %s: %v", announcement.Hash.String(), p.ID, fetchErr)
+	}
+
+	// If not found with direct peers, try others
+	if fetchErr != nil {
+		for _, p := range otherProviders {
+			if p.ID == r.node.ID() {
+				continue
+			}
+			log.Printf("Attempting to fetch %s from other peer %s", announcement.Hash.String(), p.ID)
+			data, metadata, fetchErr = r.node.RequestContentFromPeer(p.ID, announcement.Hash.String())
+			if fetchErr == nil {
+				successPeer = p.ID
+				break // Found it
+			}
+			log.Printf("Failed to fetch %s from other peer %s: %v", announcement.Hash.String(), p.ID, fetchErr)
+		}
+	}
+
+	if fetchErr != nil {
 		replicationFailuresTotal.Inc()
-		log.Printf("Failed to fetch content %s from %s: %v. Attempting relay via %s", announcement.Hash.String(), sourcePeerID, err, peerID)
-
-		if relayErr := r.node.ConnectViaRelay(r.ctx, sourcePeerID, peerID); relayErr != nil {
-			log.Printf("Failed to connect to source peer %s via relay %s: %v", sourcePeerID, peerID, relayErr)
-			return nil
-		}
-
-		log.Printf("Successfully connected to %s via relay. Retrying content fetch.", sourcePeerID)
-		data, metadata, err = r.node.RequestContentFromPeer(sourcePeerID, announcement.Hash.String())
-		if err != nil {
-			log.Printf("Failed to fetch content %s from %s even after relay: %v", announcement.Hash.String(), sourcePeerID, err)
-			return nil
-		}
+		log.Printf("Failed to fetch content %s from any provider.", announcement.Hash.String())
+		return nil
 	}
 
 	if err := r.storage.StoreData(announcement.Hash, data); err != nil {
@@ -413,7 +458,7 @@ func (r *Replicator) handleContentAnnouncement(peerID peer.ID, announcement *Con
 	}
 
 	replicationSuccessTotal.Inc()
-	log.Printf("Successfully replicated content %s from %s", announcement.Hash.String(), peerID.String())
+	log.Printf("Successfully replicated content %s from %s", announcement.Hash.String(), successPeer.String())
 	if err := r.AnnounceContent(announcement.Hash, metadata.Size); err != nil {
 		log.Printf("Failed to announce replicated content %s: %v", announcement.Hash.String(), err)
 	}
