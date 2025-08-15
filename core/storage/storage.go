@@ -445,11 +445,14 @@ func (s *Storage) HasData(hash hasher.Hash) bool {
 	filePath := filepath.Join(s.dataPath, hash.String())
 	_, err := os.Stat(filePath)
 	if err == nil {
-		log.Printf("Data found for %s at %s", hash.String(), filePath)
+		// log.Printf("Data found for %s at %s", hash.String(), filePath)
 		storageOperationsTotal.WithLabelValues("has_data", "success").Inc()
 		return true
 	}
-	log.Printf("Data not found for %s at %s: %v", hash.String(), filePath, err)
+	if !os.IsNotExist(err) {
+		log.Printf("Error checking for data %s at %s: %v", hash.String(), filePath, err)
+	}
+	// log.Printf("Data not found for %s at %s: %v", hash.String(), filePath, err)
 	storageOperationsTotal.WithLabelValues("has_data", "not_found").Inc()
 	return false
 }

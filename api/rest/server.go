@@ -20,7 +20,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -335,40 +334,29 @@ func (s *Server) viewContent(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) streamChunks(w http.ResponseWriter, r *http.Request, metadata *storage.ContentMetadata) {
-	var wg sync.WaitGroup
-	chunkDataMap := make(map[int][]byte)
-	errs := make(chan error, len(metadata.Chunks))
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming unsupported!", http.StatusInternalServerError)
+		return
+	}
 
 	for i, chunkInfo := range metadata.Chunks {
-		wg.Add(1)
-		go func(i int, chunkInfo chunker.ChunkInfo) {
-			defer wg.Done()
-			data, err := s.getChunkData(r.Context(), chunkInfo.Hash)
-			if err != nil {
-				errs <- fmt.Errorf("failed to get chunk %d (%s): %w", i, chunkInfo.Hash.String(), err)
-				return
-			}
-			chunkDataMap[i] = data
-		}(i, chunkInfo)
-	}
-
-	wg.Wait()
-	close(errs)
-
-	for err := range errs {
-		log.Printf("Error during chunk download: %v", err)
-	}
-
-	for i := 0; i < len(metadata.Chunks); i++ {
-		chunkData, ok := chunkDataMap[i]
-		if !ok {
-			log.Printf("Chunk %d missing for content %s", i, metadata.Hash.String())
+		data, err := s.getChunkData(r.Context(), chunkInfo.Hash)
+		if err != nil {
+			log.Printf("Error getting chunk %d for content %s: %v", i, metadata.Hash.String(), err)
+			// We can't recover from a missing chunk, so we stop.
+			// The client will receive a truncated response.
 			return
 		}
-		if _, err := w.Write(chunkData); err != nil {
-			log.Printf("Failed to write chunk %d to response: %v", i, err)
+
+		if _, err := w.Write(data); err != nil {
+			log.Printf("Error writing chunk %d to response for content %s: %v", i, metadata.Hash.String(), err)
+			// This likely means the client has closed the connection.
 			return
 		}
+
+		// Flush the data to the client after each chunk.
+		flusher.Flush()
 	}
 }
 
