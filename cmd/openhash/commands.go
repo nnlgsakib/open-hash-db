@@ -9,17 +9,19 @@ import (
 	"log"
 	"mime/multipart"
 	"net/http"
-	"openhashdb/api/rest"
-	"openhashdb/core/dag"
-	"openhashdb/core/hasher"
-	"openhashdb/core/storage"
-	"openhashdb/core/utils"
-	"openhashdb/network/libp2p"
-	"openhashdb/network/replicator"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"openhashdb/api/rest"
+	"openhashdb/core/chunker"
+	"openhashdb/core/hasher"
+	"openhashdb/core/merkle"
+	"openhashdb/core/storage"
+	"openhashdb/core/utils"
+	"openhashdb/network/libp2p"
+	"openhashdb/network/replicator"
 
 	"github.com/spf13/cobra"
 )
@@ -248,7 +250,8 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&apiURL, "api", "", "REST API URL for remote operations (e.g., http://localhost:8080)")
 
 	// Command-specific flags
-	daemonCmd.Flags().Bool("enable-rest", true, "Enable REST API")
+
+daemonCmd.Flags().Bool("enable-rest", true, "Enable REST API")
 
 	// Add commands
 	rootCmd.AddCommand(addCmd)
@@ -333,180 +336,207 @@ func cleanup() {
 
 // addFile adds a single file
 func addFile(path string) error {
-	// Read file
-	content, err := os.ReadFile(path)
+	file, err := os.Open(path)
 	if err != nil {
-		return fmt.Errorf("failed to read file: %w", err)
+		return fmt.Errorf("failed to open file: %w", err)
+	}
+	defer file.Close()
+
+	c := chunker.NewChunker(chunker.ChunkSize256KB)
+	merkleFile, chunks, err := merkle.BuildFileTree(file, c)
+	if err != nil {
+		return fmt.Errorf("failed to build merkle tree: %w", err)
 	}
 
-	// Get file info
+	for _, chunk := range chunks {
+		if !store.HasData(chunk.Hash) {
+			if err := store.StoreData(chunk.Hash, chunk.Data); err != nil {
+				return fmt.Errorf("failed to store chunk %s: %w", chunk.Hash.String(), err)
+			}
+		}
+	}
+
 	info, err := os.Stat(path)
 	if err != nil {
 		return fmt.Errorf("failed to stat file: %w", err)
 	}
 
-	// Compute hash
-	hash := hasher.HashBytes(content)
-
-	// Create metadata
 	metadata := &storage.ContentMetadata{
-		Hash:        hash,
+		Hash:        merkleFile.Root,
 		Filename:    filepath.Base(path),
 		MimeType:    utils.GetMimeType(path),
-		Size:        info.Size(),
+		Size:        merkleFile.TotalSize,
 		ModTime:     info.ModTime(),
 		IsDirectory: false,
 		CreatedAt:   time.Now(),
 		RefCount:    1,
+		Chunks:      merkleFile.Chunks,
 	}
 
-	// Store metadata
 	if err := store.StoreContent(metadata); err != nil {
 		return fmt.Errorf("failed to store metadata: %w", err)
 	}
 
-	// Store data
-	if err := store.StoreData(hash, content); err != nil {
-		return fmt.Errorf("failed to store data: %w", err)
-	}
-
-	// Announce to DHT if node is available
 	if node != nil {
-		if err := node.AnnounceContent(hash.String()); err != nil {
+		if err := node.AnnounceContent(merkleFile.Root.String()); err != nil {
 			log.Printf("Warning: failed to announce content to DHT: %v", err)
 		}
 	}
 
-	fmt.Printf("✅ File added: %s\n", hash.String())
-	fmt.Printf("   Size: %d bytes\n", len(content))
+	fmt.Printf("✅ File added: %s\n", merkleFile.Root.String())
+	fmt.Printf("   Size: %d bytes\n", merkleFile.TotalSize)
 	fmt.Printf("   Name: %s\n", filepath.Base(path))
 
 	return nil
 }
 
-// addFolder adds a folder (simplified implementation)
+// addFolder adds a folder
 func addFolder(path string) error {
-	// Build DAG
-	builder := dag.NewDAGBuilder()
-	if verbose {
-		builder.ProgressCallback = func(path string, processed, total int) {
-			fmt.Printf("Processing: %s (%d/%d)\n", path, processed, total)
+	link, err := storeDirectoryRecursive(path, filepath.Base(path))
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("✅ Folder added: %s\n", link.Hash.String())
+	fmt.Printf("   Size: %d bytes\n", link.Size)
+	fmt.Printf("   Name: %s\n", link.Name)
+
+	return nil
+}
+
+func storeDirectoryRecursive(path string, name string) (*merkle.Link, error) {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return nil, err
+	}
+
+	var links []merkle.Link
+	c := chunker.NewChunker(chunker.ChunkSize256KB)
+
+	for _, entry := range entries {
+		entryPath := filepath.Join(path, entry.Name())
+		var link *merkle.Link
+
+		if entry.IsDir() {
+			link, err = storeDirectoryRecursive(entryPath, entry.Name())
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			file, err := os.Open(entryPath)
+			if err != nil {
+				return nil, err
+			}
+
+			merkleFile, chunks, err := merkle.BuildFileTree(file, c)
+			file.Close()
+			if err != nil {
+				return nil, fmt.Errorf("failed to build merkle tree for %s: %w", entry.Name(), err)
+			}
+
+			for _, chunk := range chunks {
+				if !store.HasData(chunk.Hash) {
+					if err := store.StoreData(chunk.Hash, chunk.Data); err != nil {
+						return nil, fmt.Errorf("failed to store chunk %s: %w", chunk.Hash.String(), err)
+					}
+				}
+			}
+
+			info, _ := entry.Info()
+
+			fileMetadata := &storage.ContentMetadata{
+				Hash:        merkleFile.Root,
+				Filename:    entry.Name(),
+				MimeType:    utils.GetMimeType(entry.Name()),
+				Size:        merkleFile.TotalSize,
+				ModTime:     info.ModTime(),
+				IsDirectory: false,
+				CreatedAt:   time.Now(),
+				RefCount:    1,
+				Chunks:      merkleFile.Chunks,
+			}
+			if err := store.StoreContent(fileMetadata); err != nil {
+				return nil, fmt.Errorf("failed to store metadata for %s: %w", entry.Name(), err)
+			}
+
+			link = &merkle.Link{
+				Name: entry.Name(),
+				Hash: merkleFile.Root,
+				Size: merkleFile.TotalSize,
+				Type: "file",
+			}
 		}
+		links = append(links, *link)
 	}
 
-	dagNode, err := builder.BuildFromPath(path)
+	dirHash, err := merkle.BuildDirectoryTree(links)
 	if err != nil {
-		return fmt.Errorf("failed to build DAG: %w", err)
+		return nil, err
 	}
 
-	// Serialize DAG
-	dagData, err := dagNode.Serialize()
+	var totalSize int64
+	for _, l := range links {
+		totalSize += l.Size
+	}
+
+	info, err := os.Stat(path)
 	if err != nil {
-		return fmt.Errorf("failed to serialize DAG: %w", err)
+		return nil, err
 	}
 
-	// Create metadata
-	metadata := &storage.ContentMetadata{
-		Hash:        dagNode.Hash,
-		Filename:    filepath.Base(path),
-		MimeType:    "application/x-directory",
-		Size:        dagNode.Size,
-		ModTime:     time.Now(),
+	dirMetadata := &storage.ContentMetadata{
+		Hash:        dirHash,
+		Filename:    name,
+		MimeType:    "inode/directory",
+		Size:        totalSize,
+		ModTime:     info.ModTime(),
 		IsDirectory: true,
 		CreatedAt:   time.Now(),
 		RefCount:    1,
+		Links:       links,
 	}
 
-	// Store metadata
-	if err := store.StoreContent(metadata); err != nil {
-		return fmt.Errorf("failed to store metadata: %w", err)
+	if err := store.StoreContent(dirMetadata); err != nil {
+		return nil, err
 	}
 
-	// Store DAG data
-	if err := store.StoreData(dagNode.Hash, dagData); err != nil {
-		return fmt.Errorf("failed to store DAG data: %w", err)
-	}
-
-	fmt.Printf("✅ Folder added: %s\n", dagNode.Hash.String())
-	fmt.Printf("   Size: %d bytes\n", dagNode.Size)
-	fmt.Printf("   Name: %s\n", filepath.Base(path))
-	fmt.Printf("   Files: %d\n", len(dagNode.Links))
-
-	return nil
+	return &merkle.Link{
+		Name: name,
+		Hash: dirHash,
+		Size: totalSize,
+		Type: "directory",
+	}, nil
 }
 
-// getContent retrieves and displays content
+// getContent retrieves content from local storage or the network
 func getContent(hash hasher.Hash) error {
 	// First try to get from local storage
 	metadata, err := store.GetContent(hash)
 	if err == nil {
-		// Content found locally
-		data, err := store.GetData(hash)
-		if err == nil {
-			return displayContent(metadata, data, hash)
-		}
+		return displayContent(metadata, hash)
 	}
 
 	// Content not found locally, try DHT lookup if node is available
 	if node != nil {
 		log.Printf("Content not found locally, searching DHT...")
-		providers, err := node.FindContentProviders(hash.String())
-		if err != nil {
-			return fmt.Errorf("failed to find content providers: %w", err)
-		}
-
-		if len(providers) == 0 {
-			return fmt.Errorf("content not found: no providers available for hash %s", hash.String())
-		}
-
-		// Try to retrieve content from providers
-		for _, provider := range providers {
-			if provider.ID == node.ID() {
-				continue // Skip self
-			}
-			log.Printf("Attempting to retrieve content from provider: %s", provider.ID.String())
-			data, retrievedMetadata, err := node.RequestContentFromPeer(provider.ID, hash.String())
-			if err != nil {
-				log.Printf("Failed to retrieve from provider %s: %v", provider.ID.String(), err)
-				continue
-			}
-
-			// Store locally for future use
-			if err := store.StoreContent(retrievedMetadata); err != nil {
-				log.Printf("Warning: failed to store retrieved metadata: %v", err)
-			}
-
-			if err := store.StoreData(hash, data); err != nil {
-				log.Printf("Warning: failed to store retrieved data: %v", err)
-			}
-
-			log.Printf("Successfully retrieved and stored content from %s", provider.ID.String())
-			return displayContent(retrievedMetadata, data, hash)
-		}
-
-		return fmt.Errorf("failed to retrieve content from any provider")
+		// This part needs to be updated to fetch metadata and then chunks
+		return fmt.Errorf("fetching from network not yet implemented for CLI direct mode")
 	}
 
 	return fmt.Errorf("content not found: %w", err)
 }
 
 // displayContent displays content information and data
-func displayContent(metadata *storage.ContentMetadata, data []byte, hash hasher.Hash) error {
+func displayContent(metadata *storage.ContentMetadata, hash hasher.Hash) error {
 	if metadata.IsDirectory {
-		// Parse as DAG
-		dagNode, err := dag.Deserialize(data)
-		if err != nil {
-			return fmt.Errorf("failed to deserialize DAG: %w", err)
-		}
-
 		fmt.Printf("📁 Directory: %s\n", metadata.Filename)
 		fmt.Printf("   Hash: %s\n", hash.String())
 		fmt.Printf("   Size: %d bytes\n", metadata.Size)
 		fmt.Printf("   Files:\n")
 
-		for _, link := range dagNode.Links {
+		for _, link := range metadata.Links {
 			typeIcon := "📄"
-			if link.Type == dag.NodeTypeDirectory {
+			if link.Type == "directory" {
 				typeIcon = "📁"
 			}
 			fmt.Printf("     %s %s (%s, %d bytes)\n", typeIcon, link.Name, link.Hash.String()[:8], link.Size)
@@ -517,12 +547,6 @@ func displayContent(metadata *storage.ContentMetadata, data []byte, hash hasher.
 		fmt.Printf("   Hash: %s\n", hash.String())
 		fmt.Printf("   Size: %d bytes\n", metadata.Size)
 		fmt.Printf("   MIME: %s\n", metadata.MimeType)
-
-		// If it's a text file and small enough, show content
-		if isTextFile(metadata.MimeType) && len(data) < 1024 {
-			fmt.Printf("   Content:\n")
-			fmt.Printf("   %s\n", string(data))
-		}
 	}
 
 	return nil
@@ -544,8 +568,8 @@ func viewContent(hash hasher.Hash) error {
 	fmt.Printf("Reference Count: %d\n", metadata.RefCount)
 	fmt.Printf("Is Directory: %t\n", metadata.IsDirectory)
 
-	if metadata.ChunkCount > 0 {
-		fmt.Printf("Chunk Count: %d\n", metadata.ChunkCount)
+	if len(metadata.Chunks) > 0 {
+		fmt.Printf("Chunk Count: %d\n", len(metadata.Chunks))
 	}
 
 	return nil

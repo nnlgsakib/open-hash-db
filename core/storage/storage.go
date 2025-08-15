@@ -11,7 +11,9 @@ import (
 	"sync"
 	"time"
 
+	"openhashdb/core/chunker"
 	"openhashdb/core/hasher"
+	"openhashdb/core/merkle"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -44,16 +46,18 @@ const (
 
 // ContentMetadata represents metadata for stored content
 type ContentMetadata struct {
-	Hash        hasher.Hash `json:"hash"`         // Random hash used as the primary identifier
-	ContentHash hasher.Hash `json:"content_hash"` // Content-based hash for verification
+	Hash        hasher.Hash `json:"hash"` // Merkle Root
 	Filename    string      `json:"filename"`
 	MimeType    string      `json:"mime_type"`
 	Size        int64       `json:"size"`
 	ModTime     time.Time   `json:"mod_time"`
-	ChunkCount  int         `json:"chunk_count,omitempty"`
 	IsDirectory bool        `json:"is_directory"`
 	CreatedAt   time.Time   `json:"created_at"`
 	RefCount    int         `json:"ref_count"`
+	// For files:
+	Chunks []chunker.ChunkInfo `json:"chunks,omitempty"`
+	// For directories:
+	Links []merkle.Link `json:"links,omitempty"`
 }
 
 // ChunkMetadata represents metadata for a chunk
@@ -127,17 +131,57 @@ func (s *Storage) Close() error {
 	return nil
 }
 
-// ValidateContent checks if both metadata and data exist for a hash
+// ValidateContent checks if both metadata and all necessary data exist for a hash.
 func (s *Storage) ValidateContent(hash hasher.Hash) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if !s.HasContent(hash) {
-		return fmt.Errorf("content metadata not found for %s", hash.String())
+	// NOTE: The logic from GetContent and HasData is intentionally duplicated here
+	// to avoid a deadlock from acquiring the same read-lock twice.
+
+	// 1. Check for metadata
+	key := contentPrefix + hash.String()
+	data, err := s.db.Get([]byte(key), nil)
+	if err != nil {
+		if err == leveldb.ErrNotFound {
+			return fmt.Errorf("content metadata not found for %s", hash.String())
+		}
+		return fmt.Errorf("failed to get content metadata for %s: %w", hash.String(), err)
 	}
-	if !s.HasData(hash) {
+
+	var metadata ContentMetadata
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return fmt.Errorf("failed to unmarshal metadata for %s: %w", hash.String(), err)
+	}
+
+	// 2. Check for data
+	if metadata.IsDirectory {
+		// For directories, the metadata (list of links) is the content.
+		return nil
+	}
+
+	if len(metadata.Chunks) > 0 {
+		// It's a chunked file, so validate that all chunks exist.
+		for _, chunkInfo := range metadata.Chunks {
+			chunkPath := filepath.Join(s.dataPath, chunkInfo.Hash.String())
+			if _, err := os.Stat(chunkPath); os.IsNotExist(err) {
+				return fmt.Errorf("validation failed for %s: missing chunk %s", hash.String(), chunkInfo.Hash.String())
+			}
+		}
+		return nil
+	}
+
+	// It's a non-chunked file (e.g. empty file or a file replicated from another node).
+	// Validate that the single data file exists.
+	filePath := filepath.Join(s.dataPath, hash.String())
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		// An empty file (size 0) is valid even if the data file doesn't exist.
+		if metadata.Size == 0 {
+			return nil
+		}
 		return fmt.Errorf("content data not found for %s", hash.String())
 	}
+
 	return nil
 }
 
@@ -163,38 +207,9 @@ func (s *Storage) StoreContent(metadata *ContentMetadata) error {
 		return fmt.Errorf("failed to store content metadata for %s: %w", metadata.Hash.String(), err)
 	}
 
-	log.Printf("Stored content metadata for random hash %s with content hash %s", metadata.Hash.String(), metadata.ContentHash.String())
+	log.Printf("Stored content metadata for Merkle root %s", metadata.Hash.String())
 	storageOperationsTotal.WithLabelValues("store_content", "success").Inc()
 	return nil
-}
-
-// HasContentByHash checks if content with a specific content hash exists
-func (s *Storage) HasContentByHash(contentHash hasher.Hash) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	iter := s.db.NewIterator(nil, nil)
-	defer iter.Release()
-
-	prefix := []byte(contentPrefix)
-	for iter.Seek(prefix); iter.Valid() && bytes.HasPrefix(iter.Key(), prefix); iter.Next() {
-		var metadata ContentMetadata
-		if err := json.Unmarshal(iter.Value(), &metadata); err == nil {
-			if bytes.Equal(metadata.ContentHash[:], contentHash[:]) {
-				log.Printf("Found content metadata for content hash %s (random hash %s)", contentHash.String(), metadata.Hash.String())
-				storageOperationsTotal.WithLabelValues("has_content_by_hash", "success").Inc()
-				return true
-			}
-		}
-	}
-
-	if err := iter.Error(); err != nil {
-		log.Printf("Iterator error in HasContentByHash: %v", err)
-		storageOperationsTotal.WithLabelValues("has_content_by_hash", "error").Inc()
-	}
-	log.Printf("No content metadata found for content hash %s", contentHash.String())
-	storageOperationsTotal.WithLabelValues("has_content_by_hash", "not_found").Inc()
-	return false
 }
 
 // GetContent retrieves content metadata
@@ -222,7 +237,6 @@ func (s *Storage) GetContent(hash hasher.Hash) (*ContentMetadata, error) {
 		return nil, fmt.Errorf("failed to unmarshal metadata for %s: %w", hash.String(), err)
 	}
 
-	// log.Printf("Retrieved content metadata for %s (content hash %s)", hash.String(), metadata.ContentHash.String())
 	storageOperationsTotal.WithLabelValues("get_content", "success").Inc()
 	return &metadata, nil
 }
@@ -361,7 +375,7 @@ func (s *Storage) GetData(hash hasher.Hash) ([]byte, error) {
 		return nil, fmt.Errorf("failed to get data for %s: %w", hash.String(), err)
 	}
 
-	log.Printf("Retrieved data for %s from %s (%d bytes)", hash.String(), filePath, len(data))
+	// log.Printf("Retrieved data for %s from %s (%d bytes)", hash.String(), filePath, len(data))
 	storageOperationsTotal.WithLabelValues("get_data", "success").Inc()
 	return data, nil
 }

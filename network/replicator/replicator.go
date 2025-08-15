@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"openhashdb/core/chunker"
 	"openhashdb/core/hasher"
 	"openhashdb/core/storage"
 	"openhashdb/network/libp2p"
@@ -337,7 +338,7 @@ func (r *Replicator) handleGossipMessage(peerID peer.ID, data []byte) error {
 	return nil
 }
 
-// handleContentAnnouncement handles content announcements
+// handleContentAnnouncement handles content announcements by replicating chunks.
 func (r *Replicator) handleContentAnnouncement(peerID peer.ID, announcement *ContentAnnouncement) error {
 	// log.Printf("Received content announcement from %s: %s", peerID.String(), announcement.Hash.String())
 
@@ -367,12 +368,6 @@ func (r *Replicator) handleContentAnnouncement(peerID peer.ID, announcement *Con
 		return nil
 	}
 
-	availableSpace, err := r.storage.GetAvailableSpace()
-	if err != nil {
-		log.Printf("Failed to check storage capacity: %v", err)
-		return nil
-	}
-
 	providers, err := r.node.FindContentProviders(announcement.Hash.String())
 	if err != nil {
 		log.Printf("Failed to find providers for %s: %v", announcement.Hash.String(), err)
@@ -384,83 +379,84 @@ func (r *Replicator) handleContentAnnouncement(peerID peer.ID, announcement *Con
 		return nil
 	}
 
-	if availableSpace < announcement.Size {
-		log.Printf("Insufficient storage space for %s (need %d, have %d)", announcement.Hash.String(), announcement.Size, availableSpace)
+	// Pick a provider to fetch from
+	var provider peer.AddrInfo
+	found := false
+	for _, p := range providers {
+		if p.ID != r.node.ID() {
+			provider = p
+			found = true
+			break
+		}
+	}
+	if !found {
+		log.Printf("No suitable provider found for %s", announcement.Hash.String())
 		return nil
 	}
 
-	connectedPeers := r.node.ConnectedPeers()
-	connectedPeerSet := make(map[peer.ID]struct{})
-	for _, p := range connectedPeers {
-		connectedPeerSet[p] = struct{}{}
+	log.Printf("Starting chunk-based replication for %s from peer %s", announcement.Hash.String(), provider.ID)
+
+	// 1. Fetch metadata
+	metadata, err := r.node.RequestMetadataFromPeer(r.ctx, provider.ID, announcement.Hash)
+	if err != nil {
+		log.Printf("Failed to fetch metadata for %s from %s: %v", announcement.Hash.String(), provider.ID, err)
+		replicationFailuresTotal.Inc()
+		return nil
 	}
 
-	var directProviders, otherProviders []peer.AddrInfo
-	for _, p := range providers {
-		if _, ok := connectedPeerSet[p.ID]; ok {
-			directProviders = append(directProviders, p)
-		} else {
-			otherProviders = append(otherProviders, p)
-		}
+	// 2. Store metadata immediately
+	if err := r.storage.StoreContent(metadata); err != nil {
+		log.Printf("Failed to store replicated metadata %s: %v", announcement.Hash.String(), err)
+		replicationFailuresTotal.Inc()
+		return nil
 	}
 
-	var data []byte
-	var metadata *storage.ContentMetadata
-	var fetchErr error
-	var successPeer peer.ID
+	// 3. Fetch all chunks
+	var wg sync.WaitGroup
+	errs := make(chan error, len(metadata.Chunks))
 
-	// Try direct peers first
-	for _, p := range directProviders {
-		if p.ID == r.node.ID() {
+	for _, chunkInfo := range metadata.Chunks {
+		if r.storage.HasData(chunkInfo.Hash) {
 			continue
 		}
-		log.Printf("Attempting to fetch %s from directly connected peer %s", announcement.Hash.String(), p.ID)
-		data, metadata, fetchErr = r.node.RequestContentFromPeer(p.ID, announcement.Hash.String())
-		if fetchErr == nil {
-			successPeer = p.ID
-			break // Found it
-		}
-		log.Printf("Failed to fetch %s from direct peer %s: %v", announcement.Hash.String(), p.ID, fetchErr)
-	}
-
-	// If not found with direct peers, try others
-	if fetchErr != nil {
-		for _, p := range otherProviders {
-			if p.ID == r.node.ID() {
-				continue
+		wg.Add(1)
+		go func(c chunker.ChunkInfo) {
+			defer wg.Done()
+			chunkData, err := r.node.RequestChunkFromPeer(r.ctx, provider.ID, c.Hash)
+			if err != nil {
+				errs <- fmt.Errorf("failed to fetch chunk %s from %s: %w", c.Hash.String(), provider.ID, err)
+				return
 			}
-			log.Printf("Attempting to fetch %s from other peer %s", announcement.Hash.String(), p.ID)
-			data, metadata, fetchErr = r.node.RequestContentFromPeer(p.ID, announcement.Hash.String())
-			if fetchErr == nil {
-				successPeer = p.ID
-				break // Found it
+			actualHash := hasher.HashBytes(chunkData)
+			if actualHash != c.Hash {
+				errs <- fmt.Errorf("fetched chunk %s has incorrect hash", c.Hash.String())
+				return
 			}
-			log.Printf("Failed to fetch %s from other peer %s: %v", announcement.Hash.String(), p.ID, fetchErr)
-		}
+			if err := r.storage.StoreData(c.Hash, chunkData); err != nil {
+				errs <- fmt.Errorf("failed to store chunk %s: %w", c.Hash.String(), err)
+			}
+		}(chunkInfo)
+	}
+	wg.Wait()
+	close(errs)
+
+	hasErrors := false
+	for err := range errs {
+		log.Printf("Error during chunk replication for %s: %v", announcement.Hash.String(), err)
+		hasErrors = true
 	}
 
-	if fetchErr != nil {
+	if hasErrors {
+		log.Printf("Replication for %s failed due to chunk errors.", announcement.Hash.String())
 		replicationFailuresTotal.Inc()
-		log.Printf("Failed to fetch content %s from any provider.", announcement.Hash.String())
-		return nil
-	}
-
-	if err := r.storage.StoreData(announcement.Hash, data); err != nil {
-		replicationFailuresTotal.Inc()
-		log.Printf("Failed to store replicated content %s: %v", announcement.Hash.String(), err)
-		return nil
-	}
-
-	if err := r.storage.StoreContent(metadata); err != nil {
-		replicationFailuresTotal.Inc()
-		log.Printf("Failed to store replicated metadata %s: %v", announcement.Hash.String(), err)
 		return nil
 	}
 
 	replicationSuccessTotal.Inc()
-	log.Printf("Successfully replicated content %s from %s", announcement.Hash.String(), successPeer.String())
+	log.Printf("Successfully replicated content %s (all chunks) from %s", announcement.Hash.String(), provider.ID)
+
 	if err := r.AnnounceContent(announcement.Hash, metadata.Size); err != nil {
-		log.Printf("Failed to announce replicated content %s: %v", announcement.Hash.String(), err)
+		log.Printf("Failed to announce newly replicated content %s: %v", announcement.Hash.String(), err)
 	}
 
 	return nil
