@@ -1,6 +1,7 @@
 package rest
 
 import (
+	"archive/zip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -53,16 +54,16 @@ type ErrorResponse struct {
 
 // ContentInfo represents content information
 type ContentInfo struct {
-	Hash        string        `json:"hash"`
-	Filename    string        `json:"filename"`
-	MimeType    string        `json:"mime_type"`
-	Size        int64         `json:"size"`
-	ModTime     time.Time     `json:"mod_time"`
-	IsDirectory bool          `json:"is_directory"`
-	CreatedAt   time.Time     `json:"created_at"`
-	RefCount    int           `json:"ref_count"`
+	Hash        string              `json:"hash"`
+	Filename    string              `json:"filename"`
+	MimeType    string              `json:"mime_type"`
+	Size        int64               `json:"size"`
+	ModTime     time.Time           `json:"mod_time"`
+	IsDirectory bool                `json:"is_directory"`
+	CreatedAt   time.Time           `json:"created_at"`
+	RefCount    int                 `json:"ref_count"`
 	Chunks      []chunker.ChunkInfo `json:"chunks,omitempty"`
-	Links       []merkle.Link `json:"links,omitempty"`
+	Links       []merkle.Link       `json:"links,omitempty"`
 }
 
 // NewServer creates a new REST API server
@@ -196,7 +197,8 @@ func (s *Server) uploadFolder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var folderName string
+	var firstPartName string
+	var hasFiles bool
 
 	for {
 		part, err := reader.NextPart()
@@ -211,17 +213,12 @@ func (s *Server) uploadFolder(w http.ResponseWriter, r *http.Request) {
 		if part.FileName() == "" {
 			continue
 		}
-
-		filePath := filepath.Join(tempDir, part.FileName())
-
-		if folderName == "" {
-			parts := strings.Split(part.FileName(), "/")
-			if len(parts) > 1 {
-				folderName = parts[0]
-			} else {
-				folderName = "upload"
-			}
+		hasFiles = true
+		if firstPartName == "" {
+			firstPartName = part.FileName()
 		}
+
+		filePath := filepath.Join(tempDir, filepath.FromSlash(part.FileName()))
 
 		if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
 			s.writeError(w, http.StatusInternalServerError, "Failed to create directory structure", err)
@@ -242,12 +239,23 @@ func (s *Server) uploadFolder(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if folderName == "" {
+	if !hasFiles {
 		s.writeError(w, http.StatusBadRequest, "No files provided for folder upload", nil)
 		return
 	}
 
-	rootPath := filepath.Join(tempDir, folderName)
+	var rootPath string
+	var folderName string
+
+	parts := strings.Split(firstPartName, "/")
+	if len(parts) > 1 {
+		folderName = parts[0]
+		rootPath = filepath.Join(tempDir, folderName)
+	} else {
+		folderName = "upload"
+		rootPath = tempDir
+	}
+
 	link, err := s.storeUploadedDirectory(rootPath, folderName)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to store directory", err)
@@ -286,16 +294,88 @@ func (s *Server) downloadContent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if metadata.IsDirectory {
-		s.writeJSON(w, http.StatusOK, metadata.Links)
+		s.streamDirectoryAsZip(w, r, metadata)
 		return
 	}
 
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\" %s \"", metadata.Filename))
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", metadata.Filename))
 	w.Header().Set("Content-Type", metadata.MimeType)
 	w.Header().Set("Content-Length", strconv.FormatInt(metadata.Size, 10))
-	w.WriteHeader(http.StatusOK)
 
 	s.streamChunks(w, r, metadata)
+}
+
+func (s *Server) streamDirectoryAsZip(w http.ResponseWriter, r *http.Request, metadata *storage.ContentMetadata) {
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s.zip\"", metadata.Filename))
+
+	zipWriter := zip.NewWriter(w)
+	defer zipWriter.Close()
+
+	err := s.addDirectoryToZip(r.Context(), zipWriter, metadata.Links, "")
+	if err != nil {
+		log.Printf("Error creating zip archive for %s: %v", metadata.Hash.String(), err)
+		// We can't write a proper error response if headers have been sent.
+	}
+}
+
+func (s *Server) addDirectoryToZip(ctx context.Context, zipWriter *zip.Writer, links []merkle.Link, basePath string) error {
+	for _, link := range links {
+		pathInZip := link.Name
+		if basePath != "" {
+			pathInZip = basePath + "/" + link.Name
+		}
+
+		if link.Type == "directory" {
+			dirMetadata, err := s.storage.GetContent(link.Hash)
+			if err != nil {
+				return fmt.Errorf("could not get metadata for subdirectory %s (%s): %w", link.Name, link.Hash.String(), err)
+			}
+
+			header := &zip.FileHeader{
+				Name:     pathInZip + "/",
+				Modified: dirMetadata.ModTime,
+			}
+			header.SetMode(os.ModeDir | 0755)
+
+			_, err = zipWriter.CreateHeader(header)
+			if err != nil {
+				return fmt.Errorf("failed to create directory header in zip for %s: %w", pathInZip, err)
+			}
+
+			if err := s.addDirectoryToZip(ctx, zipWriter, dirMetadata.Links, pathInZip); err != nil {
+				return err
+			}
+		} else { // "file"
+			fileMetadata, err := s.storage.GetContent(link.Hash)
+			if err != nil {
+				return fmt.Errorf("could not get metadata for file %s (%s): %w", link.Name, link.Hash.String(), err)
+			}
+
+			header := &zip.FileHeader{
+				Name:     pathInZip,
+				Modified: fileMetadata.ModTime,
+				Method:   zip.Deflate,
+			}
+			header.SetMode(0644)
+
+			fileWriter, err := zipWriter.CreateHeader(header)
+			if err != nil {
+				return fmt.Errorf("failed to create file in zip for %s: %w", pathInZip, err)
+			}
+
+			for _, chunkInfo := range fileMetadata.Chunks {
+				data, err := s.getChunkData(ctx, chunkInfo.Hash)
+				if err != nil {
+					return fmt.Errorf("could not get chunk %s for file %s: %w", chunkInfo.Hash.String(), pathInZip, err)
+				}
+				if _, err = fileWriter.Write(data); err != nil {
+					return fmt.Errorf("failed to write chunk data to zip for file %s: %w", pathInZip, err)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // viewContent handles content viewing.
@@ -316,7 +396,7 @@ func (s *Server) viewContent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if metadata.IsDirectory {
-		s.showDirectoryListing(w, metadata)
+		s.showDirectoryListing(w, r, metadata)
 		return
 	}
 
@@ -328,7 +408,6 @@ func (s *Server) viewContent(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", "inline")
 	w.Header().Set("Content-Type", metadata.MimeType)
 	w.Header().Set("Content-Length", strconv.FormatInt(metadata.Size, 10))
-	w.WriteHeader(http.StatusOK)
 
 	s.streamChunks(w, r, metadata)
 }
@@ -350,13 +429,23 @@ func (s *Server) streamChunks(w http.ResponseWriter, r *http.Request, metadata *
 		}
 
 		if _, err := w.Write(data); err != nil {
-			log.Printf("Error writing chunk %d to response for content %s: %v", i, metadata.Hash.String(), err)
-			// This likely means the client has closed the connection.
+			// Check if the error is due to the client closing the connection.
+			// This is a common occurrence and not necessarily a server error.
+			if strings.Contains(err.Error(), "forcibly closed by the remote host") ||
+				strings.Contains(err.Error(), "broken pipe") ||
+				strings.Contains(err.Error(), "connection reset by peer") {
+				log.Printf("Client closed connection while streaming %s. Download aborted.", metadata.Hash.String())
+			} else {
+				log.Printf("Error writing chunk %d to response for content %s: %v", i, metadata.Hash.String(), err)
+			}
+			// Stop streaming if we can't write to the client.
 			return
 		}
 
 		// Flush the data to the client after each chunk.
-		flusher.Flush()
+		if flusher != nil {
+			flusher.Flush()
+		}
 	}
 }
 
@@ -391,8 +480,7 @@ func (s *Server) showDownloadPage(w http.ResponseWriter, hashStr, filename strin
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w,
-		`
-		<!DOCTYPE html>
+		`<!DOCTYPE html>
 		<html>
 		<head>
 			<title>OpenHashDB - Content View</title>
@@ -412,13 +500,75 @@ func (s *Server) showDownloadPage(w http.ResponseWriter, hashStr, filename strin
 				<a href="/download/%s" download="%s" class="button">Download File</a>
 			</div>
 		</body>
-		</html>
-	`,
-	hashStr, filename, hashStr, filename)
+		</html>`,
+		hashStr, filename, hashStr, filename)
 }
 
-func (s *Server) showDirectoryListing(w http.ResponseWriter, metadata *storage.ContentMetadata) {
-	s.writeJSON(w, http.StatusOK, metadata.Links)
+func (s *Server) showDirectoryListing(w http.ResponseWriter, r *http.Request, metadata *storage.ContentMetadata) {
+	if strings.Contains(r.Header.Get("Accept"), "application/json") {
+		s.writeJSON(w, http.StatusOK, metadata.Links)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+
+	var html strings.Builder
+	html.WriteString(fmt.Sprintf(`
+		<!DOCTYPE html>
+		<html>
+		<head>
+			<title>Directory Listing: %s</title>
+			<style>
+				body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 20px; color: #333; }
+				h2 { border-bottom: 1px solid #ccc; padding-bottom: 10px; }
+				a { color: #007bff; text-decoration: none; }
+				a:hover { text-decoration: underline; }
+				table { border-collapse: collapse; width: 100%%; margin-top: 20px; }
+				th, td { text-align: left; padding: 8px; border-bottom: 1px solid #ddd; }
+				th { background-color: #f2f2f2; }
+				.download-all { display: inline-block; margin-bottom: 20px; padding: 10px 20px; background-color: #28a745; color: white; border-radius: 5px; font-weight: bold; }
+				.download-all:hover { background-color: #218838; }
+			</style>
+		</head>
+		<body>
+			<h2>Directory: %s</h2>
+			<a href="/download/%s" class="download-all">Download All as .zip</a>
+			<table>
+				<tr>
+					<th>Type</th>
+					<th>Name</th>
+					<th>Size</th>
+					<th>Hash</th>
+				</tr>
+	`, metadata.Filename, metadata.Filename, metadata.Hash.String()))
+
+	for _, link := range metadata.Links {
+		var linkHref, nameDisplay string
+		if link.Type == "directory" {
+			linkHref = fmt.Sprintf("/view/%s", link.Hash.String())
+			nameDisplay = link.Name + "/"
+		} else {
+			linkHref = fmt.Sprintf("/download/%s", link.Hash.String())
+			nameDisplay = link.Name
+		}
+		html.WriteString(fmt.Sprintf(`
+			<tr>
+				<td>%s</td>
+				<td><a href="%s" title="%s">%s</a></td>
+				<td>%d bytes</td>
+				<td><a href="/info/%s" title="View details of %s">%s...</a></td>
+			</tr>
+		`, link.Type, linkHref, link.Name, nameDisplay, link.Size, link.Hash.String(), link.Name, link.Hash.String()[:16]))
+	}
+
+	html.WriteString(`
+			</table>
+		</body>
+		</html>
+	`)
+
+	fmt.Fprint(w, html.String())
 }
 
 // getContentInfo returns information about content
