@@ -66,9 +66,15 @@ type Blockstore struct {
 	mu       sync.RWMutex
 }
 
-// NewBlockstore creates a new blockstore instance.
-func NewBlockstore(dbPath string) (*Blockstore, error) {
-	db, err := leveldb.OpenFile(dbPath, &opt.Options{
+// NewBlockstore creates a new blockstore instance at the given root path.
+func NewBlockstore(rootPath string) (*Blockstore, error) {
+	// Ensure the root directory exists
+	if err := os.MkdirAll(rootPath, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create database root directory %s: %w", rootPath, err)
+	}
+
+	leveldbPath := filepath.Join(rootPath, "leveldb")
+	db, err := leveldb.OpenFile(leveldbPath, &opt.Options{
 		WriteBuffer:            64 * 1024 * 1024,
 		CompactionTableSize:    8 * 1024 * 1024,
 		CompactionTotalSize:    64 * 1024 * 1024,
@@ -76,10 +82,10 @@ func NewBlockstore(dbPath string) (*Blockstore, error) {
 	})
 	if err != nil {
 		blockstoreOperationsTotal.WithLabelValues("open_db", "error").Inc()
-		return nil, fmt.Errorf("failed to open database at %s: %w", dbPath, err)
+		return nil, fmt.Errorf("failed to open database at %s: %w", leveldbPath, err)
 	}
 
-	dataPath := filepath.Join(filepath.Dir(dbPath), "blocks") // Changed from "data"
+	dataPath := filepath.Join(rootPath, "blocks")
 	if err := os.MkdirAll(dataPath, 0755); err != nil {
 		blockstoreOperationsTotal.WithLabelValues("mkdir", "error").Inc()
 		return nil, fmt.Errorf("failed to create blocks directory %s: %w", dataPath, err)

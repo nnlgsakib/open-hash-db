@@ -243,7 +243,7 @@ var daemonCmd = &cobra.Command{
 
 func init() {
 	// Global flags
-	rootCmd.PersistentFlags().StringVar(&dbPath, "db", "./openhash.db", "Database path")
+	rootCmd.PersistentFlags().StringVar(&dbPath, "db", "./.openhashdb", "Database root path")
 	rootCmd.PersistentFlags().StringVar(&keyPath, "key-path", "", "Path to the node's private key file (defaults to <db-path>/peer.key)")
 	rootCmd.PersistentFlags().IntVar(&apiPort, "api-port", 8080, "REST API port")
 	rootCmd.PersistentFlags().IntVar(&p2pPort, "p2p-port", 0, "P2P port (0 for random)")
