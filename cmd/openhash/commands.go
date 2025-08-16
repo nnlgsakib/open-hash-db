@@ -253,7 +253,7 @@ func init() {
 
 	// Command-specific flags
 
-daemonCmd.Flags().Bool("enable-rest", true, "Enable REST API")
+	daemonCmd.Flags().Bool("enable-rest", true, "Enable REST API")
 
 	// Add commands
 	rootCmd.AddCommand(addCmd)
@@ -347,7 +347,7 @@ func addFile(path string) error {
 	}
 	defer file.Close()
 
-	c := chunker.NewChunker(chunker.ChunkSize256KB)
+	c := chunker.NewChunker()
 	merkleFile, chunks, err := merkle.BuildFileTree(file, c)
 	if err != nil {
 		return fmt.Errorf("failed to build merkle tree: %w", err)
@@ -416,7 +416,7 @@ func storeDirectoryRecursive(path string, name string) (*merkle.Link, error) {
 	}
 
 	var links []merkle.Link
-	c := chunker.NewChunker(chunker.ChunkSize256KB)
+	c := chunker.NewChunker()
 
 	for _, entry := range entries {
 		entryPath := filepath.Join(path, entry.Name())

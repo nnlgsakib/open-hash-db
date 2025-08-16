@@ -57,16 +57,16 @@ type ErrorResponse struct {
 
 // ContentInfo represents content information
 type ContentInfo struct {
-	Hash        string                `json:"hash"`
-	Filename    string                `json:"filename"`
-	MimeType    string                `json:"mime_type"`
-	Size        int64                 `json:"size"`
-	ModTime     time.Time             `json:"mod_time"`
-	IsDirectory bool                  `json:"is_directory"`
-	CreatedAt   time.Time             `json:"created_at"`
-	RefCount    int                   `json:"ref_count"`
-	Chunks      []chunker.ChunkInfo   `json:"chunks,omitempty"`
-	Links       []merkle.Link         `json:"links,omitempty"`
+	Hash        string              `json:"hash"`
+	Filename    string              `json:"filename"`
+	MimeType    string              `json:"mime_type"`
+	Size        int64               `json:"size"`
+	ModTime     time.Time           `json:"mod_time"`
+	IsDirectory bool                `json:"is_directory"`
+	CreatedAt   time.Time           `json:"created_at"`
+	RefCount    int                 `json:"ref_count"`
+	Chunks      []chunker.ChunkInfo `json:"chunks,omitempty"`
+	Links       []merkle.Link       `json:"links,omitempty"`
 }
 
 // NewServer creates a new REST API server
@@ -74,7 +74,7 @@ func NewServer(bs *blockstore.Blockstore, replicator *replicator.Replicator, nod
 	s := &Server{
 		storage:    bs,
 		replicator: replicator,
-		chunker:    chunker.NewChunker(chunker.ChunkSize256KB),
+		chunker:    chunker.NewChunker(),
 		node:       node,
 		router:     mux.NewRouter(),
 	}

@@ -11,8 +11,13 @@ import (
 type ChunkSize int
 
 const (
-	ChunkSize256KB ChunkSize = 256 * 1024  // 256KB for general content
-	ChunkSize1MB   ChunkSize = 1024 * 1024 // 1MB for large media files
+	ChunkSize64KB   ChunkSize = 64 * 1024         // 64KB for small files (<1MB)
+	ChunkSize256KB  ChunkSize = 256 * 1024        // 256KB for general content (1MB - 100MB)
+	ChunkSize1MB    ChunkSize = 1 * 1024 * 1024   // 1MB for large files (100MB - 1GB)
+	ChunkSize4MB    ChunkSize = 4 * 1024 * 1024   // 4MB for very large files (1GB - 10GB)
+	ChunkSize16MB   ChunkSize = 16 * 1024 * 1024  // 16MB for huge files (10GB - 100GB)
+	ChunkSize64MB   ChunkSize = 64 * 1024 * 1024  // 64MB for massive files (100GB - 1TB)
+	ChunkSize256MB  ChunkSize = 256 * 1024 * 1024 // 256MB for gigantic files (>1TB)
 )
 
 // Chunk represents a single chunk of data
@@ -36,15 +41,42 @@ type ChunkedFile struct {
 }
 
 // Chunker handles file chunking operations
-type Chunker struct {
-	chunkSize int
+type Chunker struct{}
+
+// NewChunker creates a new chunker
+func NewChunker() *Chunker {
+	return &Chunker{}
 }
 
-// NewChunker creates a new chunker with specified chunk size
-func NewChunker(size ChunkSize) *Chunker {
-	return &Chunker{
-		chunkSize: int(size),
+// calculateDynamicChunkSize determines the optimal chunk size based on the total data size.
+func calculateDynamicChunkSize(dataSize int64) int {
+	const (
+		_   = iota
+		KB int64 = 1 << (10 * iota)
+		MB
+		GB
+		TB
+	)
+
+	if dataSize < 1*MB {
+		return int(ChunkSize64KB)
 	}
+	if dataSize < 100*MB {
+		return int(ChunkSize256KB)
+	}
+	if dataSize < 1*GB {
+		return int(ChunkSize1MB)
+	}
+	if dataSize < 10*GB {
+		return int(ChunkSize4MB)
+	}
+	if dataSize < 100*GB {
+		return int(ChunkSize16MB)
+	}
+	if dataSize < 1*TB {
+		return int(ChunkSize64MB)
+	}
+	return int(ChunkSize256MB)
 }
 
 // ChunkBytes splits byte slice into chunks
@@ -53,15 +85,16 @@ func (c *Chunker) ChunkBytes(data []byte) ([]Chunk, error) {
 		return nil, fmt.Errorf("cannot chunk empty data")
 	}
 
+	chunkSize := calculateDynamicChunkSize(int64(len(data)))
 	var chunks []Chunk
 	offset := 0
-	
+
 	for offset < len(data) {
-		end := offset + c.chunkSize
+		end := offset + chunkSize
 		if end > len(data) {
 			end = len(data)
 		}
-		
+
 		chunkData := data[offset:end]
 		chunk := Chunk{
 			Hash: hasher.HashBytes(chunkData),
@@ -69,19 +102,36 @@ func (c *Chunker) ChunkBytes(data []byte) ([]Chunk, error) {
 			Size: len(chunkData),
 		}
 		copy(chunk.Data, chunkData)
-		
+
 		chunks = append(chunks, chunk)
 		offset = end
 	}
-	
+
 	return chunks, nil
 }
 
 // ChunkReader splits data from reader into chunks
 func (c *Chunker) ChunkReader(r io.Reader) ([]Chunk, error) {
+	var chunkSize int
+
+	// Try to determine reader size for dynamic chunking
+	if seeker, ok := r.(io.Seeker); ok {
+		size, err := seeker.Seek(0, io.SeekEnd)
+		if err != nil {
+			return nil, fmt.Errorf("failed to seek reader end: %w", err)
+		}
+		if _, err := seeker.Seek(0, io.SeekStart); err != nil {
+			return nil, fmt.Errorf("failed to rewind reader: %w", err)
+		}
+		chunkSize = calculateDynamicChunkSize(size)
+	} else {
+		// Default chunk size for streams of unknown length
+		chunkSize = int(ChunkSize256KB)
+	}
+
 	var chunks []Chunk
-	buffer := make([]byte, c.chunkSize)
-	
+	buffer := make([]byte, chunkSize)
+
 	for {
 		n, err := r.Read(buffer)
 		if n == 0 {
@@ -92,18 +142,18 @@ func (c *Chunker) ChunkReader(r io.Reader) ([]Chunk, error) {
 				return nil, fmt.Errorf("failed to read chunk: %w", err)
 			}
 		}
-		
+
 		chunkData := make([]byte, n)
 		copy(chunkData, buffer[:n])
-		
+
 		chunk := Chunk{
 			Hash: hasher.HashBytes(chunkData),
 			Data: chunkData,
 			Size: n,
 		}
-		
+
 		chunks = append(chunks, chunk)
-		
+
 		if err == io.EOF {
 			break
 		}
@@ -111,7 +161,7 @@ func (c *Chunker) ChunkReader(r io.Reader) ([]Chunk, error) {
 			return nil, fmt.Errorf("failed to read chunk: %w", err)
 		}
 	}
-	
+
 	return chunks, nil
 }
 
@@ -229,7 +279,7 @@ func VerifyChunkedFile(chunkedFile *ChunkedFile, chunks []Chunk) error {
 	}
 	
 	// Verify Merkle root
-	chunker := NewChunker(ChunkSize256KB) // Size doesn't matter for verification
+	chunker := NewChunker() // Size doesn't matter for verification
 	rootHash := chunker.computeMerkleRoot(hashes)
 	if rootHash != chunkedFile.RootHash {
 		return fmt.Errorf("Merkle root hash mismatch")
