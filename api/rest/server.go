@@ -8,27 +8,30 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"openhashdb/core/chunker"
-	"openhashdb/core/hasher"
-	"openhashdb/core/merkle"
-	"openhashdb/core/storage"
-	"openhashdb/core/utils"
-	"openhashdb/network/libp2p"
-	"openhashdb/network/replicator"
-	"openhashdb/network/streammanager"
-	"openhashdb/openhashdb-ui"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	"openhashdb/core/block"
+	"openhashdb/core/blockstore"
+	"openhashdb/core/chunker"
+	"openhashdb/core/hasher"
+	"openhashdb/core/merkle"
+	"openhashdb/core/utils"
+	"openhashdb/network/bitswap"
+	"openhashdb/network/libp2p"
+	"openhashdb/network/replicator"
+	"openhashdb/network/streammanager"
+	"openhashdb/openhashdb-ui"
+
 	"github.com/gorilla/mux"
 )
 
 // Server represents the REST API server
 type Server struct {
-	storage    *storage.Storage
+	storage    *blockstore.Blockstore
 	replicator *replicator.Replicator
 	streamer   *streammanager.StreamManager
 	chunker    *chunker.Chunker
@@ -54,22 +57,22 @@ type ErrorResponse struct {
 
 // ContentInfo represents content information
 type ContentInfo struct {
-	Hash        string              `json:"hash"`
-	Filename    string              `json:"filename"`
-	MimeType    string              `json:"mime_type"`
-	Size        int64               `json:"size"`
-	ModTime     time.Time           `json:"mod_time"`
-	IsDirectory bool                `json:"is_directory"`
-	CreatedAt   time.Time           `json:"created_at"`
-	RefCount    int                 `json:"ref_count"`
-	Chunks      []chunker.ChunkInfo `json:"chunks,omitempty"`
-	Links       []merkle.Link       `json:"links,omitempty"`
+	Hash        string                `json:"hash"`
+	Filename    string                `json:"filename"`
+	MimeType    string                `json:"mime_type"`
+	Size        int64                 `json:"size"`
+	ModTime     time.Time             `json:"mod_time"`
+	IsDirectory bool                  `json:"is_directory"`
+	CreatedAt   time.Time             `json:"created_at"`
+	RefCount    int                   `json:"ref_count"`
+	Chunks      []chunker.ChunkInfo   `json:"chunks,omitempty"`
+	Links       []merkle.Link         `json:"links,omitempty"`
 }
 
 // NewServer creates a new REST API server
-func NewServer(storage *storage.Storage, replicator *replicator.Replicator, node interface{}) *Server {
+func NewServer(bs *blockstore.Blockstore, replicator *replicator.Replicator, node interface{}) *Server {
 	s := &Server{
-		storage:    storage,
+		storage:    bs,
 		replicator: replicator,
 		chunker:    chunker.NewChunker(chunker.ChunkSize256KB),
 		node:       node,
@@ -77,7 +80,7 @@ func NewServer(storage *storage.Storage, replicator *replicator.Replicator, node
 	}
 
 	if libp2pNode, ok := node.(*libp2p.Node); ok {
-		s.streamer = streammanager.NewStreamManager(libp2pNode, storage)
+		s.streamer = streammanager.NewStreamManager(libp2pNode)
 	}
 
 	s.setupRoutes()
@@ -289,8 +292,18 @@ func (s *Server) downloadContent(w http.ResponseWriter, r *http.Request) {
 
 	metadata, err := s.storage.GetContent(hash)
 	if err != nil {
-		s.writeError(w, http.StatusNotFound, "Content not found locally", err)
-		return
+		// If not found locally, try to fetch from the network
+		log.Printf("Content %s not found locally, attempting to fetch from network...", hashStr)
+		if err := s.replicator.FetchAndStore(hash); err != nil {
+			s.writeError(w, http.StatusNotFound, "Content not found on the network", err)
+			return
+		}
+		// Try getting content again after fetching
+		metadata, err = s.storage.GetContent(hash)
+		if err != nil {
+			s.writeError(w, http.StatusInternalServerError, "Failed to get content after fetching", err)
+			return
+		}
 	}
 
 	if metadata.IsDirectory {
@@ -305,7 +318,7 @@ func (s *Server) downloadContent(w http.ResponseWriter, r *http.Request) {
 	s.streamChunks(w, r, metadata)
 }
 
-func (s *Server) streamDirectoryAsZip(w http.ResponseWriter, r *http.Request, metadata *storage.ContentMetadata) {
+func (s *Server) streamDirectoryAsZip(w http.ResponseWriter, r *http.Request, metadata *blockstore.ContentMetadata) {
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s.zip\"", metadata.Filename))
 
@@ -391,8 +404,18 @@ func (s *Server) viewContent(w http.ResponseWriter, r *http.Request) {
 
 	metadata, err := s.storage.GetContent(hash)
 	if err != nil {
-		s.writeError(w, http.StatusNotFound, "Content not found", err)
-		return
+		// If not found locally, try to fetch from the network
+		log.Printf("Content %s not found locally, attempting to fetch from network...", hashStr)
+		if err := s.replicator.FetchAndStore(hash); err != nil {
+			s.writeError(w, http.StatusNotFound, "Content not found on the network", err)
+			return
+		}
+		// Try getting content again after fetching
+		metadata, err = s.storage.GetContent(hash)
+		if err != nil {
+			s.writeError(w, http.StatusInternalServerError, "Failed to get content after fetching", err)
+			return
+		}
 	}
 
 	if metadata.IsDirectory {
@@ -412,7 +435,7 @@ func (s *Server) viewContent(w http.ResponseWriter, r *http.Request) {
 	s.streamChunks(w, r, metadata)
 }
 
-func (s *Server) streamChunks(w http.ResponseWriter, r *http.Request, metadata *storage.ContentMetadata) {
+func (s *Server) streamChunks(w http.ResponseWriter, r *http.Request, metadata *blockstore.ContentMetadata) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "Streaming unsupported!", http.StatusInternalServerError)
@@ -451,10 +474,28 @@ func (s *Server) streamChunks(w http.ResponseWriter, r *http.Request, metadata *
 
 // getChunkData retrieves chunk data, fetching from network if necessary.
 func (s *Server) getChunkData(ctx context.Context, chunkHash hasher.Hash) ([]byte, error) {
-	if s.storage.HasData(chunkHash) {
-		return s.storage.GetData(chunkHash)
+	has, err := s.storage.Has(chunkHash)
+	if err != nil {
+		return nil, fmt.Errorf("error checking blockstore for chunk %s: %w", chunkHash, err)
 	}
-	return s.replicator.RequestChunk(chunkHash)
+	if has {
+		blk, err := s.storage.Get(chunkHash)
+		if err != nil {
+			return nil, err
+		}
+		return blk.RawData(), nil
+	}
+
+	// Use bitswap to get the block
+	if bitswapNode, ok := s.node.(interface{ GetBitswap() *bitswap.Engine }); ok {
+		blk, err := bitswapNode.GetBitswap().GetBlock(ctx, chunkHash)
+		if err != nil {
+			return nil, err
+		}
+		return blk.RawData(), nil
+	}
+
+	return nil, fmt.Errorf("node does not support bitswap")
 }
 
 // isMimeTypeRenderable checks if a MIME type can be displayed directly by most browsers.
@@ -485,7 +526,7 @@ func (s *Server) showDownloadPage(w http.ResponseWriter, hashStr, filename strin
 		<head>
 			<title>OpenHashDB - Content View</title>
 			<style>
-				body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; text-align: center; margin-top: 50px; color: #333; }
+				body { font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, Helvetica, Arial, sans-serif; text-align: center; margin-top: 50px; color: #333; }
 				.container { max-width: 600px; margin: auto; padding: 20px; }
 				strong { color: #0056b3; }
 				a.button { display: inline-block; margin-top: 20px; padding: 12px 24px; background-color: #007bff; color: white; text-decoration: none; border-radius: 5px; font-weight: bold; }
@@ -504,7 +545,7 @@ func (s *Server) showDownloadPage(w http.ResponseWriter, hashStr, filename strin
 		hashStr, filename, hashStr, filename)
 }
 
-func (s *Server) showDirectoryListing(w http.ResponseWriter, r *http.Request, metadata *storage.ContentMetadata) {
+func (s *Server) showDirectoryListing(w http.ResponseWriter, r *http.Request, metadata *blockstore.ContentMetadata) {
 	if strings.Contains(r.Header.Get("Accept"), "application/json") {
 		s.writeJSON(w, http.StatusOK, metadata.Links)
 		return
@@ -520,7 +561,7 @@ func (s *Server) showDirectoryListing(w http.ResponseWriter, r *http.Request, me
 		<head>
 			<title>Directory Listing: %s</title>
 			<style>
-				body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 20px; color: #333; }
+				body { font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, Helvetica, Arial, sans-serif; margin: 20px; color: #333; }
 				h2 { border-bottom: 1px solid #ccc; padding-bottom: 10px; }
 				a { color: #007bff; text-decoration: none; }
 				a:hover { text-decoration: underline; }
@@ -562,7 +603,8 @@ func (s *Server) showDirectoryListing(w http.ResponseWriter, r *http.Request, me
 		`, link.Type, linkHref, link.Name, nameDisplay, link.Size, link.Hash.String(), link.Name, link.Hash.String()[:16]))
 	}
 
-	html.WriteString(`
+	html.WriteString(
+		`
 			</table>
 		</body>
 		</html>
@@ -637,11 +679,12 @@ func (s *Server) listContent(w http.ResponseWriter, r *http.Request) {
 
 // getStats returns system statistics
 func (s *Server) getStats(w http.ResponseWriter, r *http.Request) {
-	storageStats, err := s.storage.GetStats()
+	content, err := s.storage.ListContent()
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to get storage stats", err)
 		return
 	}
+	storageStats := map[string]interface{}{"content_count": len(content)}
 
 	replicationStats := s.replicator.GetStats()
 
@@ -726,14 +769,14 @@ func (s *Server) storeUploadedFile(filename string, reader io.Reader) (hasher.Ha
 	}
 
 	for _, chunk := range chunks {
-		if !s.storage.HasData(chunk.Hash) {
-			if err := s.storage.StoreData(chunk.Hash, chunk.Data); err != nil {
+		if has, _ := s.storage.Has(chunk.Hash); !has {
+			if err := s.storage.Put(block.NewBlock(chunk.Data)); err != nil {
 				return hasher.Hash{}, 0, fmt.Errorf("failed to store chunk %s: %w", chunk.Hash.String(), err)
 			}
 		}
 	}
 
-	metadata := &storage.ContentMetadata{
+	metadata := &blockstore.ContentMetadata{
 		Hash:        merkleFile.Root,
 		Filename:    filename,
 		MimeType:    utils.GetMimeType(filename),
@@ -743,6 +786,15 @@ func (s *Server) storeUploadedFile(filename string, reader io.Reader) (hasher.Ha
 		CreatedAt:   time.Now(),
 		RefCount:    1,
 		Chunks:      merkleFile.Chunks,
+	}
+
+	// Store the metadata itself as a block
+	metaBytes, err := json.Marshal(metadata)
+	if err != nil {
+		return hasher.Hash{}, 0, fmt.Errorf("failed to marshal metadata: %w", err)
+	}
+	if err := s.storage.Put(block.NewBlockWithHash(metadata.Hash, metaBytes)); err != nil {
+		return hasher.Hash{}, 0, fmt.Errorf("failed to store metadata block: %w", err)
 	}
 
 	if err := s.storage.StoreContent(metadata); err != nil {
@@ -802,7 +854,7 @@ func (s *Server) storeUploadedDirectory(path string, name string) (*merkle.Link,
 		totalSize += l.Size
 	}
 
-	dirMetadata := &storage.ContentMetadata{
+	dirMetadata := &blockstore.ContentMetadata{
 		Hash:        dirHash,
 		Filename:    name,
 		MimeType:    "inode/directory",
@@ -812,6 +864,15 @@ func (s *Server) storeUploadedDirectory(path string, name string) (*merkle.Link,
 		CreatedAt:   time.Now(),
 		RefCount:    1,
 		Links:       links,
+	}
+
+	// Store the metadata itself as a block
+	metaBytes, err := json.Marshal(dirMetadata)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal directory metadata: %w", err)
+	}
+	if err := s.storage.Put(block.NewBlockWithHash(dirMetadata.Hash, metaBytes)); err != nil {
+		return nil, fmt.Errorf("failed to store directory metadata block: %w", err)
 	}
 
 	if err := s.storage.StoreContent(dirMetadata); err != nil {

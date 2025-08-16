@@ -1,22 +1,19 @@
 package libp2p
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/binary"
-	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
 
+	"openhashdb/core/blockstore"
 	"openhashdb/core/hasher"
-	"openhashdb/core/storage"
+	"openhashdb/network/bitswap"
 
 	"github.com/ipfs/go-cid"
 	"github.com/libp2p/go-libp2p"
@@ -36,62 +33,13 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/multiformats/go-multihash"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
-)
-
-// Metrics
-var (
-	networkMessagesTotal = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "openhashdb_network_messages_total",
-			Help: "Total number of network messages",
-		},
-		[]string{"type"},
-	)
-	networkErrorsTotal = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "openhashdb_network_errors_total",
-			Help: "Total number of network errors",
-		},
-		[]string{"type"},
-	)
-	networkRetriesTotal = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Name: "openhashdb_network_retries_total",
-			Help: "Total number of network operation retries",
-		},
-	)
-	peerConnectionsTotal = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Name: "openhashdb_peer_connections_total",
-			Help: "Total number of peer connections",
-		},
-	)
-	peerDisconnectionsTotal = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Name: "openhashdb_peer_disconnections_total",
-			Help: "Total number of peer disconnections",
-		},
-	)
 )
 
 const (
-	ProtocolContentExchange  = protocol.ID("/openhashdb/content/1.0.0")
-	ProtocolChunkExchange    = protocol.ID("/openhashdb/chunk/1.0.0")
-	ProtocolGossip           = protocol.ID("/openhashdb/gossip/1.0.0")
-	ProtocolStreamExchange   = protocol.ID("/openhashdb/stream/1.0.0")
-	ProtocolMetadataExchange = protocol.ID("/openhashdb/metadata/1.0.0")
-	ProtocolChunkRequest     = protocol.ID("/openhashdb/chunk-request/1.0.0")
-	ServiceTag               = "openhashdb"
-	MaxPeerEventLogs         = 100
+	ProtocolGossip   = protocol.ID("/openhashdb/gossip/1.0.0")
+	ServiceTag       = "openhashdb"
+	MaxPeerEventLogs = 100
 )
-
-// StreamRequest defines the structure for requesting a stream, including resumability.
-type StreamRequest struct {
-	ContentHash string `json:"content_hash"`
-	Offset      int64  `json:"offset"`
-}
 
 // PeerEvent represents a peer discovery, connection, or disconnection event
 type PeerEvent struct {
@@ -109,111 +57,11 @@ type Node struct {
 	mdns                  mdns.Service
 	dht                   *dht.IpfsDHT
 	heartbeatService      *HeartbeatService
-	storage               *storage.Storage
-	ContentHandler        func(peer.ID, []byte) error
-	ChunkHandler          func(peer.ID, []byte) error
+	blockstore            *blockstore.Blockstore
+	bitswap               *bitswap.Engine
 	GossipHandler         func(peer.ID, []byte) error
-	PeerConnectedCallback func(peer.ID)
 	peerEvents            []PeerEvent
 	peerEventsMu          sync.RWMutex
-}
-
-// SetStorage sets the storage backend
-func (n *Node) SetStorage(s *storage.Storage) {
-	n.storage = s
-}
-
-// logPeerEvent logs a peer event
-func (n *Node) logPeerEvent(peerID peer.ID, eventType string, addrs []string) {
-	n.peerEventsMu.Lock()
-	defer n.peerEventsMu.Unlock()
-
-	event := PeerEvent{
-		PeerID:    peerID,
-		Type:      eventType,
-		Timestamp: time.Now(),
-		Addresses: addrs,
-	}
-
-	n.peerEvents = append(n.peerEvents, event)
-	if len(n.peerEvents) > MaxPeerEventLogs {
-		n.peerEvents = n.peerEvents[len(n.peerEvents)-MaxPeerEventLogs:]
-	}
-
-	log.Printf("Peer %s event: %s at %s, Addresses: %v",
-		peerID.String(), eventType, event.Timestamp.Format(time.RFC3339), addrs)
-}
-
-// GetLatestPeerEvents returns the latest peer events
-func (n *Node) GetLatestPeerEvents(limit int) []PeerEvent {
-	n.peerEventsMu.RLock()
-	defer n.peerEventsMu.RUnlock()
-
-	if limit <= 0 || limit > len(n.peerEvents) {
-		limit = len(n.peerEvents)
-	}
-
-	result := make([]PeerEvent, limit)
-	for i := 0; i < limit; i++ {
-		result[i] = n.peerEvents[len(n.peerEvents)-1-i]
-	}
-	return result
-}
-
-// loadOrCreateIdentity loads or creates a private key
-func loadOrCreateIdentity(keyPath string) (crypto.PrivKey, error) {
-	if err := os.MkdirAll(filepath.Dir(keyPath), 0755); err != nil {
-		return nil, fmt.Errorf("failed to create key directory: %w", err)
-	}
-
-	if keyData, err := os.ReadFile(keyPath); err == nil {
-		keyBytes, err := base64.StdEncoding.DecodeString(string(keyData))
-		if err != nil {
-			log.Printf("Warning: failed to decode key, creating new: %v", err)
-		} else {
-			privKey, err := crypto.UnmarshalPrivateKey(keyBytes)
-			if err == nil {
-				log.Printf("Loaded identity from %s", keyPath)
-				return privKey, nil
-			}
-			log.Printf("Warning: failed to unmarshal key, creating new: %v", err)
-		}
-	}
-
-	log.Printf("Generating new identity at %s", keyPath)
-	privKey, _, err := crypto.GenerateKeyPairWithReader(crypto.RSA, 2048, rand.Reader)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate key pair: %w", err)
-	}
-
-	keyBytes, err := crypto.MarshalPrivateKey(privKey)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal private key: %w", err)
-	}
-
-	keyData := base64.StdEncoding.EncodeToString(keyBytes)
-	if err := os.WriteFile(keyPath, []byte(keyData), 0600); err != nil {
-		return nil, fmt.Errorf("failed to save private key: %w", err)
-	}
-
-	return privKey, nil
-}
-
-// convertBootnodesToAddrInfo converts multiaddresses to peer.AddrInfo
-func convertBootnodesToAddrInfo(bootnodes []string) ([]peer.AddrInfo, error) {
-	var addrInfos []peer.AddrInfo
-	for _, addr := range bootnodes {
-		if addr == "" {
-			continue
-		}
-		addrInfo, err := peer.AddrInfoFromString(addr)
-		if err != nil {
-			log.Printf("Failed to parse bootnode address %s: %v", addr, err)
-			continue
-		}
-		addrInfos = append(addrInfos, *addrInfo)
-	}
-	return addrInfos, nil
 }
 
 // NewNodeWithKeyPath creates a new libp2p node
@@ -234,7 +82,6 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 		}
 	}
 
-	// Combine bootnodes
 	allBootnodes := append(DefaultBootnodes, bootnodes...)
 	addrInfos, err := convertBootnodesToAddrInfo(allBootnodes)
 	if err != nil {
@@ -271,7 +118,6 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 		return nil, fmt.Errorf("failed to create libp2p host: %w", err)
 	}
 
-	// Enable the circuit relay v2 service
 	if _, err := circuit.New(h); err != nil {
 		return nil, fmt.Errorf("failed to create circuit relay: %w", err)
 	}
@@ -283,23 +129,14 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 		cancel:                cancel,
 		dht:                   nodeDHT,
 		peerEvents:            make([]PeerEvent, 0, MaxPeerEventLogs),
-		PeerConnectedCallback: func(p peer.ID) {},
 	}
 	node.heartbeatService = NewHeartbeatService(nodeCtx, node)
 
-	// Set up network notifiee
 	n := &networkNotifiee{node: node}
 	h.Network().Notify(n)
 
-	// Set stream handlers
-	h.SetStreamHandler(ProtocolContentExchange, node.handleContentStream)
-	h.SetStreamHandler(ProtocolChunkExchange, node.handleChunkStream)
 	h.SetStreamHandler(ProtocolGossip, node.handleGossipStream)
-	h.SetStreamHandler(ProtocolStreamExchange, node.handleStreamExchange)
-	h.SetStreamHandler(ProtocolMetadataExchange, node.handleMetadataRequestStream)
-	h.SetStreamHandler(ProtocolChunkRequest, node.handleChunkRequestStream)
 
-	// Setup mDNS
 	if err := node.setupMDNS(); err != nil {
 		log.Printf("Warning: failed to setup mDNS: %v", err)
 	}
@@ -310,7 +147,6 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 		log.Printf("  %s/p2p/%s", addr, h.ID().String())
 	}
 
-	// Periodic DHT bootstrap
 	go func() {
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
@@ -326,7 +162,6 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 		}
 	}()
 
-	// Initial bootstrap
 	go func() {
 		if err := node.bootstrapDHT(); err != nil {
 			log.Printf("Warning: failed to bootstrap DHT: %v", err)
@@ -339,24 +174,41 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 	return node, nil
 }
 
+// Setters for components that are initialized after the node
+func (n *Node) SetBlockstore(bs *blockstore.Blockstore) {
+	n.blockstore = bs
+}
+
+func (n *Node) SetBitswap(b *bitswap.Engine) {
+	n.bitswap = b
+}
+
+func (n *Node) GetBitswap() *bitswap.Engine {
+	return n.bitswap
+}
+
+func (n *Node) Host() host.Host {
+	return n.host
+}
+
 // networkNotifiee handles connection events
 type networkNotifiee struct {
 	node *Node
 }
 
 func (n *networkNotifiee) Connected(net network.Network, conn network.Conn) {
-	peerConnectionsTotal.Inc()
 	addrs := make([]string, 0, len(n.node.host.Peerstore().Addrs(conn.RemotePeer())))
 	for _, addr := range n.node.host.Peerstore().Addrs(conn.RemotePeer()) {
 		addrs = append(addrs, addr.String())
 	}
 	n.node.logPeerEvent(conn.RemotePeer(), "connected", addrs)
 	n.node.heartbeatService.MonitorConnection(conn.RemotePeer())
-	n.node.PeerConnectedCallback(conn.RemotePeer())
+	if n.node.bitswap != nil {
+		n.node.bitswap.HandleNewPeer(conn.RemotePeer())
+	}
 }
 
 func (n *networkNotifiee) Disconnected(net network.Network, conn network.Conn) {
-	peerDisconnectionsTotal.Inc()
 	addrs := make([]string, 0, len(n.node.host.Peerstore().Addrs(conn.RemotePeer())))
 	for _, addr := range n.node.host.Peerstore().Addrs(conn.RemotePeer()) {
 		addrs = append(addrs, addr.String())
@@ -420,69 +272,35 @@ func (n *Node) Connect(ctx context.Context, peerAddr string) error {
 		return fmt.Errorf("failed to parse peer address %s: %w", peerAddr, err)
 	}
 
-	// Clear any existing backoff for the peer, which can be useful
-	// if a previous direct dial failed and we now want to try via a relay.
 	if swarm, ok := n.host.Network().(*swarm.Swarm); ok {
 		swarm.Backoff().Clear(maddr.ID)
 	}
 
 	const maxRetries = 5
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		// Increase timeout for each attempt
 		ctx, cancel := context.WithTimeout(ctx, time.Duration(10+5*attempt)*time.Second)
 		defer cancel()
 
 		err = n.host.Connect(ctx, *maddr)
 		if err == nil {
 			log.Printf("Connected to peer: %s", maddr.ID.String())
-			n.PeerConnectedCallback(maddr.ID)
 			return nil
 		}
 		log.Printf("Attempt %d/%d: Failed to connect to peer %s: %v", attempt, maxRetries, maddr.ID.String(), err)
-		networkErrorsTotal.WithLabelValues("connect").Inc()
 		if attempt < maxRetries {
-			networkRetriesTotal.Inc()
 			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond) // Exponential backoff
 		}
 	}
 	return fmt.Errorf("failed to connect to peer %s after %d attempts: %w", maddr.ID.String(), maxRetries, err)
 }
 
-// ConnectViaRelay attempts to connect to a peer via a known relay peer.
-// The node must already be connected to the relay peer for this to succeed.
-func (n *Node) ConnectViaRelay(ctx context.Context, targetPeerID, relayID peer.ID) error {
-	log.Printf("Attempting to connect to %s via relay %s", targetPeerID, relayID)
-
-	// Construct the multiaddress for the target peer, routed through the relay.
-	// This address format tells libp2p to use the circuit relay protocol.
-	relayAddrStr := fmt.Sprintf("/p2p/%s/p2p-circuit/p2p/%s", relayID.String(), targetPeerID.String())
-
-	// Use the existing Connect function which has retry logic.
-	// The AddrInfoFromString inside Connect will parse the address.
-	return n.Connect(ctx, relayAddrStr)
-}
-
-// SendContent sends content to a peer
-func (n *Node) SendContent(ctx context.Context, peerID peer.ID, data []byte) error {
-	networkMessagesTotal.WithLabelValues("content").Inc()
-	return n.sendData(ctx, peerID, ProtocolContentExchange, data)
-}
-
-// SendChunk sends a chunk to a peer
-func (n *Node) SendChunk(ctx context.Context, peerID peer.ID, data []byte) error {
-	networkMessagesTotal.WithLabelValues("chunk").Inc()
-	return n.sendData(ctx, peerID, ProtocolChunkExchange, data)
-}
-
 // BroadcastGossip broadcasts gossip message
 func (n *Node) BroadcastGossip(ctx context.Context, data []byte) error {
-	networkMessagesTotal.WithLabelValues("gossip").Inc()
 	peers := n.ConnectedPeers()
 	for _, peerID := range peers {
 		go func(pid peer.ID) {
 			if err := n.sendData(ctx, pid, ProtocolGossip, data); err != nil {
 				log.Printf("Failed to send gossip to %s: %v", pid.String(), err)
-				networkErrorsTotal.WithLabelValues("gossip").Inc()
 			}
 		}(peerID)
 	}
@@ -499,22 +317,18 @@ func (n *Node) sendData(ctx context.Context, peerID peer.ID, protocolID protocol
 		stream, err := n.host.NewStream(network.WithAllowLimitedConn(ctx, "send-data"), peerID, protocolID)
 		if err != nil {
 			log.Printf("Attempt %d/%d: Failed to open stream to %s: %v", attempt, maxRetries, peerID.String(), err)
-			networkErrorsTotal.WithLabelValues("send_data").Inc()
 			if attempt == maxRetries {
 				return fmt.Errorf("failed to open stream to %s after %d attempts: %w", peerID.String(), maxRetries, err)
 			}
-			networkRetriesTotal.Inc()
 			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
 			continue
 		}
 		defer stream.Close()
 		if _, err := stream.Write(data); err != nil {
 			log.Printf("Attempt %d/%d: Failed to write data to %s: %v", attempt, maxRetries, peerID.String(), err)
-			networkErrorsTotal.WithLabelValues("send_data").Inc()
 			if attempt == maxRetries {
 				return fmt.Errorf("failed to write data to %s after %d attempts: %w", peerID.String(), maxRetries, err)
 			}
-			networkRetriesTotal.Inc()
 			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
 			continue
 		}
@@ -523,132 +337,9 @@ func (n *Node) sendData(ctx context.Context, peerID peer.ID, protocolID protocol
 	return fmt.Errorf("failed to send data to %s: max retries exceeded", peerID.String())
 }
 
-// handleContentStream handles content streams
-func (n *Node) handleContentStream(stream network.Stream) {
-	defer stream.Close()
-	networkMessagesTotal.WithLabelValues("content_received").Inc()
-
-	remotePeer := stream.Conn().RemotePeer()
-	log.Printf("Handling content stream from %s", remotePeer.String())
-
-
-	buf := make([]byte, 256)
-	bytesRead, err := stream.Read(buf)
-	if err != nil && err != io.EOF && err != context.Canceled {
-		log.Printf("Failed to read content request from %s: %v", remotePeer.String(), err)
-		networkErrorsTotal.WithLabelValues("read_content_request").Inc()
-		_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: failed to read content request: %v", err)))
-		return
-	}
-	contentHashStr := string(buf[:bytesRead])
-	log.Printf("Received content request for %s from %s", contentHashStr, remotePeer.String())
-
-	if n.storage == nil {
-		log.Printf("Error: storage not configured for %s", remotePeer.String())
-		networkErrorsTotal.WithLabelValues("storage_not_configured").Inc()
-		_, _ = stream.Write([]byte("ERROR: storage not configured"))
-		return
-	}
-
-	hash, err := hasher.HashFromString(contentHashStr)
-	if err != nil {
-		log.Printf("Invalid hash %s from %s: %v", contentHashStr, remotePeer.String(), err)
-		networkErrorsTotal.WithLabelValues("invalid_hash").Inc()
-		_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: invalid hash: %v", err)))
-		return
-	}
-
-	if err := n.storage.ValidateContent(hash); err != nil {
-		log.Printf("Content validation failed for %s from %s: %v", contentHashStr, remotePeer.String(), err)
-		networkErrorsTotal.WithLabelValues("content_validation").Inc()
-		_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: %v", err)))
-		return
-	}
-
-	metadata, err := n.storage.GetContent(hash)
-	if err != nil {
-		log.Printf("Failed to get metadata for %s from %s: %v", contentHashStr, remotePeer.String(), err)
-		networkErrorsTotal.WithLabelValues("get_metadata").Inc()
-		_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: failed to get metadata: %v", err)))
-		return
-	}
-
-	dataStream, err := n.storage.GetDataStream(hash)
-	if err != nil {
-		log.Printf("Failed to get data stream for %s from %s: %v", contentHashStr, remotePeer.String(), err)
-		networkErrorsTotal.WithLabelValues("get_data").Inc()
-		_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: failed to get data: %v", err)))
-		return
-	}
-	defer dataStream.Close()
-
-	metaBytes, err := json.Marshal(metadata)
-	if err != nil {
-		log.Printf("Failed to marshal metadata for %s from %s: %v", contentHashStr, remotePeer.String(), err)
-		networkErrorsTotal.WithLabelValues("marshal_metadata").Inc()
-		_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: failed to marshal metadata: %v", err)))
-		return
-	}
-
-	if err := binary.Write(stream, binary.BigEndian, uint32(len(metaBytes))); err != nil {
-		log.Printf("Failed to write metadata length for %s to %s: %v", contentHashStr, remotePeer.String(), err)
-		networkErrorsTotal.WithLabelValues("write_metadata_length").Inc()
-		_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: failed to write metadata length: %v", err)))
-		return
-	}
-
-	if _, err := stream.Write(metaBytes); err != nil {
-		log.Printf("Failed to write metadata for %s to %s: %v", contentHashStr, remotePeer.String(), err)
-		networkErrorsTotal.WithLabelValues("write_metadata").Inc()
-		_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: failed to write metadata: %v", err)))
-		return
-	}
-
-	bytesSent, err := io.Copy(stream, dataStream)
-	if err != nil {
-		log.Printf("Failed to write content for %s to %s: %v", contentHashStr, remotePeer.String(), err)
-		networkErrorsTotal.WithLabelValues("write_content").Inc()
-		_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: failed to write content: %v", err)))
-		return
-	}
-	log.Printf("Sent %d bytes of content %s to %s", bytesSent, contentHashStr, remotePeer.String())
-
-	if err := stream.CloseWrite(); err != nil {
-		log.Printf("Failed to close write stream for %s to %s: %v", contentHashStr, remotePeer.String(), err)
-		networkErrorsTotal.WithLabelValues("close_write_stream").Inc()
-	}
-}
-
-// handleChunkStream handles chunk streams
-func (n *Node) handleChunkStream(stream network.Stream) {
-	defer stream.Close()
-	networkMessagesTotal.WithLabelValues("chunk_received").Inc()
-
-	remotePeer := stream.Conn().RemotePeer()
-	log.Printf("Handling chunk stream from %s", remotePeer.String())
-
-	data := make([]byte, 1024*1024)
-	bytesRead, err := stream.Read(data)
-	if err != nil {
-		log.Printf("Failed to read chunk stream from %s: %v", remotePeer.String(), err)
-		networkErrorsTotal.WithLabelValues("read_chunk_stream").Inc()
-		_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: failed to read chunk: %v", err)))
-		return
-	}
-
-	if n.ChunkHandler != nil {
-		if err := n.ChunkHandler(remotePeer, data[:bytesRead]); err != nil {
-			log.Printf("Chunk handler error from %s: %v", remotePeer.String(), err)
-			networkErrorsTotal.WithLabelValues("chunk_handler").Inc()
-			_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: chunk handler failed: %v", err)))
-		}
-	}
-}
-
 // handleGossipStream handles gossip streams
 func (n *Node) handleGossipStream(stream network.Stream) {
 	defer stream.Close()
-	networkMessagesTotal.WithLabelValues("gossip_received").Inc()
 
 	remotePeer := stream.Conn().RemotePeer()
 	log.Printf("Handling gossip stream from %s", remotePeer.String())
@@ -657,16 +348,12 @@ func (n *Node) handleGossipStream(stream network.Stream) {
 	bytesRead, err := stream.Read(data)
 	if err != nil {
 		log.Printf("Failed to read gossip stream from %s: %v", remotePeer.String(), err)
-		networkErrorsTotal.WithLabelValues("read_gossip_stream").Inc()
-		_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: failed to read gossip: %v", err)))
 		return
 	}
 
 	if n.GossipHandler != nil {
 		if err := n.GossipHandler(remotePeer, data[:bytesRead]); err != nil {
 			log.Printf("Gossip handler error from %s: %v", remotePeer.String(), err)
-			networkErrorsTotal.WithLabelValues("gossip_handler").Inc()
-			_, _ = stream.Write([]byte(fmt.Sprintf("ERROR: gossip handler failed: %v", err)))
 		}
 	}
 }
@@ -687,7 +374,6 @@ func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
 	defer cancel()
 	if err := n.node.host.Connect(ctx, pi); err != nil {
 		log.Printf("Failed to connect to discovered peer %s: %v", pi.ID.String(), err)
-		networkErrorsTotal.WithLabelValues("connect_discovered").Inc()
 	} else {
 		log.Printf("Successfully connected to discovered peer %s", pi.ID.String())
 	}
@@ -805,13 +491,13 @@ func (n *Node) AnnounceContent(contentHashStr string) error {
 		return fmt.Errorf("invalid content hash: %w", err)
 	}
 
-	if n.storage == nil {
-		log.Printf("Storage not configured for content %s", contentHashStr)
-		return fmt.Errorf("storage not configured")
+	if n.blockstore == nil {
+		log.Printf("Blockstore not configured for content %s", contentHashStr)
+		return fmt.Errorf("blockstore not configured")
 	}
-	if err := n.storage.ValidateContent(hash); err != nil {
-		log.Printf("Validation failed for content %s: %v", contentHashStr, err)
-		return err
+	if !n.blockstore.HasContent(hash) {
+		log.Printf("Validation failed for content %s: content not in blockstore", contentHashStr)
+		return fmt.Errorf("content not in blockstore")
 	}
 
 	const maxRetries = 5
@@ -825,7 +511,6 @@ func (n *Node) AnnounceContent(contentHashStr string) error {
 			if attempt == maxRetries {
 				return fmt.Errorf("failed to create multihash: %w", err)
 			}
-			networkRetriesTotal.Inc()
 			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
 			continue
 		}
@@ -837,7 +522,6 @@ func (n *Node) AnnounceContent(contentHashStr string) error {
 			if attempt == maxRetries {
 				return fmt.Errorf("failed to announce content after %d attempts: %w", maxRetries, err)
 			}
-			networkRetriesTotal.Inc()
 			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
 			continue
 		}
@@ -881,245 +565,6 @@ func (n *Node) FindContentProviders(contentHash string) ([]peer.AddrInfo, error)
 	return result, nil
 }
 
-// RequestContentFromPeer requests content from a peer
-func (n *Node) RequestContentFromPeer(peerID peer.ID, contentHash string) ([]byte, *storage.ContentMetadata, error) {
-	const maxRetries = 5
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		ctx, cancel := context.WithTimeout(n.ctx, 60*time.Second)
-		defer cancel()
-
-		log.Printf("Attempt %d/%d: Requesting content %s from %s", attempt, maxRetries, contentHash, peerID.String())
-		stream, err := n.host.NewStream(network.WithAllowLimitedConn(ctx, "request-content"), peerID, ProtocolContentExchange)
-		if err != nil {
-			log.Printf("Attempt %d/%d: Failed to open stream to %s: %v", attempt, maxRetries, peerID.String(), err)
-			networkErrorsTotal.WithLabelValues("open_stream").Inc()
-			if attempt == maxRetries {
-				return nil, nil, fmt.Errorf("failed to open stream to %s after %d attempts: %w", peerID.String(), maxRetries, err)
-			}
-			networkRetriesTotal.Inc()
-			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
-			continue
-		}
-
-		if _, err := stream.Write([]byte(contentHash)); err != nil {
-			log.Printf("Attempt %d/%d: Failed to send content request to %s: %v", attempt, maxRetries, peerID.String(), err)
-			networkErrorsTotal.WithLabelValues("write_content_request").Inc()
-			stream.Close()
-			if attempt == maxRetries {
-				return nil, nil, fmt.Errorf("failed to send content request to %s after %d attempts: %w", peerID.String(), maxRetries, err)
-			}
-			networkRetriesTotal.Inc()
-			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
-			continue
-		}
-		stream.CloseWrite()
-
-		buf := make([]byte, 256)
-		nBytes, err := stream.Read(buf)
-		if err == nil && nBytes > 0 && bytes.HasPrefix(buf[:nBytes], []byte("ERROR:")) {
-			log.Printf("Received error from %s: %s", peerID.String(), string(buf[:nBytes]))
-			networkErrorsTotal.WithLabelValues("remote_error").Inc()
-			stream.Close()
-			if attempt == maxRetries {
-				return nil, nil, fmt.Errorf("remote error from %s: %s", peerID.String(), string(buf[:nBytes]))
-			}
-			networkRetriesTotal.Inc()
-			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
-			continue
-		}
-
-		if err != nil && err != io.EOF {
-			log.Printf("Attempt %d/%d: Failed to read initial response from %s: %v", attempt, maxRetries, peerID.String(), err)
-			networkErrorsTotal.WithLabelValues("read_response").Inc()
-			stream.Close()
-			if attempt == maxRetries {
-				return nil, nil, fmt.Errorf("failed to read response from %s after %d attempts: %w", peerID.String(), maxRetries, err)
-			}
-			networkRetriesTotal.Inc()
-			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
-			continue
-		}
-
-		combinedReader := io.MultiReader(bytes.NewReader(buf[:nBytes]), stream)
-		var metaLen uint32
-		if err := binary.Read(combinedReader, binary.BigEndian, &metaLen); err != nil {
-			log.Printf("Attempt %d/%d: Failed to read metadata length from %s: %v", attempt, maxRetries, peerID.String(), err)
-			networkErrorsTotal.WithLabelValues("read_metadata_length").Inc()
-			stream.Close()
-			if attempt == maxRetries {
-				return nil, nil, fmt.Errorf("failed to read metadata length from %s after %d attempts: %w", peerID.String(), maxRetries, err)
-			}
-			networkRetriesTotal.Inc()
-			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
-			continue
-		}
-
-		metaBytes := make([]byte, metaLen)
-		if _, err := io.ReadFull(combinedReader, metaBytes); err != nil {
-			log.Printf("Attempt %d/%d: Failed to read metadata from %s: %v", attempt, maxRetries, peerID.String(), err)
-			networkErrorsTotal.WithLabelValues("read_metadata").Inc()
-			stream.Close()
-			if attempt == maxRetries {
-				return nil, nil, fmt.Errorf("failed to read metadata from %s after %d attempts: %w", peerID.String(), maxRetries, err)
-			}
-			networkRetriesTotal.Inc()
-			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
-			continue
-		}
-
-		var metadata storage.ContentMetadata
-		if err := json.Unmarshal(metaBytes, &metadata); err != nil {
-			log.Printf("Attempt %d/%d: Failed to unmarshal metadata from %s: %v", attempt, maxRetries, peerID.String(), err)
-			networkErrorsTotal.WithLabelValues("unmarshal_metadata").Inc()
-			stream.Close()
-			if attempt == maxRetries {
-				return nil, nil, fmt.Errorf("failed to unmarshal metadata from %s after %d attempts: %w", peerID.String(), maxRetries, err)
-			}
-			networkRetriesTotal.Inc()
-			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
-			continue
-		}
-
-		data, err := io.ReadAll(stream)
-		if err != nil {
-			log.Printf("Attempt %d/%d: Failed to read content from %s: %v", attempt, maxRetries, peerID.String(), err)
-			networkErrorsTotal.WithLabelValues("read_content").Inc()
-			stream.Close()
-			if attempt == maxRetries {
-				return nil, nil, fmt.Errorf("failed to read content from %s after %d attempts: %w", peerID.String(), maxRetries, err)
-			}
-			networkRetriesTotal.Inc()
-			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
-			continue
-		}
-
-		// TODO: Verification logic needs to be updated for Merkle trees.
-		// For now, we trust the peer.
-
-		log.Printf("Successfully fetched %d bytes of content %s from %s", len(data), contentHash, peerID.String())
-		return data, &metadata, nil
-	}
-
-	return nil, nil, fmt.Errorf("failed to fetch content %s from %s: max retries exceeded", contentHash, peerID.String())
-}
-
-// RequestContentStreamFromPeer requests a content stream from a peer.
-func (n *Node) RequestContentStreamFromPeer(ctx context.Context, peerID peer.ID, contentHash string, offset int64) (io.ReadCloser, *storage.ContentMetadata, error) {
-	stream, err := n.host.NewStream(network.WithAllowLimitedConn(ctx, "request-stream"), peerID, ProtocolStreamExchange)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to open stream to %s: %w", peerID.String(), err)
-	}
-
-	go func() {
-		defer stream.Close()
-		select {
-		case <-ctx.Done():
-			stream.Reset()
-			return
-		}
-	}()
-
-	
-
-	req := StreamRequest{ContentHash: contentHash, Offset: offset}
-	reqBytes, err := json.Marshal(req)
-	if err != nil {
-		stream.Reset()
-		return nil, nil, fmt.Errorf("failed to marshal stream request: %w", err)
-	}
-
-	if _, err := stream.Write(reqBytes); err != nil {
-		stream.Reset()
-		return nil, nil, fmt.Errorf("failed to send content request to %s: %w", peerID.String(), err)
-	}
-	stream.CloseWrite()
-
-	var metaLen uint32
-	if err := binary.Read(stream, binary.BigEndian, &metaLen); err != nil {
-		stream.Reset()
-		return nil, nil, fmt.Errorf("failed to read metadata length from %s: %w", peerID.String(), err)
-	}
-
-	metaBytes := make([]byte, metaLen)
-	if _, err := io.ReadFull(stream, metaBytes); err != nil {
-		stream.Reset()
-		return nil, nil, fmt.Errorf("failed to read metadata from %s: %w", peerID.String(), err)
-	}
-
-	var metadata storage.ContentMetadata
-	if err := json.Unmarshal(metaBytes, &metadata); err != nil {
-		stream.Reset()
-		return nil, nil, fmt.Errorf("failed to unmarshal metadata from %s: %w", peerID.String(), err)
-	}
-
-	return stream, &metadata, nil
-}
-
-// handleStreamExchange handles large file stream requests.
-func (n *Node) handleStreamExchange(stream network.Stream) {
-	remotePeer := stream.Conn().RemotePeer()
-	log.Printf("Handling stream exchange from %s", remotePeer.String())
-
-
-	decoder := json.NewDecoder(stream)
-	var req StreamRequest
-	if err := decoder.Decode(&req); err != nil {
-		log.Printf("Failed to read stream request from %s: %v", remotePeer.String(), err)
-		stream.Reset()
-		return
-	}
-
-	hash, err := hasher.HashFromString(req.ContentHash)
-	if err != nil {
-		log.Printf("Invalid hash %s from %s: %v", req.ContentHash, remotePeer.String(), err)
-		stream.Reset()
-		return
-	}
-
-	metadata, err := n.storage.GetContent(hash)
-	if err != nil {
-		log.Printf("Failed to get metadata for %s from %s: %v", req.ContentHash, remotePeer.String(), err)
-		stream.Reset()
-		return
-	}
-
-	dataStream, err := n.storage.GetDataStreamAt(hash, req.Offset)
-	if err != nil {
-		log.Printf("Failed to get data stream for %s at offset %d from %s: %v", req.ContentHash, req.Offset, remotePeer.String(), err)
-		stream.Reset()
-		return
-	}
-
-	metaBytes, err := json.Marshal(metadata)
-	if err != nil {
-		log.Printf("Failed to marshal metadata for %s from %s: %v", req.ContentHash, remotePeer.String(), err)
-		stream.Reset()
-		return
-	}
-
-	if err := binary.Write(stream, binary.BigEndian, uint32(len(metaBytes))); err != nil {
-		log.Printf("Failed to write metadata length for %s to %s: %v", req.ContentHash, remotePeer.String(), err)
-		stream.Reset()
-		return
-	}
-
-	if _, err := stream.Write(metaBytes); err != nil {
-		log.Printf("Failed to write metadata for %s to %s: %v", req.ContentHash, remotePeer.String(), err)
-		stream.Reset()
-		return
-	}
-
-	bytesSent, err := io.Copy(stream, dataStream)
-	if err != nil {
-		log.Printf("Failed to write content for %s to %s: %v", req.ContentHash, remotePeer.String(), err)
-		stream.Reset()
-		return
-	}
-
-	log.Printf("Sent %d bytes of content %s to %s via stream from offset %d", bytesSent, req.ContentHash, remotePeer.String(), req.Offset)
-	stream.Close()
-}
-
 // GetDHTStats returns DHT statistics
 func (n *Node) GetDHTStats() map[string]interface{} {
 	if n.dht == nil {
@@ -1135,126 +580,77 @@ func (n *Node) GetDHTStats() map[string]interface{} {
 	}
 }
 
-// RequestMetadataFromPeer requests only the content metadata from a peer.
-func (n *Node) RequestMetadataFromPeer(ctx context.Context, peerID peer.ID, contentHash hasher.Hash) (*storage.ContentMetadata, error) {
-	stream, err := n.host.NewStream(network.WithAllowLimitedConn(ctx, "request-metadata"), peerID, ProtocolMetadataExchange)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open metadata stream to %s: %w", peerID.String(), err)
-	}
-	defer stream.Close()
+// Helper functions that were removed
+func (n *Node) logPeerEvent(peerID peer.ID, eventType string, addrs []string) {
+	n.peerEventsMu.Lock()
+	defer n.peerEventsMu.Unlock()
 
-	if _, err := stream.Write([]byte(contentHash.String())); err != nil {
-		stream.Reset()
-		return nil, fmt.Errorf("failed to send metadata request to %s: %w", peerID.String(), err)
-	}
-	stream.CloseWrite()
-
-	buf, err := io.ReadAll(stream)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read metadata response from %s: %w", peerID.String(), err)
+	event := PeerEvent{
+		PeerID:    peerID,
+		Type:      eventType,
+		Timestamp: time.Now(),
+		Addresses: addrs,
 	}
 
-	if bytes.HasPrefix(buf, []byte("ERROR:")) {
-		return nil, fmt.Errorf("received error from %s: %s", peerID.String(), string(buf))
+	n.peerEvents = append(n.peerEvents, event)
+	if len(n.peerEvents) > MaxPeerEventLogs {
+		n.peerEvents = n.peerEvents[len(n.peerEvents)-MaxPeerEventLogs:]
 	}
 
-	var metadata storage.ContentMetadata
-	if err := json.Unmarshal(buf, &metadata); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal metadata from %s: %w", peerID.String(), err)
-	}
-
-	return &metadata, nil
+	log.Printf("Peer %s event: %s at %s, Addresses: %v",
+		peerID.String(), eventType, event.Timestamp.Format(time.RFC3339), addrs)
 }
 
-// handleMetadataRequestStream handles requests for content metadata.
-func (n *Node) handleMetadataRequestStream(stream network.Stream) {
-	defer stream.Close()
-	remotePeer := stream.Conn().RemotePeer()
+func loadOrCreateIdentity(keyPath string) (crypto.PrivKey, error) {
+	if err := os.MkdirAll(filepath.Dir(keyPath), 0755); err != nil {
+		return nil, fmt.Errorf("failed to create key directory: %w", err)
+	}
 
-	buf, err := io.ReadAll(stream)
+	if keyData, err := os.ReadFile(keyPath); err == nil {
+		keyBytes, err := base64.StdEncoding.DecodeString(string(keyData))
+		if err != nil {
+			log.Printf("Warning: failed to decode key, creating new: %v", err)
+		} else {
+			privKey, err := crypto.UnmarshalPrivateKey(keyBytes)
+			if err == nil {
+				log.Printf("Loaded identity from %s", keyPath)
+				return privKey, nil
+			}
+			log.Printf("Warning: failed to unmarshal key, creating new: %v", err)
+		}
+	}
+
+	log.Printf("Generating new identity at %s", keyPath)
+	privKey, _, err := crypto.GenerateKeyPairWithReader(crypto.RSA, 2048, rand.Reader)
 	if err != nil {
-		log.Printf("Failed to read metadata request from %s: %v", remotePeer.String(), err)
-		return
+		return nil, fmt.Errorf("failed to generate key pair: %w", err)
 	}
 
-	hash, err := hasher.HashFromString(string(buf))
+	keyBytes, err := crypto.MarshalPrivateKey(privKey)
 	if err != nil {
-		log.Printf("Invalid hash in metadata request from %s: %v", remotePeer.String(), err)
-		stream.Write([]byte("ERROR: Invalid hash"))
-		return
+		return nil, fmt.Errorf("failed to marshal private key: %w", err)
 	}
 
-	metadata, err := n.storage.GetContent(hash)
-	if err != nil {
-		log.Printf("Metadata not found for %s, requested by %s: %v", hash.String(), remotePeer.String(), err)
-		stream.Write([]byte("ERROR: Metadata not found"))
-		return
+	keyData := base64.StdEncoding.EncodeToString(keyBytes)
+	if err := os.WriteFile(keyPath, []byte(keyData), 0600); err != nil {
+		return nil, fmt.Errorf("failed to save private key: %w", err)
 	}
 
-	metaBytes, err := json.Marshal(metadata)
-	if err != nil {
-		log.Printf("Failed to marshal metadata for %s: %v", hash.String(), err)
-		stream.Write([]byte("ERROR: Failed to marshal metadata"))
-		return
-	}
-
-	if _, err := stream.Write(metaBytes); err != nil {
-		log.Printf("Failed to write metadata to %s: %v", remotePeer.String(), err)
-	}
+	return privKey, nil
 }
 
-// RequestChunkFromPeer requests a single chunk from a peer.
-func (n *Node) RequestChunkFromPeer(ctx context.Context, peerID peer.ID, chunkHash hasher.Hash) ([]byte, error) {
-	stream, err := n.host.NewStream(network.WithAllowLimitedConn(ctx, "request-chunk"), peerID, ProtocolChunkRequest)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open chunk stream to %s: %w", peerID.String(), err)
+func convertBootnodesToAddrInfo(bootnodes []string) ([]peer.AddrInfo, error) {
+	var addrInfos []peer.AddrInfo
+	for _, addr := range bootnodes {
+		if addr == "" {
+			continue
+		}
+		addrInfo, err := peer.AddrInfoFromString(addr)
+		if err != nil {
+			log.Printf("Failed to parse bootnode address %s: %v", addr, err)
+			continue
+		}
+		addrInfos = append(addrInfos, *addrInfo)
 	}
-	defer stream.Close()
-
-	if _, err := stream.Write([]byte(chunkHash.String())); err != nil {
-		stream.Reset()
-		return nil, fmt.Errorf("failed to send chunk request to %s: %w", peerID.String(), err)
-	}
-	stream.CloseWrite()
-
-	data, err := io.ReadAll(stream)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read chunk data from %s: %w", peerID.String(), err)
-	}
-
-	if bytes.HasPrefix(data, []byte("ERROR:")) {
-		return nil, fmt.Errorf("received error from %s: %s", peerID.String(), string(data))
-	}
-
-	return data, nil
-}
-
-// handleChunkRequestStream handles requests for individual chunks.
-func (n *Node) handleChunkRequestStream(stream network.Stream) {
-	defer stream.Close()
-	remotePeer := stream.Conn().RemotePeer()
-
-	buf, err := io.ReadAll(stream)
-	if err != nil {
-		log.Printf("Failed to read chunk request from %s: %v", remotePeer.String(), err)
-		return
-	}
-
-	hash, err := hasher.HashFromString(string(buf))
-	if err != nil {
-		log.Printf("Invalid hash in chunk request from %s: %v", remotePeer.String(), err)
-		stream.Write([]byte("ERROR: Invalid hash"))
-		return
-	}
-
-	chunkData, err := n.storage.GetData(hash)
-	if err != nil {
-		log.Printf("Chunk data not found for %s, requested by %s: %v", hash.String(), remotePeer.String(), err)
-		stream.Write([]byte("ERROR: Chunk not found"))
-		return
-	}
-
-	if _, err := stream.Write(chunkData); err != nil {
-		log.Printf("Failed to write chunk data to %s: %v", remotePeer.String(), err)
-	}
+	return addrInfos, nil
 }

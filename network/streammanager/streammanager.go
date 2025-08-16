@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"openhashdb/core/hasher"
-	"openhashdb/core/storage"
 	"openhashdb/network/libp2p"
 
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -33,7 +32,6 @@ type TransferRequest struct {
 // StreamManager handles the queuing and processing of large file transfers.
 type StreamManager struct {
 	node          *libp2p.Node
-	storage       *storage.Storage
 	requests      chan *TransferRequest
 	activeStreams map[string]context.CancelFunc
 	streamSlots   chan struct{}
@@ -43,11 +41,10 @@ type StreamManager struct {
 }
 
 // NewStreamManager creates a new StreamManager.
-func NewStreamManager(node *libp2p.Node, storage *storage.Storage) *StreamManager {
+func NewStreamManager(node *libp2p.Node) *StreamManager {
 	ctx, cancel := context.WithCancel(context.Background())
 	sm := &StreamManager{
 		node:          node,
-		storage:       storage,
 		requests:      make(chan *TransferRequest, 100),
 		activeStreams: make(map[string]context.CancelFunc),
 		streamSlots:   make(chan struct{}, MaxConcurrentStreams),
@@ -117,7 +114,7 @@ func (sm *StreamManager) handleTransfer(req *TransferRequest) {
 		return
 	}
 
-	ctx, cancel := context.WithCancel(req.Ctx)
+	_, cancel := context.WithCancel(req.Ctx)
 	sm.activeStreams[streamID] = cancel
 	sm.mu.Unlock()
 
@@ -128,25 +125,7 @@ func (sm *StreamManager) handleTransfer(req *TransferRequest) {
 		cancel()
 	}()
 
-	// Check for partial download to resume.
-	offset, err := sm.storage.GetPartialDataInfo(req.Hash)
-	if err != nil {
-		log.Printf("Error checking for partial data for %s: %v", req.Hash.String(), err)
-		// Decide if we should continue or fail. For now, we'll try from the start.
-		offset = 0
-	}
+	log.Printf("Starting large file stream for %s from %s", req.Hash.String(), req.PeerID.String())
 
-	if offset > 0 {
-		log.Printf("Resuming large file stream for %s from %s at offset %d", req.Hash.String(), req.PeerID.String(), offset)
-	} else {
-		log.Printf("Starting large file stream for %s from %s", req.Hash.String(), req.PeerID.String())
-	}
-
-	stream, _, err := sm.node.RequestContentStreamFromPeer(ctx, req.PeerID, req.Hash.String(), offset)
-	if err != nil {
-		req.Error <- err
-		return
-	}
-
-	req.Response <- stream
+	req.Error <- fmt.Errorf("resumable streams not yet implemented with bitswap")
 }

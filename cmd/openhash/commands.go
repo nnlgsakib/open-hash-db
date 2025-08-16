@@ -15,11 +15,13 @@ import (
 	"time"
 
 	"openhashdb/api/rest"
+	"openhashdb/core/block"
+	"openhashdb/core/blockstore"
 	"openhashdb/core/chunker"
 	"openhashdb/core/hasher"
 	"openhashdb/core/merkle"
-	"openhashdb/core/storage"
 	"openhashdb/core/utils"
+	"openhashdb/network/bitswap"
 	"openhashdb/network/libp2p"
 	"openhashdb/network/replicator"
 
@@ -37,7 +39,7 @@ var (
 	apiURL    string
 
 	// Global instances
-	store     *storage.Storage
+	bs        *blockstore.Blockstore
 	node      *libp2p.Node
 	repl      *replicator.Replicator
 	apiServer *rest.Server
@@ -94,7 +96,7 @@ var addCmd = &cobra.Command{
 		if err := initStorage(); err != nil {
 			return err
 		}
-		defer store.Close()
+		defer bs.Close()
 
 		// Check if path exists
 		info, err := os.Stat(path)
@@ -132,7 +134,7 @@ var getCmd = &cobra.Command{
 		if err := initStorage(); err != nil {
 			return err
 		}
-		defer store.Close()
+		defer bs.Close()
 
 		hash, err := hasher.HashFromString(hashStr)
 		if err != nil {
@@ -165,7 +167,7 @@ var viewCmd = &cobra.Command{
 		if err := initStorage(); err != nil {
 			return err
 		}
-		defer store.Close()
+		defer bs.Close()
 
 		hash, err := hasher.HashFromString(hashStr)
 		if err != nil {
@@ -195,7 +197,7 @@ var listCmd = &cobra.Command{
 		if err := initStorage(); err != nil {
 			return err
 		}
-		defer store.Close()
+		defer bs.Close()
 
 		return listContent()
 	},
@@ -223,7 +225,7 @@ var daemonCmd = &cobra.Command{
 
 		if enableRest {
 			// Initialize API server
-			apiServer = rest.NewServer(store, repl, node)
+			apiServer = rest.NewServer(bs, repl, node)
 			addr := fmt.Sprintf("0.0.0.0:%d", apiPort)
 			fmt.Printf("REST API available at: http://%s\n", addr)
 
@@ -268,12 +270,12 @@ func main() {
 	}
 }
 
-// initStorage initializes the storage layer
+// initStorage initializes the blockstore layer
 func initStorage() error {
 	var err error
-	store, err = storage.NewStorage(dbPath)
+	bs, err = blockstore.NewBlockstore(dbPath)
 	if err != nil {
-		return fmt.Errorf("failed to initialize storage: %w", err)
+		return fmt.Errorf("failed to initialize blockstore: %w", err)
 	}
 	return nil
 }
@@ -307,11 +309,14 @@ func initAll() error {
 	if err != nil {
 		return fmt.Errorf("failed to initialize libp2p node: %w", err)
 	}
-	// Set storage for the node to handle content requests
-	node.SetStorage(store)
+	node.SetBlockstore(bs) // Set the blockstore on the node
+
+	// Initialize Bitswap Engine
+	bitswapEngine := bitswap.NewEngine(ctx, node.Host(), bs)
+	node.SetBitswap(bitswapEngine)
 
 	// Initialize replicator
-	repl = replicator.NewReplicator(store, node, replicator.DefaultReplicationFactor)
+	repl = replicator.NewReplicator(bs, node, bitswapEngine, replicator.DefaultReplicationFactor)
 
 	return nil
 }
@@ -324,8 +329,8 @@ func cleanup() {
 	if node != nil {
 		node.Close()
 	}
-	if store != nil {
-		store.Close()
+	if bs != nil {
+		bs.Close()
 	}
 	if apiServer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -349,8 +354,8 @@ func addFile(path string) error {
 	}
 
 	for _, chunk := range chunks {
-		if !store.HasData(chunk.Hash) {
-			if err := store.StoreData(chunk.Hash, chunk.Data); err != nil {
+		if has, _ := bs.Has(chunk.Hash); !has {
+			if err := bs.Put(block.NewBlock(chunk.Data)); err != nil {
 				return fmt.Errorf("failed to store chunk %s: %w", chunk.Hash.String(), err)
 			}
 		}
@@ -361,7 +366,7 @@ func addFile(path string) error {
 		return fmt.Errorf("failed to stat file: %w", err)
 	}
 
-	metadata := &storage.ContentMetadata{
+	metadata := &blockstore.ContentMetadata{
 		Hash:        merkleFile.Root,
 		Filename:    filepath.Base(path),
 		MimeType:    utils.GetMimeType(path),
@@ -373,7 +378,7 @@ func addFile(path string) error {
 		Chunks:      merkleFile.Chunks,
 	}
 
-	if err := store.StoreContent(metadata); err != nil {
+	if err := bs.StoreContent(metadata); err != nil {
 		return fmt.Errorf("failed to store metadata: %w", err)
 	}
 
@@ -435,8 +440,8 @@ func storeDirectoryRecursive(path string, name string) (*merkle.Link, error) {
 			}
 
 			for _, chunk := range chunks {
-				if !store.HasData(chunk.Hash) {
-					if err := store.StoreData(chunk.Hash, chunk.Data); err != nil {
+				if has, _ := bs.Has(chunk.Hash); !has {
+					if err := bs.Put(block.NewBlock(chunk.Data)); err != nil {
 						return nil, fmt.Errorf("failed to store chunk %s: %w", chunk.Hash.String(), err)
 					}
 				}
@@ -444,7 +449,7 @@ func storeDirectoryRecursive(path string, name string) (*merkle.Link, error) {
 
 			info, _ := entry.Info()
 
-			fileMetadata := &storage.ContentMetadata{
+			fileMetadata := &blockstore.ContentMetadata{
 				Hash:        merkleFile.Root,
 				Filename:    entry.Name(),
 				MimeType:    utils.GetMimeType(entry.Name()),
@@ -455,7 +460,7 @@ func storeDirectoryRecursive(path string, name string) (*merkle.Link, error) {
 				RefCount:    1,
 				Chunks:      merkleFile.Chunks,
 			}
-			if err := store.StoreContent(fileMetadata); err != nil {
+			if err := bs.StoreContent(fileMetadata); err != nil {
 				return nil, fmt.Errorf("failed to store metadata for %s: %w", entry.Name(), err)
 			}
 
@@ -484,7 +489,7 @@ func storeDirectoryRecursive(path string, name string) (*merkle.Link, error) {
 		return nil, err
 	}
 
-	dirMetadata := &storage.ContentMetadata{
+	dirMetadata := &blockstore.ContentMetadata{
 		Hash:        dirHash,
 		Filename:    name,
 		MimeType:    "inode/directory",
@@ -496,7 +501,7 @@ func storeDirectoryRecursive(path string, name string) (*merkle.Link, error) {
 		Links:       links,
 	}
 
-	if err := store.StoreContent(dirMetadata); err != nil {
+	if err := bs.StoreContent(dirMetadata); err != nil {
 		return nil, err
 	}
 
@@ -511,23 +516,32 @@ func storeDirectoryRecursive(path string, name string) (*merkle.Link, error) {
 // getContent retrieves content from local storage or the network
 func getContent(hash hasher.Hash) error {
 	// First try to get from local storage
-	metadata, err := store.GetContent(hash)
+	metadata, err := bs.GetContent(hash)
 	if err == nil {
 		return displayContent(metadata, hash)
 	}
 
 	// Content not found locally, try DHT lookup if node is available
 	if node != nil {
-		log.Printf("Content not found locally, searching DHT...")
-		// This part needs to be updated to fetch metadata and then chunks
-		return fmt.Errorf("fetching from network not yet implemented for CLI direct mode")
+		log.Printf("Content not found locally, searching network...")
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		// This is a simplification. In a real scenario, we would fetch the metadata first.
+		blk, err := node.GetBitswap().GetBlock(ctx, hash)
+		if err != nil {
+			return fmt.Errorf("failed to get content from network: %w", err)
+		}
+		log.Printf("Got block: %s", blk.Hash())
+		// We can't display full content info as we only have the root block.
+		fmt.Printf("✅ Content retrieved from network: %s\n", hash.String())
+		return nil
 	}
 
 	return fmt.Errorf("content not found: %w", err)
 }
 
 // displayContent displays content information and data
-func displayContent(metadata *storage.ContentMetadata, hash hasher.Hash) error {
+func displayContent(metadata *blockstore.ContentMetadata, hash hasher.Hash) error {
 	if metadata.IsDirectory {
 		fmt.Printf("📁 Directory: %s\n", metadata.Filename)
 		fmt.Printf("   Hash: %s\n", hash.String())
@@ -554,7 +568,7 @@ func displayContent(metadata *storage.ContentMetadata, hash hasher.Hash) error {
 
 // viewContent displays content information
 func viewContent(hash hasher.Hash) error {
-	metadata, err := store.GetContent(hash)
+	metadata, err := bs.GetContent(hash)
 	if err != nil {
 		return fmt.Errorf("content not found: %w", err)
 	}
@@ -577,7 +591,7 @@ func viewContent(hash hasher.Hash) error {
 
 // listContent lists all stored content
 func listContent() error {
-	hashes, err := store.ListContent()
+	hashes, err := bs.ListContent()
 	if err != nil {
 		return fmt.Errorf("failed to list content: %w", err)
 	}
@@ -591,7 +605,7 @@ func listContent() error {
 	fmt.Println()
 
 	for _, hash := range hashes {
-		metadata, err := store.GetContent(hash)
+		metadata, err := bs.GetContent(hash)
 		if err != nil {
 			continue
 		}

@@ -30,15 +30,15 @@ func NewPeerExchanger(ctx context.Context, node *Node) *PeerExchanger {
 
 // getPeerListJSON gets the list of connected peers as a JSON byte slice.
 func (pe *PeerExchanger) getPeerListJSON() ([]byte, error) {
-	peers := pe.node.host.Peerstore().Peers()
+	peers := pe.node.Host().Peerstore().Peers()
 	var addrInfos []peer.AddrInfo
 	for _, p := range peers {
-		if p == pe.node.host.ID() {
+		if p == pe.node.Host().ID() {
 			continue
 		}
 		// We only want to share peers we are connected to.
-		if pe.node.host.Network().Connectedness(p) == network.Connected {
-			addrInfos = append(addrInfos, pe.node.host.Peerstore().PeerInfo(p))
+		if pe.node.Host().Network().Connectedness(p) == network.Connected {
+			addrInfos = append(addrInfos, pe.node.Host().Peerstore().PeerInfo(p))
 		}
 	}
 	return json.Marshal(addrInfos)
@@ -51,7 +51,7 @@ func (pe *PeerExchanger) connectToNewPeers(addrInfos []peer.AddrInfo, sourcePeer
 
 	for _, pi := range addrInfos {
 		// Don't connect to self or already connected peers
-		if pi.ID == pe.node.host.ID() || pe.node.host.Network().Connectedness(pi.ID) == network.Connected {
+		if pi.ID == pe.node.Host().ID() || pe.node.Host().Network().Connectedness(pi.ID) == network.Connected {
 			continue
 		}
 
@@ -69,14 +69,14 @@ func (pe *PeerExchanger) connectToNewPeers(addrInfos []peer.AddrInfo, sourcePeer
 			defer wg.Done()
 
 			// Double-check connection status inside the goroutine
-			if pe.node.host.Network().Connectedness(pi.ID) == network.Connected {
+			if pe.node.Host().Network().Connectedness(pi.ID) == network.Connected {
 				return
 			}
 
 			log.Printf("Discovered new peer %s from %s, attempting to connect", pi.ID.String(), sourcePeer.String())
 
 			// Attempt direct connection
-			err := pe.node.host.Connect(pe.ctx, pi)
+			err := pe.node.Connect(pe.ctx, pi.Addrs[0].String())
 			if err == nil {
 				log.Printf("Successfully connected directly to new peer %s", pi.ID.String())
 				// On success, leave the peer in the `connecting` map to prevent race conditions.
@@ -87,16 +87,12 @@ func (pe *PeerExchanger) connectToNewPeers(addrInfos []peer.AddrInfo, sourcePeer
 			log.Printf("Failed to connect directly to %s: %v. Trying via relay.", pi.ID.String(), err)
 
 			// If direct connection fails, try via relay
-			if err := pe.node.ConnectViaRelay(pe.ctx, pi.ID, sourcePeer); err != nil {
-				log.Printf("Failed to connect to %s via relay %s: %v", pi.ID.String(), sourcePeer.String(), err)
-				// If all attempts fail, remove the peer from the connecting map
-				pe.connectingMu.Lock()
-				delete(pe.connecting, pi.ID)
-				pe.connectingMu.Unlock()
-			} else {
-				log.Printf("Successfully connected to %s via relay %s", pi.ID.String(), sourcePeer.String())
-				// On success, leave the peer in the `connecting` map
-			}
+			// This part needs to be updated as ConnectViaRelay was removed.
+			// For now, we just log the failure.
+			log.Printf("Relay connection not implemented yet.")
+			pe.connectingMu.Lock()
+			delete(pe.connecting, pi.ID)
+			pe.connectingMu.Unlock()
 		}(pi)
 	}
 	wg.Wait()

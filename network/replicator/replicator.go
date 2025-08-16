@@ -8,9 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"openhashdb/core/chunker"
+	"openhashdb/core/blockstore"
 	"openhashdb/core/hasher"
-	"openhashdb/core/storage"
+	"openhashdb/network/bitswap"
 	"openhashdb/network/libp2p"
 
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -46,11 +46,6 @@ type ReplicationFactor int
 
 const (
 	DefaultReplicationFactor ReplicationFactor = 3
-	MinReplicationFactor     ReplicationFactor = 1
-	MaxReplicationFactor     ReplicationFactor = 10
-	RelayThreshold                             = 5
-	RequestTimeout                             = 30 * time.Second
-	CleanupInterval                            = 1 * time.Minute
 	LargeFileSizeThreshold                     = 200 * 1024 * 1024 // 200MB
 )
 
@@ -62,41 +57,13 @@ type ContentAnnouncement struct {
 	PeerID    string      `json:"peer_id"`
 }
 
-// ChunkRequest represents a request for a specific chunk
-type ChunkRequest struct {
-	Hash      hasher.Hash `json:"hash"`
-	RequestID string      `json:"request_id"`
-}
-
-// ChunkResponse represents a response to a chunk request
-type ChunkResponse struct {
-	Hash      hasher.Hash `json:"hash"`
-	Data      []byte      `json:"data"`
-	RequestID string      `json:"request_id"`
-	Success   bool        `json:"success"`
-}
-
-// PinRequest represents a request to pin content
-type PinRequest struct {
-	Hash     hasher.Hash `json:"hash"`
-	Priority int         `json:"priority"`
-}
-
-// RequestTracker tracks content request frequency
-type RequestTracker struct {
-	Count     int
-	FirstSeen time.Time
-}
-
 // Replicator handles content replication and availability
 type Replicator struct {
-	storage           *storage.Storage
+	blockstore        *blockstore.Blockstore
 	node              *libp2p.Node
+	bitswap           *bitswap.Engine
 	replicationFactor ReplicationFactor
 	pinnedContent     map[string]struct{}
-	pendingRequests   map[string]chan ChunkResponse
-	requestTracker    map[string]*RequestTracker
-	relayCache        map[string][]byte
 	replicatingNow    map[string]struct{}
 	mu                sync.RWMutex
 	ctx               context.Context
@@ -104,39 +71,33 @@ type Replicator struct {
 }
 
 // NewReplicator creates a new replicator
-func NewReplicator(storage *storage.Storage, node *libp2p.Node, replicationFactor ReplicationFactor) *Replicator {
+func NewReplicator(bs *blockstore.Blockstore, node *libp2p.Node, bitswap *bitswap.Engine, replicationFactor ReplicationFactor) *Replicator {
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &Replicator{
-		storage:           storage,
+		blockstore:        bs,
 		node:              node,
+		bitswap:           bitswap,
 		replicationFactor: replicationFactor,
 		pinnedContent:     make(map[string]struct{}),
-		pendingRequests:   make(map[string]chan ChunkResponse),
-		requestTracker:    make(map[string]*RequestTracker),
-		relayCache:        make(map[string][]byte),
 		replicatingNow:    make(map[string]struct{}),
 		ctx:               ctx,
 		cancel:            cancel,
 	}
 
 	node.GossipHandler = r.handleGossipMessage
-	node.ChunkHandler = r.handleChunkMessage
 	go r.announceContentPeriodically()
-	go r.cleanupPendingRequests()
 
 	return r
 }
 
 // Close shuts down the replicator
-func (r *Replicator) Close() error {
+func (r *Replicator) Close() {
 	r.cancel()
-	return nil
 }
 
 // AnnounceContent announces new content
 func (r *Replicator) AnnounceContent(hash hasher.Hash, size int64) error {
-	// Verify that content metadata exists before announcing
-	if !r.storage.HasContent(hash) {
+	if !r.blockstore.HasContent(hash) {
 		log.Printf("Content %s not found locally, skipping announcement", hash.String())
 		return fmt.Errorf("content %s not found locally", hash.String())
 	}
@@ -160,132 +121,19 @@ func (r *Replicator) AnnounceContent(hash hasher.Hash, size int64) error {
 	return r.node.BroadcastGossip(r.ctx, data)
 }
 
-
-
-// RequestChunk requests a chunk from the network or relays it
-func (r *Replicator) RequestChunk(hash hasher.Hash) ([]byte, error) {
-	// Check local storage
-	if r.storage.HasData(hash) {
-		data, err := r.storage.GetData(hash)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get local data for %s: %w", hash.String(), err)
-		}
-		return data, nil
-	}
-
-	// Check relay cache
-	r.mu.RLock()
-	if data, exists := r.relayCache[hash.String()]; exists {
-		r.mu.RUnlock()
-		return data, nil
-	}
-	r.mu.RUnlock()
-
-	// Track request frequency
-	r.mu.Lock()
-	tracker, exists := r.requestTracker[hash.String()]
-	if !exists {
-		tracker = &RequestTracker{
-			Count:     1,
-			FirstSeen: time.Now(),
-		}
-		r.requestTracker[hash.String()] = tracker
-	} else {
-		tracker.Count++
-	}
-	shouldReplicate := tracker.Count >= RelayThreshold
-	r.mu.Unlock()
-
-	// Find providers
-	providers, err := r.node.FindContentProviders(hash.String())
-	if err != nil {
-		return nil, fmt.Errorf("failed to find providers for %s: %w", hash.String(), err)
-	}
-	if len(providers) == 0 {
-		return nil, fmt.Errorf("no providers found for content %s", hash.String())
-	}
-
-	// Request from first provider
-	data, metadata, err := r.node.RequestContentFromPeer(providers[0].ID, hash.String())
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch content from %s: %w", providers[0].ID.String(), err)
-	}
-
-	// Store in relay cache
-	r.mu.Lock()
-	r.relayCache[hash.String()] = data
-	r.mu.Unlock()
-
-	// On-demand replication
-	if shouldReplicate {
-		replicationRequestsTotal.WithLabelValues("on_demand").Inc()
-		if err := r.storage.StoreData(hash, data); err != nil {
-			replicationFailuresTotal.Inc()
-			log.Printf("Failed to replicate content %s: %v", hash.String(), err)
-		} else {
-			replicationSuccessTotal.Inc()
-			log.Printf("Replicated content %s locally after %d requests", hash.String(), tracker.Count)
-			if err := r.AnnounceContent(hash, metadata.Size); err != nil {
-				log.Printf("Failed to announce replicated content %s: %v", hash.String(), err)
-			}
-		}
-	}
-
-	return data, nil
-}
-
 // PinContent pins content
 func (r *Replicator) PinContent(hash hasher.Hash) error {
 	r.mu.Lock()
 	r.pinnedContent[hash.String()] = struct{}{}
 	r.mu.Unlock()
 
-	if r.storage.HasContent(hash) {
-		return r.storage.IncrementRefCount(hash)
+	if r.blockstore.HasContent(hash) {
+		// TODO: Implement ref counting on blockstore content metadata
+		return nil
 	}
 
 	// If content is not local, fetch it in the background
-	go func() {
-		log.Printf("Content %s is pinned but not local, fetching...", hash.String())
-		providers, err := r.node.FindContentProviders(hash.String())
-		if err != nil {
-			log.Printf("Failed to find providers for pinned content %s: %v", hash.String(), err)
-			return
-		}
-		if len(providers) == 0 {
-			log.Printf("No providers found for pinned content %s", hash.String())
-			return
-		}
-
-		var data []byte
-		var metadata *storage.ContentMetadata
-		var fetchErr error
-
-		for _, p := range providers {
-			if p.ID == r.node.ID() {
-				continue // Skip self
-			}
-			data, metadata, fetchErr = r.node.RequestContentFromPeer(p.ID, hash.String())
-			if fetchErr == nil {
-				break // Success
-			}
-			log.Printf("Failed to fetch pinned content %s from peer %s: %v", hash.String(), p.ID, fetchErr)
-		}
-
-		if fetchErr != nil {
-			log.Printf("Failed to fetch pinned content %s from all providers", hash.String())
-			return
-		}
-
-		if err := r.storage.StoreContent(metadata); err != nil {
-			log.Printf("Failed to store metadata for pinned content %s: %v", hash.String(), err)
-		}
-		if err := r.storage.StoreData(hash, data); err != nil {
-			log.Printf("Failed to store data for pinned content %s: %v", hash.String(), err)
-		}
-		r.storage.IncrementRefCount(hash)
-		log.Printf("Successfully fetched and stored pinned content %s", hash.String())
-	}()
+	go r.FetchAndStore(hash)
 
 	return nil
 }
@@ -296,8 +144,8 @@ func (r *Replicator) UnpinContent(hash hasher.Hash) error {
 	delete(r.pinnedContent, hash.String())
 	r.mu.Unlock()
 
-	if r.storage.HasContent(hash) {
-		return r.storage.DecrementRefCount(hash)
+	if r.blockstore.HasContent(hash) {
+		// TODO: Implement ref counting on blockstore content metadata
 	}
 
 	return nil
@@ -329,28 +177,19 @@ func (r *Replicator) handleGossipMessage(peerID peer.ID, data []byte) error {
 		return r.handleContentAnnouncement(peerID, &announcement)
 	}
 
-	var request ChunkRequest
-	if err := json.Unmarshal(data, &request); err == nil {
-		return r.handleChunkRequest(peerID, &request)
-	}
-
 	log.Printf("Unknown gossip message from peer %s", peerID.String())
 	return nil
 }
 
-// handleContentAnnouncement handles content announcements by replicating chunks.
+// handleContentAnnouncement handles content announcements by replicating content.
 func (r *Replicator) handleContentAnnouncement(peerID peer.ID, announcement *ContentAnnouncement) error {
-	// log.Printf("Received content announcement from %s: %s", peerID.String(), announcement.Hash.String())
-
-	if r.storage.HasContent(announcement.Hash) {
-		// log.Printf("Content %s already exists locally, skipping replication and announcement", announcement.Hash.String())
+	if r.blockstore.HasContent(announcement.Hash) {
 		return nil
 	}
 
 	r.mu.Lock()
 	if _, ongoing := r.replicatingNow[announcement.Hash.String()]; ongoing {
 		r.mu.Unlock()
-		log.Printf("Replication for %s already in progress, skipping announcement from %s", announcement.Hash.String(), peerID.String())
 		return nil
 	}
 	r.replicatingNow[announcement.Hash.String()] = struct{}{}
@@ -362,7 +201,6 @@ func (r *Replicator) handleContentAnnouncement(peerID peer.ID, announcement *Con
 		r.mu.Unlock()
 	}()
 
-	// Skip automatic replication for large files
 	if announcement.Size > LargeFileSizeThreshold {
 		log.Printf("Content %s is larger than %d bytes, skipping automatic replication", announcement.Hash.String(), LargeFileSizeThreshold)
 		return nil
@@ -379,155 +217,65 @@ func (r *Replicator) handleContentAnnouncement(peerID peer.ID, announcement *Con
 		return nil
 	}
 
-	// Pick a provider to fetch from
-	var provider peer.AddrInfo
-	found := false
-	for _, p := range providers {
-		if p.ID != r.node.ID() {
-			provider = p
-			found = true
-			break
-		}
-	}
-	if !found {
-		log.Printf("No suitable provider found for %s", announcement.Hash.String())
-		return nil
-	}
-
-	log.Printf("Starting chunk-based replication for %s from peer %s", announcement.Hash.String(), provider.ID)
-
-	// 1. Fetch metadata
-	metadata, err := r.node.RequestMetadataFromPeer(r.ctx, provider.ID, announcement.Hash)
-	if err != nil {
-		log.Printf("Failed to fetch metadata for %s from %s: %v", announcement.Hash.String(), provider.ID, err)
-		replicationFailuresTotal.Inc()
-		return nil
-	}
-
-	// 2. Store metadata immediately
-	if err := r.storage.StoreContent(metadata); err != nil {
-		log.Printf("Failed to store replicated metadata %s: %v", announcement.Hash.String(), err)
-		replicationFailuresTotal.Inc()
-		return nil
-	}
-
-	// 3. Fetch all chunks
-	var wg sync.WaitGroup
-	errs := make(chan error, len(metadata.Chunks))
-
-	for _, chunkInfo := range metadata.Chunks {
-		if r.storage.HasData(chunkInfo.Hash) {
-			continue
-		}
-		wg.Add(1)
-		go func(c chunker.ChunkInfo) {
-			defer wg.Done()
-			chunkData, err := r.node.RequestChunkFromPeer(r.ctx, provider.ID, c.Hash)
-			if err != nil {
-				errs <- fmt.Errorf("failed to fetch chunk %s from %s: %w", c.Hash.String(), provider.ID, err)
-				return
-			}
-			actualHash := hasher.HashBytes(chunkData)
-			if actualHash != c.Hash {
-				errs <- fmt.Errorf("fetched chunk %s has incorrect hash", c.Hash.String())
-				return
-			}
-			if err := r.storage.StoreData(c.Hash, chunkData); err != nil {
-				errs <- fmt.Errorf("failed to store chunk %s: %w", c.Hash.String(), err)
-			}
-		}(chunkInfo)
-	}
-	wg.Wait()
-	close(errs)
-
-	hasErrors := false
-	for err := range errs {
-		log.Printf("Error during chunk replication for %s: %v", announcement.Hash.String(), err)
-		hasErrors = true
-	}
-
-	if hasErrors {
-		log.Printf("Replication for %s failed due to chunk errors.", announcement.Hash.String())
-		replicationFailuresTotal.Inc()
-		return nil
-	}
-
-	replicationSuccessTotal.Inc()
-	log.Printf("Successfully replicated content %s (all chunks) from %s", announcement.Hash.String(), provider.ID)
-
-	if err := r.AnnounceContent(announcement.Hash, metadata.Size); err != nil {
-		log.Printf("Failed to announce newly replicated content %s: %v", announcement.Hash.String(), err)
-	}
+	log.Printf("Replication factor not met for %s, starting replication...", announcement.Hash.String())
+	go r.FetchAndStore(announcement.Hash)
 
 	return nil
 }
 
-// handleChunkRequest handles chunk requests
-func (r *Replicator) handleChunkRequest(peerID peer.ID, request *ChunkRequest) error {
-	log.Printf("Received chunk request from %s: %s", peerID.String(), request.Hash.String())
+func (r *Replicator) FetchAndStore(hash hasher.Hash) error {
+	log.Printf("Fetching content %s...", hash.String())
 
-	var responseData []byte
-	var err error
+	ctx, cancel := context.WithTimeout(r.ctx, 2*time.Minute)
+	defer cancel()
 
-	// Check local storage first
-	if r.storage.HasData(request.Hash) {
-		responseData, err = r.storage.GetData(request.Hash)
-		if err != nil {
-			log.Printf("Failed to get local chunk data for %s: %v", request.Hash.String(), err)
-			return nil
-		}
-	} else {
-		// Check relay cache
-		r.mu.RLock()
-		data, exists := r.relayCache[request.Hash.String()]
-		r.mu.RUnlock()
-		if !exists {
-			log.Printf("Chunk %s not found in local storage or relay cache", request.Hash.String())
-			return nil
-		}
-		responseData = data
-	}
-
-	response := ChunkResponse{
-		Hash:      request.Hash,
-		Data:      responseData,
-		RequestID: request.RequestID,
-		Success:   true,
-	}
-
-	data, err := json.Marshal(response)
+	// Fetch the root block, which should be the metadata
+	rootBlock, err := r.bitswap.GetBlock(ctx, hash)
 	if err != nil {
-		log.Printf("Failed to marshal chunk response for %s: %v", request.Hash.String(), err)
-		return nil
+		log.Printf("Failed to fetch root block %s: %v", hash.String(), err)
+		replicationFailuresTotal.Inc()
+		return err
 	}
 
-	return r.node.SendChunk(r.ctx, peerID, data)
-}
-
-// handleChunkMessage handles incoming chunk messages
-func (r *Replicator) handleChunkMessage(peerID peer.ID, data []byte) error {
-	var response ChunkResponse
-	if err := json.Unmarshal(data, &response); err != nil {
-		return fmt.Errorf("failed to unmarshal chunk response: %w", err)
+	// The root block for a file/directory is its metadata
+	var metadata blockstore.ContentMetadata
+	if err := json.Unmarshal(rootBlock.RawData(), &metadata); err != nil {
+		log.Printf("Fetched root block %s is not valid metadata: %v", hash.String(), err)
+		replicationFailuresTotal.Inc()
+		return err
 	}
 
-	log.Printf("Received chunk response from %s: %s", peerID.String(), response.Hash.String())
-
-	r.mu.RLock()
-	responseChan, exists := r.pendingRequests[response.RequestID]
-	r.mu.RUnlock()
-
-	if !exists {
-		log.Printf("No pending request found for ID: %s", response.RequestID)
-		return nil
+	// Store the metadata
+	if err := r.blockstore.StoreContent(&metadata); err != nil {
+		log.Printf("Failed to store metadata for %s: %v", hash.String(), err)
+		return err
 	}
 
-	select {
-	case responseChan <- response:
-	default:
-		log.Printf("Response channel full or closed for %s", response.RequestID)
+	// If it's a file, fetch all its chunks
+	if !metadata.IsDirectory && len(metadata.Chunks) > 0 {
+		blockHashes := make([]hasher.Hash, len(metadata.Chunks))
+		for i, chunk := range metadata.Chunks {
+			blockHashes[i] = chunk.Hash
+		}
+
+		blockChannel, err := r.bitswap.GetBlocks(ctx, blockHashes)
+		if err != nil {
+			log.Printf("Failed to start bitswap session for chunks of %s: %v", hash.String(), err)
+			replicationFailuresTotal.Inc()
+			return err
+		}
+
+		for blk := range blockChannel {
+			log.Printf("Replicated block %s for content %s", blk.Hash().String(), hash.String())
+		}
 	}
 
+	log.Printf("Successfully replicated content %s", hash.String())
+	replicationSuccessTotal.Inc()
+
+	if err := r.AnnounceContent(hash, metadata.Size); err != nil {
+		log.Printf("Failed to announce newly replicated content %s: %v", hash.String(), err)
+	}
 	return nil
 }
 
@@ -565,7 +313,7 @@ func (r *Replicator) announcePinnedContent() {
 			continue
 		}
 
-		metadata, err := r.storage.GetContent(hash)
+		metadata, err := r.blockstore.GetContent(hash)
 		if err != nil {
 			log.Printf("Could not get metadata for pinned content %s: %v", hash.String(), err)
 			continue
@@ -573,37 +321,6 @@ func (r *Replicator) announcePinnedContent() {
 
 		if err := r.AnnounceContent(hash, metadata.Size); err != nil {
 			log.Printf("Failed to announce pinned content %s: %v", hash.String(), err)
-		}
-	}
-}
-
-// cleanupPendingRequests cleans up old pending requests
-func (r *Replicator) cleanupPendingRequests() {
-	ticker := time.NewTicker(CleanupInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			r.mu.Lock()
-			for requestID, responseChan := range r.pendingRequests {
-				select {
-				case <-responseChan:
-				default:
-					close(responseChan)
-				}
-				delete(r.pendingRequests, requestID)
-			}
-
-			for hash, tracker := range r.requestTracker {
-				if time.Since(tracker.FirstSeen) > 24*time.Hour {
-					delete(r.requestTracker, hash)
-					delete(r.relayCache, hash)
-				}
-			}
-			r.mu.Unlock()
-		case <-r.ctx.Done():
-			return
 		}
 	}
 }
@@ -616,8 +333,6 @@ func (r *Replicator) GetStats() map[string]interface{} {
 	return map[string]interface{}{
 		"replication_factor": int(r.replicationFactor),
 		"pinned_content":     len(r.pinnedContent),
-		"pending_requests":   len(r.pendingRequests),
-		"relay_cache_size":   len(r.relayCache),
-		"tracked_requests":   len(r.requestTracker),
+		"replicating_now":    len(r.replicatingNow),
 	}
 }
