@@ -1,15 +1,12 @@
 package blockstore
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	
 	"log"
 	"os"
 	"path/filepath"
-	"sync"
 	"time"
 
 	"openhashdb/core/block"
@@ -21,6 +18,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/opt"
+	"github.com/syndtr/goleveldb/leveldb/util"
 )
 
 // Metrics for blockstore operations
@@ -62,8 +60,7 @@ type ContentMetadata struct {
 // Blockstore handles persistent storage of blocks.
 type Blockstore struct {
 	db       *leveldb.DB
-	dataPath string
-	mu       sync.RWMutex
+	rootPath string
 }
 
 // NewBlockstore creates a new blockstore instance at the given root path.
@@ -85,16 +82,9 @@ func NewBlockstore(rootPath string) (*Blockstore, error) {
 		return nil, fmt.Errorf("failed to open database at %s: %w", leveldbPath, err)
 	}
 
-	dataPath := filepath.Join(rootPath, "blocks")
-	if err := os.MkdirAll(dataPath, 0755); err != nil {
-		blockstoreOperationsTotal.WithLabelValues("mkdir", "error").Inc()
-		return nil, fmt.Errorf("failed to create blocks directory %s: %w", dataPath, err)
-	}
-
 	bs := &Blockstore{
 		db:       db,
-		dataPath: dataPath,
-		mu:       sync.RWMutex{},
+		rootPath: rootPath,
 	}
 
 	if space, err := bs.GetAvailableSpace(); err == nil {
@@ -107,9 +97,6 @@ func NewBlockstore(rootPath string) (*Blockstore, error) {
 
 // Close closes the blockstore.
 func (bs *Blockstore) Close() error {
-	bs.mu.Lock()
-	defer bs.mu.Unlock()
-
 	err := bs.db.Close()
 	if err != nil {
 		blockstoreOperationsTotal.WithLabelValues("close_db", "error").Inc()
@@ -121,13 +108,10 @@ func (bs *Blockstore) Close() error {
 
 // Get retrieves a block from the blockstore.
 func (bs *Blockstore) Get(h hasher.Hash) (block.Block, error) {
-	bs.mu.RLock()
-	defer bs.mu.RUnlock()
-
-	filePath := filepath.Join(bs.dataPath, h.String())
-	data, err := os.ReadFile(filePath)
+	key := []byte(blockPrefix + h.String())
+	data, err := bs.db.Get(key, nil)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if err == leveldb.ErrNotFound {
 			blockstoreOperationsTotal.WithLabelValues("get", "not_found").Inc()
 			return nil, fmt.Errorf("block not found: %s", h.String())
 		}
@@ -141,19 +125,20 @@ func (bs *Blockstore) Get(h hasher.Hash) (block.Block, error) {
 
 // Put stores a block in the blockstore.
 func (bs *Blockstore) Put(b block.Block) error {
-	bs.mu.Lock()
-	defer bs.mu.Unlock()
-
 	hash := b.Hash()
-	filePath := filepath.Join(bs.dataPath, hash.String())
+	key := []byte(blockPrefix + hash.String())
 
-	// Avoid writing if file already exists
-	if _, err := os.Stat(filePath); err == nil {
+	exists, err := bs.db.Has(key, nil)
+	if err != nil {
+		blockstoreOperationsTotal.WithLabelValues("put", "error").Inc()
+		return fmt.Errorf("failed to check for block %s: %w", hash.String(), err)
+	}
+	if exists {
 		blockstoreOperationsTotal.WithLabelValues("put", "exists").Inc()
 		return nil // Block already exists
 	}
 
-	if err := os.WriteFile(filePath, b.RawData(), 0644); err != nil {
+	if err := bs.db.Put(key, b.RawData(), nil); err != nil {
 		blockstoreOperationsTotal.WithLabelValues("put", "error").Inc()
 		return fmt.Errorf("failed to store block %s: %w", hash.String(), err)
 	}
@@ -168,60 +153,50 @@ func (bs *Blockstore) Put(b block.Block) error {
 
 // Has checks if a block exists in the blockstore.
 func (bs *Blockstore) Has(h hasher.Hash) (bool, error) {
-	bs.mu.RLock()
-	defer bs.mu.RUnlock()
-
-	filePath := filepath.Join(bs.dataPath, h.String())
-	_, err := os.Stat(filePath)
-	if err == nil {
-		return true, nil
-	}
-	if os.IsNotExist(err) {
-		return false, nil
-	}
-	return false, err
+	key := []byte(blockPrefix + h.String())
+	return bs.db.Has(key, nil)
 }
 
 // GetSize returns the size of a block.
 func (bs *Blockstore) GetSize(h hasher.Hash) (int, error) {
-	bs.mu.RLock()
-	defer bs.mu.RUnlock()
-
-	filePath := filepath.Join(bs.dataPath, h.String())
-	info, err := os.Stat(filePath)
+	key := []byte(blockPrefix + h.String())
+	data, err := bs.db.Get(key, nil)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if err == leveldb.ErrNotFound {
 			return -1, fmt.Errorf("block not found: %s", h.String())
 		}
 		return -1, err
 	}
-	return int(info.Size()), nil
+	return len(data), nil
 }
 
 // AllKeysChan returns a channel that streams all block keys.
 func (bs *Blockstore) AllKeysChan(ctx context.Context) (<-chan hasher.Hash, error) {
-	// This is an expensive operation, use with care.
 	ch := make(chan hasher.Hash)
 	go func() {
 		defer close(ch)
-		files, err := os.ReadDir(bs.dataPath)
-		if err != nil {
-			log.Printf("Error reading blockstore directory: %v", err)
-			return
-		}
-		for _, file := range files {
-			if file.IsDir() {
-				continue
-			}
-			h, err := hasher.HashFromString(file.Name())
+
+		prefix := []byte(blockPrefix)
+		iter := bs.db.NewIterator(util.BytesPrefix(prefix), nil)
+		defer iter.Release()
+
+		for iter.Next() {
+			key := iter.Key()
+			// Trim prefix to get the hash string
+			hashStr := string(key[len(prefix):])
+			h, err := hasher.HashFromString(hashStr)
 			if err != nil {
-				continue // Skip invalid filenames
+				log.Printf("Skipping invalid block key in database: %s", key)
+				continue
 			}
 			select {
 			case ch <- h:
 			case <-ctx.Done():
 				return
 			}
+		}
+		if err := iter.Error(); err != nil {
+			log.Printf("Error iterating through blockstore: %v", err)
 		}
 	}()
 	return ch, nil
@@ -231,9 +206,6 @@ func (bs *Blockstore) AllKeysChan(ctx context.Context) (<-chan hasher.Hash, erro
 
 // StoreContent stores content metadata.
 func (bs *Blockstore) StoreContent(metadata *ContentMetadata) error {
-	bs.mu.Lock()
-	defer bs.mu.Unlock()
-
 	key := contentPrefix + metadata.Hash.String()
 	data, err := json.Marshal(metadata)
 	if err != nil {
@@ -244,12 +216,12 @@ func (bs *Blockstore) StoreContent(metadata *ContentMetadata) error {
 
 // GetContent retrieves content metadata.
 func (bs *Blockstore) GetContent(hash hasher.Hash) (*ContentMetadata, error) {
-	bs.mu.RLock()
-	defer bs.mu.RUnlock()
-
 	key := contentPrefix + hash.String()
 	data, err := bs.db.Get([]byte(key), nil)
 	if err != nil {
+		if err == leveldb.ErrNotFound {
+			return nil, fmt.Errorf("content metadata not found for hash %s: %w", hash.String(), err)
+		}
 		return nil, fmt.Errorf("failed to get content metadata: %w", err)
 	}
 
@@ -262,9 +234,6 @@ func (bs *Blockstore) GetContent(hash hasher.Hash) (*ContentMetadata, error) {
 
 // HasContent checks if content metadata exists.
 func (bs *Blockstore) HasContent(hash hasher.Hash) bool {
-	bs.mu.RLock()
-	defer bs.mu.RUnlock()
-
 	key := contentPrefix + hash.String()
 	val, err := bs.db.Has([]byte(key), nil)
 	return err == nil && val
@@ -272,15 +241,12 @@ func (bs *Blockstore) HasContent(hash hasher.Hash) bool {
 
 // ListContent returns all content hashes.
 func (bs *Blockstore) ListContent() ([]hasher.Hash, error) {
-	bs.mu.RLock()
-	defer bs.mu.RUnlock()
-
 	var hashes []hasher.Hash
-	iter := bs.db.NewIterator(nil, nil)
+	prefix := []byte(contentPrefix)
+	iter := bs.db.NewIterator(util.BytesPrefix(prefix), nil)
 	defer iter.Release()
 
-	prefix := []byte(contentPrefix)
-	for iter.Seek(prefix); iter.Valid() && bytes.HasPrefix(iter.Key(), prefix); iter.Next() {
+	for iter.Next() {
 		key := string(iter.Key())
 		hashStr := key[len(contentPrefix):]
 		hash, err := hasher.HashFromString(hashStr)
