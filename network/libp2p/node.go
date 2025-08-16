@@ -206,6 +206,42 @@ func (n *networkNotifiee) Connected(net network.Network, conn network.Conn) {
 	if n.node.bitswap != nil {
 		n.node.bitswap.HandleNewPeer(conn.RemotePeer())
 	}
+
+	// Try to make a reservation with the peer if it supports relaying
+	go func(p peer.ID) {
+		// Use a background context because the connection is already established
+		// and we don't want to block the notifier.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		pinfo := n.node.host.Peerstore().PeerInfo(p)
+		protocols, err := n.node.host.Peerstore().GetProtocols(p)
+		if err != nil {
+			// Can happen if the peer disconnects quickly
+			log.Printf("Could not get protocols for peer %s: %v", p, err)
+			return
+		}
+
+		hasRelay := false
+		for _, proto := range protocols {
+			if proto == "/libp2p/circuit/relay/0.2.0/hop" {
+				hasRelay = true
+				break
+			}
+		}
+
+		if !hasRelay {
+			return // Not a relay
+		}
+
+		log.Printf("Attempting to reserve slot with newly connected relay: %s", p)
+		_, err = relayv2client.Reserve(ctx, n.node.host, pinfo)
+		if err != nil {
+			log.Printf("Failed to reserve slot with %s: %v", p, err)
+		} else {
+			log.Printf("Successfully reserved slot with %s", p)
+		}
+	}(conn.RemotePeer())
 }
 
 func (n *networkNotifiee) Disconnected(net network.Network, conn network.Conn) {

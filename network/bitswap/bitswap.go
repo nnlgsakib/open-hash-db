@@ -24,9 +24,9 @@ import (
 )
 
 const (
-	ProtocolBitswap         = protocol.ID("/openhashdb/bitswap/1.2.0")
-	sendWantlistInterval    = 10 * time.Second
-	presenceCacheTTL        = 1 * time.Minute
+	ProtocolBitswap      = protocol.ID("/openhashdb/bitswap/1.2.0")
+	sendWantlistInterval = 10 * time.Second
+	presenceCacheTTL     = 1 * time.Minute
 )
 
 // Engine is the main bitswap engine.
@@ -144,7 +144,7 @@ func (e *Engine) GetBlocks(ctx context.Context, hashes []hasher.Hash) (<-chan bl
 func (e *Engine) handleNewStream(s network.Stream) {
 	remotePeer := s.Conn().RemotePeer()
 	ledger := e.getOrCreateLedger(remotePeer)
-	
+
 	defer s.Close()
 	reader := bufio.NewReader(s)
 
@@ -185,7 +185,7 @@ func (e *Engine) handleNewStream(s network.Stream) {
 }
 
 func (e *Engine) handleIncomingBlocks(blocks []*pb.Message_Block, remotePeer peer.ID) {
-	log.Printf("[Bitswap] Received %d blocks from %s", len(blocks), remotePeer)
+	// log.Printf("[Bitswap] Received %d blocks from %s", len(blocks), remotePeer)
 	for _, b := range blocks {
 		hash, err := hasher.HashFromBytes(b.Hash)
 		if err != nil {
@@ -321,7 +321,7 @@ func (e *Engine) sendMatchingBlocks(p peer.ID, wl *pb.Message_Wantlist) {
 	}
 
 	if len(blocksToSend) > 0 {
-		log.Printf("[Bitswap] Fulfilling want-block request from %s for %d blocks", p, len(blocksToSend))
+		// log.Printf("[Bitswap] Fulfilling want-block request from %s for %d blocks", p, len(blocksToSend))
 	}
 	if len(presencesToSend) > 0 {
 		log.Printf("[Bitswap] Responding to want-have request from %s with %d presences", p, len(presencesToSend))
@@ -435,6 +435,7 @@ type WantlistManager struct {
 	wants map[hasher.Hash]WantlistEntry
 	mu    sync.RWMutex
 }
+
 func NewWantlistManager() *WantlistManager {
 	return &WantlistManager{wants: make(map[hasher.Hash]WantlistEntry)}
 }
@@ -460,13 +461,13 @@ func (wm *WantlistManager) GetWantlist() []WantlistEntry {
 
 // --- PeerLedger ---
 type peerLedger struct {
-	peer            peer.ID
-	bytesSent       uint64
-	bytesRecv       uint64
-	sentPresence    map[hasher.Hash]time.Time
-	outgoing        chan *pb.Message
-	done            chan struct{}
-	mu              sync.RWMutex
+	peer         peer.ID
+	bytesSent    uint64
+	bytesRecv    uint64
+	sentPresence map[hasher.Hash]time.Time
+	outgoing     chan *pb.Message
+	done         chan struct{}
+	mu           sync.RWMutex
 }
 
 func newPeerLedger(p peer.ID, ctx context.Context, h host.Host) *peerLedger {
