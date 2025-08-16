@@ -30,6 +30,16 @@ func HashFromString(s string) (Hash, error) {
 	return h, nil
 }
 
+// HashFromBytes creates a Hash from a byte slice
+func HashFromBytes(b []byte) (Hash, error) {
+	var h Hash
+	if len(b) != 32 {
+		return h, fmt.Errorf("hash must be 32 bytes, got %d", len(b))
+	}
+	copy(h[:], b)
+	return h, nil
+}
+
 // HashBytes computes SHA-256 hash of byte slice
 func HashBytes(data []byte) Hash {
 	return sha256.Sum256(data)

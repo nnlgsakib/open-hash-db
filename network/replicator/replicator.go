@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"openhashdb/core/blockstore"
+	"openhashdb/core/chunker"
 	"openhashdb/core/hasher"
 	"openhashdb/network/bitswap"
 	"openhashdb/network/libp2p"
@@ -98,12 +99,12 @@ func (r *Replicator) Close() {
 // AnnounceContent announces new content
 func (r *Replicator) AnnounceContent(hash hasher.Hash, size int64) error {
 	if !r.blockstore.HasContent(hash) {
-		log.Printf("Content %s not found locally, skipping announcement", hash.String())
+		log.Printf("[Replicator] Content %s not found locally, skipping announcement", hash.String())
 		return fmt.Errorf("content %s not found locally", hash.String())
 	}
 
 	if err := r.node.AnnounceContent(hash.String()); err != nil {
-		log.Printf("Warning: failed to announce content to DHT: %v", err)
+		log.Printf("[Replicator] Warning: failed to announce content to DHT: %v", err)
 	}
 
 	announcement := ContentAnnouncement{
@@ -128,13 +129,10 @@ func (r *Replicator) PinContent(hash hasher.Hash) error {
 	r.mu.Unlock()
 
 	if r.blockstore.HasContent(hash) {
-		// TODO: Implement ref counting on blockstore content metadata
 		return nil
 	}
 
-	// If content is not local, fetch it in the background
 	go r.FetchAndStore(hash)
-
 	return nil
 }
 
@@ -143,11 +141,6 @@ func (r *Replicator) UnpinContent(hash hasher.Hash) error {
 	r.mu.Lock()
 	delete(r.pinnedContent, hash.String())
 	r.mu.Unlock()
-
-	if r.blockstore.HasContent(hash) {
-		// TODO: Implement ref counting on blockstore content metadata
-	}
-
 	return nil
 }
 
@@ -176,8 +169,6 @@ func (r *Replicator) handleGossipMessage(peerID peer.ID, data []byte) error {
 	if err := json.Unmarshal(data, &announcement); err == nil {
 		return r.handleContentAnnouncement(peerID, &announcement)
 	}
-
-	log.Printf("Unknown gossip message from peer %s", peerID.String())
 	return nil
 }
 
@@ -202,86 +193,96 @@ func (r *Replicator) handleContentAnnouncement(peerID peer.ID, announcement *Con
 	}()
 
 	if announcement.Size > LargeFileSizeThreshold {
-		log.Printf("Content %s is larger than %d bytes, skipping automatic replication", announcement.Hash.String(), LargeFileSizeThreshold)
 		return nil
 	}
 
 	providers, err := r.node.FindContentProviders(announcement.Hash.String())
 	if err != nil {
-		log.Printf("Failed to find providers for %s: %v", announcement.Hash.String(), err)
 		return nil
 	}
 
 	if len(providers) >= int(r.replicationFactor) {
-		log.Printf("Replication factor met for %s, skipping replication", announcement.Hash.String())
 		return nil
 	}
 
-	log.Printf("Replication factor not met for %s, starting replication...", announcement.Hash.String())
+	log.Printf("[Replicator] Replication factor not met for %s, starting replication...", announcement.Hash.String())
 	go r.FetchAndStore(announcement.Hash)
 
 	return nil
 }
 
 func (r *Replicator) FetchAndStore(hash hasher.Hash) error {
-	log.Printf("Fetching content %s...", hash.String())
+	log.Printf("[Replicator] Fetching content %s...", hash.String())
 
 	ctx, cancel := context.WithTimeout(r.ctx, 2*time.Minute)
 	defer cancel()
 
-	// Fetch the root block, which should be the metadata
 	rootBlock, err := r.bitswap.GetBlock(ctx, hash)
 	if err != nil {
-		log.Printf("Failed to fetch root block %s: %v", hash.String(), err)
+		log.Printf("[Replicator] Failed to fetch root block %s: %v", hash.String(), err)
 		replicationFailuresTotal.Inc()
 		return err
 	}
 
-	// The root block for a file/directory is its metadata
 	var metadata blockstore.ContentMetadata
 	if err := json.Unmarshal(rootBlock.RawData(), &metadata); err != nil {
-		log.Printf("Fetched root block %s is not valid metadata: %v", hash.String(), err)
-		replicationFailuresTotal.Inc()
-		return err
+		log.Printf("[Replicator] Fetched root block %s is not valid metadata, treating as raw file.", hash.String())
+		chunkInfo := chunker.ChunkInfo{
+			Hash: rootBlock.Hash(),
+			Size: len(rootBlock.RawData()),
+		}
+		metadata = blockstore.ContentMetadata{
+			Filename:    hash.String(),
+			Size:        int64(chunkInfo.Size),
+			IsDirectory: false,
+			Chunks:      []chunker.ChunkInfo{chunkInfo},
+			CreatedAt:   time.Now(),
+			ModTime:     time.Now(),
+			RefCount:    1,
+		}
+		metadataBytes, _ := json.Marshal(metadata)
+		metadata.Hash = hasher.HashBytes(metadataBytes)
 	}
 
-	// Store the metadata
 	if err := r.blockstore.StoreContent(&metadata); err != nil {
-		log.Printf("Failed to store metadata for %s: %v", hash.String(), err)
+		log.Printf("[Replicator] Failed to store metadata for %s: %v", hash.String(), err)
 		return err
 	}
 
-	// If it's a file, fetch all its chunks
 	if !metadata.IsDirectory && len(metadata.Chunks) > 0 {
-		blockHashes := make([]hasher.Hash, len(metadata.Chunks))
-		for i, chunk := range metadata.Chunks {
-			blockHashes[i] = chunk.Hash
+		blockHashes := make([]hasher.Hash, 0)
+		for _, chunk := range metadata.Chunks {
+			if chunk.Hash != rootBlock.Hash() {
+				blockHashes = append(blockHashes, chunk.Hash)
+			}
 		}
 
-		blockChannel, err := r.bitswap.GetBlocks(ctx, blockHashes)
-		if err != nil {
-			log.Printf("Failed to start bitswap session for chunks of %s: %v", hash.String(), err)
-			replicationFailuresTotal.Inc()
-			return err
-		}
-
-		for blk := range blockChannel {
-			log.Printf("Replicated block %s for content %s", blk.Hash().String(), hash.String())
+		if len(blockHashes) > 0 {
+			blockChannel, err := r.bitswap.GetBlocks(ctx, blockHashes)
+			if err != nil {
+				log.Printf("[Replicator] Failed to start bitswap session for chunks of %s: %v", hash.String(), err)
+				replicationFailuresTotal.Inc()
+				return err
+			}
+			replicatedCount := 0
+			for range blockChannel {
+				replicatedCount++
+			}
+			log.Printf("[Replicator] Fetched %d/%d blocks for content %s", replicatedCount, len(blockHashes), hash.String())
 		}
 	}
 
-	log.Printf("Successfully replicated content %s", hash.String())
+	log.Printf("[Replicator] Successfully replicated content %s", hash.String())
 	replicationSuccessTotal.Inc()
 
-	if err := r.AnnounceContent(hash, metadata.Size); err != nil {
-		log.Printf("Failed to announce newly replicated content %s: %v", hash.String(), err)
+	if err := r.AnnounceContent(metadata.Hash, metadata.Size); err != nil {
+		log.Printf("[Replicator] Failed to announce newly replicated content %s: %v", metadata.Hash.String(), err)
 	}
 	return nil
 }
 
 // announceContentPeriodically periodically announces pinned content
 func (r *Replicator) announceContentPeriodically() {
-	log.Println("Starting periodic announcement of pinned content...")
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 
@@ -304,23 +305,23 @@ func (r *Replicator) announcePinnedContent() {
 	}
 	r.mu.RUnlock()
 
-	log.Printf("Announcing %d pinned content items...", len(hashes))
+	if len(hashes) > 0 {
+		log.Printf("[Replicator] Announcing %d pinned content items...", len(hashes))
+	}
 
 	for _, hashStr := range hashes {
 		hash, err := hasher.HashFromString(hashStr)
 		if err != nil {
-			log.Printf("Invalid pinned hash %s: %v", hashStr, err)
 			continue
 		}
 
 		metadata, err := r.blockstore.GetContent(hash)
 		if err != nil {
-			log.Printf("Could not get metadata for pinned content %s: %v", hash.String(), err)
 			continue
 		}
 
 		if err := r.AnnounceContent(hash, metadata.Size); err != nil {
-			log.Printf("Failed to announce pinned content %s: %v", hash.String(), err)
+			log.Printf("[Replicator] Failed to announce pinned content %s: %v", hash.String(), err)
 		}
 	}
 }

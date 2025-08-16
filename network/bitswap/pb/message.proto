@@ -1,0 +1,37 @@
+syntax = "proto3";
+package bitswap.pb;
+option go_package = "openhashdb/network/bitswap/pb";
+
+message Message {
+    message Wantlist {
+        message Entry {
+            bytes hash = 1; // The hash of the block
+            int32 priority = 2; // The priority of the want
+            enum WantType {
+                Have = 0;
+                Block = 1;
+            }
+            WantType want_type = 3; // Whether this is a want-have or want-block
+        }
+        repeated Entry entries = 1;
+        bool full = 2; // If true, this is the full wantlist
+    }
+
+    message Block {
+        bytes hash = 1;
+        bytes data = 2;
+    }
+
+    message BlockPresence {
+        bytes hash = 1;
+        enum PresenceType {
+            Have = 0;
+            DontHave = 1;
+        }
+        PresenceType type = 2;
+    }
+
+    Wantlist wantlist = 1;
+    repeated Block blocks = 2;
+    repeated BlockPresence block_presences = 3;
+}

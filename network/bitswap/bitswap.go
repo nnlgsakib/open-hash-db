@@ -1,9 +1,11 @@
 package bitswap
 
 import (
+	"bufio"
 	"context"
-	"encoding/json"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"sync"
 	"time"
@@ -11,17 +13,20 @@ import (
 	"openhashdb/core/block"
 	"openhashdb/core/blockstore"
 	"openhashdb/core/hasher"
+	"openhashdb/network/bitswap/pb"
 
 	"github.com/google/uuid"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
-	ProtocolBitswap = protocol.ID("/openhashdb/bitswap/1.1.0")
-	sendWantlistInterval = 10 * time.Second
+	ProtocolBitswap         = protocol.ID("/openhashdb/bitswap/1.2.0")
+	sendWantlistInterval    = 10 * time.Second
+	presenceCacheTTL        = 1 * time.Minute
 )
 
 // Engine is the main bitswap engine.
@@ -62,15 +67,25 @@ func (e *Engine) GetBlock(ctx context.Context, h hasher.Hash) (block.Block, erro
 	session := e.newSession(ctx)
 	defer e.closeSession(session.id)
 
-	session.AddWant(h)
-	e.wantlist.Add(h, 1)
+	session.AddWant(h, pb.Message_Wantlist_Entry_Have)
+	e.wantlist.Add(h, 1, pb.Message_Wantlist_Entry_Have)
 	e.broadcastWantlist()
 
 	select {
-	case blk := <-session.blockChannel:
-		return blk, nil
+	case peerWithBlock := <-session.peerHasBlockChannel:
+		e.sendWantBlockToPeer(peerWithBlock, h)
+		select {
+		case blk := <-session.blockChannel:
+			return blk, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(20 * time.Second):
+			return nil, fmt.Errorf("timeout waiting for block %s", h)
+		}
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	case <-time.After(20 * time.Second):
+		return nil, fmt.Errorf("timeout waiting for peer with block %s", h)
 	}
 }
 
@@ -83,15 +98,36 @@ func (e *Engine) GetBlocks(ctx context.Context, hashes []hasher.Hash) (<-chan bl
 		defer e.closeSession(session.id)
 		defer close(output)
 
+		wantsCount := 0
 		for _, h := range hashes {
 			if has, _ := e.blockstore.Has(h); !has {
-				session.AddWant(h)
-				e.wantlist.Add(h, 1)
+				session.AddWant(h, pb.Message_Wantlist_Entry_Have)
+				e.wantlist.Add(h, 1, pb.Message_Wantlist_Entry_Have)
+				wantsCount++
 			}
 		}
+
+		if wantsCount == 0 {
+			return
+		}
+
 		e.broadcastWantlist()
 
-		for i := 0; i < len(session.wants); i++ {
+		go func() {
+			for {
+				select {
+				case peerWithBlock := <-session.peerHasBlockChannel:
+					hashToGet := <-session.hashToGetChannel
+					go e.sendWantBlockToPeer(peerWithBlock, hashToGet)
+				case <-session.done:
+					return
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+
+		for i := 0; i < wantsCount; i++ {
 			select {
 			case blk := <-session.blockChannel:
 				output <- blk
@@ -107,50 +143,92 @@ func (e *Engine) GetBlocks(ctx context.Context, hashes []hasher.Hash) (<-chan bl
 // handleNewStream handles incoming bitswap streams.
 func (e *Engine) handleNewStream(s network.Stream) {
 	remotePeer := s.Conn().RemotePeer()
-	log.Printf("Received bitswap stream from %s", remotePeer)
+	ledger := e.getOrCreateLedger(remotePeer)
+	
+	defer s.Close()
+	reader := bufio.NewReader(s)
 
-	var msg Message
-	if err := json.NewDecoder(s).Decode(&msg); err != nil {
-		log.Printf("Failed to decode bitswap message from %s: %v", remotePeer, err)
-		s.Reset()
-		return
-	}
-
-	// Handle received blocks
-	if len(msg.Blocks) > 0 {
-		log.Printf("Received %d blocks from %s", len(msg.Blocks), remotePeer)
-		for _, b := range msg.Blocks {
-			e.blockstore.Put(b)
-			e.wantlist.Remove(b.Hash())
-			e.distributeBlock(b)
+	for {
+		msgLen, err := binary.ReadUvarint(reader)
+		if err != nil {
+			if err != io.EOF && err != network.ErrReset {
+				log.Printf("[Bitswap] Failed to read message length from %s: %v", remotePeer, err)
+			}
+			return
 		}
-	}
 
-	// Handle received wantlist
-	if len(msg.Wantlist.Entries) > 0 {
-		log.Printf("Received wantlist with %d entries from %s", len(msg.Wantlist.Entries), remotePeer)
-		go e.sendMatchingBlocks(remotePeer, msg.Wantlist)
+		buf := make([]byte, msgLen)
+		_, err = io.ReadFull(reader, buf)
+		if err != nil {
+			log.Printf("[Bitswap] Failed to read message from %s: %v", remotePeer, err)
+			return
+		}
+
+		var msg pb.Message
+		if err := proto.Unmarshal(buf, &msg); err != nil {
+			log.Printf("[Bitswap] Failed to decode message from %s: %v", remotePeer, err)
+			continue
+		}
+
+		ledger.BytesRecv(uint64(msgLen))
+
+		if msg.Wantlist != nil && len(msg.Wantlist.Entries) > 0 {
+			go e.sendMatchingBlocks(remotePeer, msg.Wantlist)
+		}
+		if len(msg.Blocks) > 0 {
+			go e.handleIncomingBlocks(msg.Blocks, remotePeer)
+		}
+		if len(msg.BlockPresences) > 0 {
+			go e.handleIncomingPresences(msg.BlockPresences, remotePeer)
+		}
 	}
 }
 
-// HandleNewPeer is called when a new peer connects.
-func (e *Engine) HandleNewPeer(p peer.ID) {
-	e.mu.Lock()
-	if _, exists := e.peers[p]; !exists {
-		e.peers[p] = newPeerLedger()
-		log.Printf("Tracking new bitswap peer: %s", p)
+func (e *Engine) handleIncomingBlocks(blocks []*pb.Message_Block, remotePeer peer.ID) {
+	log.Printf("[Bitswap] Received %d blocks from %s", len(blocks), remotePeer)
+	for _, b := range blocks {
+		hash, err := hasher.HashFromBytes(b.Hash)
+		if err != nil {
+			continue
+		}
+		newBlock := block.NewBlockWithHash(hash, b.Data)
+		e.blockstore.Put(newBlock)
+		e.wantlist.Remove(newBlock.Hash())
+		e.distributeBlock(newBlock)
 	}
-	e.mu.Unlock()
+}
 
-	// Send our full wantlist to the new peer
+func (e *Engine) handleIncomingPresences(presences []*pb.Message_BlockPresence, remotePeer peer.ID) {
+	for _, pres := range presences {
+		hash, err := hasher.HashFromBytes(pres.Hash)
+		if err != nil {
+			continue
+		}
+		if pres.Type == pb.Message_BlockPresence_Have {
+			e.distributeHave(hash, remotePeer)
+		}
+	}
+}
+
+func (e *Engine) getOrCreateLedger(p peer.ID) *peerLedger {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	ledger, exists := e.peers[p]
+	if !exists {
+		ledger = newPeerLedger(p, e.ctx, e.host)
+		e.peers[p] = ledger
+	}
+	return ledger
+}
+
+func (e *Engine) HandleNewPeer(p peer.ID) {
+	e.getOrCreateLedger(p)
 	go e.sendWantlistToPeer(p, true)
 }
 
-// periodicWantlistBroadcast periodically sends the wantlist to all connected peers.
 func (e *Engine) periodicWantlistBroadcast() {
 	ticker := time.NewTicker(sendWantlistInterval)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ticker.C:
@@ -161,91 +239,129 @@ func (e *Engine) periodicWantlistBroadcast() {
 	}
 }
 
-// broadcastWantlist sends the current wantlist to all connected peers.
 func (e *Engine) broadcastWantlist() {
 	wl := e.wantlist.GetWantlist()
 	if len(wl) == 0 {
 		return
 	}
-
-	log.Printf("Broadcasting wantlist with %d items", len(wl))
+	log.Printf("[Bitswap] Broadcasting wantlist with %d items", len(wl))
 	for _, p := range e.host.Network().Peers() {
 		go e.sendWantlistToPeer(p, false)
 	}
 }
 
-// sendWantlistToPeer sends the wantlist to a specific peer.
 func (e *Engine) sendWantlistToPeer(p peer.ID, full bool) {
 	wl := e.wantlist.GetWantlist()
 	if len(wl) == 0 {
 		return
 	}
-
-	msg := Message{
-		Wantlist: Wantlist{
-			Entries: wl,
-			Full:    full,
-		},
+	entries := make([]*pb.Message_Wantlist_Entry, len(wl))
+	for i, entry := range wl {
+		entries[i] = &pb.Message_Wantlist_Entry{
+			Hash:     entry.Hash[:],
+			Priority: int32(entry.Priority),
+			WantType: entry.WantType,
+		}
 	}
-
-	e.sendMessage(p, &msg)
+	msg := &pb.Message{
+		Wantlist: &pb.Message_Wantlist{Entries: entries, Full: full},
+	}
+	e.sendMessage(p, msg)
 }
 
-// sendMatchingBlocks finds blocks a peer wants and sends them.
-func (e *Engine) sendMatchingBlocks(p peer.ID, wl Wantlist) {
-	var blocksToSend []block.Block
+func (e *Engine) sendWantBlockToPeer(p peer.ID, h hasher.Hash) {
+	entry := &pb.Message_Wantlist_Entry{
+		Hash:     h[:],
+		Priority: 100,
+		WantType: pb.Message_Wantlist_Entry_Block,
+	}
+	msg := &pb.Message{
+		Wantlist: &pb.Message_Wantlist{Entries: []*pb.Message_Wantlist_Entry{entry}},
+	}
+	e.sendMessage(p, msg)
+}
+
+func (e *Engine) sendMatchingBlocks(p peer.ID, wl *pb.Message_Wantlist) {
+	var blocksToSend []*pb.Message_Block
+	var presencesToSend []*pb.Message_BlockPresence
+	ledger := e.getOrCreateLedger(p)
+
 	for _, entry := range wl.Entries {
-		if has, _ := e.blockstore.Has(entry.Hash); has {
-			blk, err := e.blockstore.Get(entry.Hash)
-			if err == nil {
-				blocksToSend = append(blocksToSend, blk)
+		hash, err := hasher.HashFromBytes(entry.Hash)
+		if err != nil {
+			continue
+		}
+		has, _ := e.blockstore.Has(hash)
+
+		if entry.WantType == pb.Message_Wantlist_Entry_Block && has {
+			blk, err := e.blockstore.Get(hash)
+			if err != nil {
+				log.Printf("[Bitswap] Core Error: Failed to get block %s from blockstore, but Has() was true: %v", hash, err)
+				continue
 			}
+			blockHash := blk.Hash()
+			blocksToSend = append(blocksToSend, &pb.Message_Block{
+				Hash: blockHash[:],
+				Data: blk.RawData(),
+			})
+		} else if entry.WantType == pb.Message_Wantlist_Entry_Have {
+			if ledger.hasSentPresenceRecently(hash) {
+				continue
+			}
+			presenceType := pb.Message_BlockPresence_DontHave
+			if has {
+				presenceType = pb.Message_BlockPresence_Have
+			}
+			presencesToSend = append(presencesToSend, &pb.Message_BlockPresence{
+				Hash: entry.Hash,
+				Type: presenceType,
+			})
+			ledger.addSentPresence(hash)
 		}
 	}
 
 	if len(blocksToSend) > 0 {
-		log.Printf("Sending %d matching blocks to %s", len(blocksToSend), p)
-		msg := &Message{Blocks: blocksToSend}
-		if err := e.sendMessage(p, msg); err != nil {
-			log.Printf("Failed to send matching blocks to %s: %v", p, err)
-		}
+		log.Printf("[Bitswap] Fulfilling want-block request from %s for %d blocks", p, len(blocksToSend))
+	}
+	if len(presencesToSend) > 0 {
+		log.Printf("[Bitswap] Responding to want-have request from %s with %d presences", p, len(presencesToSend))
+	}
+
+	if len(blocksToSend) > 0 || len(presencesToSend) > 0 {
+		msg := &pb.Message{Blocks: blocksToSend, BlockPresences: presencesToSend}
+		e.sendMessage(p, msg)
 	}
 }
 
-// sendMessage sends a bitswap message to a peer.
-func (e *Engine) sendMessage(p peer.ID, msg *Message) error {
-	s, err := e.host.NewStream(e.ctx, p, ProtocolBitswap)
-	if err != nil {
-		return fmt.Errorf("failed to open stream to %s: %w", p, err)
+func (e *Engine) sendMessage(p peer.ID, msg *pb.Message) {
+	ledger := e.getOrCreateLedger(p)
+	select {
+	case ledger.outgoing <- msg:
+	case <-e.ctx.Done():
 	}
-	defer s.Close()
-
-	if err := json.NewEncoder(s).Encode(msg); err != nil {
-		s.Reset()
-		return fmt.Errorf("failed to send bitswap message to %s: %w", p, err)
-	}
-
-	return nil
 }
 
 // --- Session Management ---
-
-// Session tracks a single GetBlocks operation.
 type Session struct {
-	id           string
-	wants        map[hasher.Hash]struct{}
-	blockChannel chan block.Block
-	mu           sync.RWMutex
+	id                  string
+	wants               map[hasher.Hash]pb.Message_Wantlist_Entry_WantType
+	blockChannel        chan block.Block
+	peerHasBlockChannel chan peer.ID
+	hashToGetChannel    chan hasher.Hash
+	done                chan struct{}
+	mu                  sync.RWMutex
 }
 
 func (e *Engine) newSession(ctx context.Context) *Session {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-
 	session := &Session{
-		id:           uuid.New().String(),
-		wants:        make(map[hasher.Hash]struct{}),
-		blockChannel: make(chan block.Block),
+		id:                  uuid.New().String(),
+		wants:               make(map[hasher.Hash]pb.Message_Wantlist_Entry_WantType),
+		blockChannel:        make(chan block.Block, 1),
+		peerHasBlockChannel: make(chan peer.ID, 1),
+		hashToGetChannel:    make(chan hasher.Hash, 1),
+		done:                make(chan struct{}),
 	}
 	e.sessions[session.id] = session
 	return session
@@ -254,58 +370,84 @@ func (e *Engine) newSession(ctx context.Context) *Session {
 func (e *Engine) closeSession(id string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	delete(e.sessions, id)
+	if session, ok := e.sessions[id]; ok {
+		close(session.done)
+		delete(e.sessions, id)
+	}
 }
 
-func (s *Session) AddWant(h hasher.Hash) {
+func (s *Session) AddWant(h hasher.Hash, wantType pb.Message_Wantlist_Entry_WantType) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.wants[h] = struct{}{}
+	s.wants[h] = wantType
 }
 
-// distributeBlock finds the session that wants the block and sends it.
 func (e *Engine) distributeBlock(b block.Block) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-
 	for _, session := range e.sessions {
-		session.mu.RLock()
-		_, wanted := session.wants[b.Hash()]
-		session.mu.RUnlock()
+		select {
+		case <-session.done:
+			continue
+		default:
+			session.mu.RLock()
+			_, wanted := session.wants[b.Hash()]
+			session.mu.RUnlock()
+			if wanted {
+				session.blockChannel <- b
+				session.mu.Lock()
+				delete(session.wants, b.Hash())
+				session.mu.Unlock()
+			}
+		}
+	}
+}
 
-		if wanted {
-			session.blockChannel <- b
-			session.mu.Lock()
-			delete(session.wants, b.Hash())
-			session.mu.Unlock()
+func (e *Engine) distributeHave(h hasher.Hash, p peer.ID) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	for _, session := range e.sessions {
+		select {
+		case <-session.done:
+			continue
+		default:
+			session.mu.RLock()
+			wantType, wanted := session.wants[h]
+			session.mu.RUnlock()
+			if wanted && wantType == pb.Message_Wantlist_Entry_Have {
+				session.peerHasBlockChannel <- p
+				session.hashToGetChannel <- h
+				session.mu.Lock()
+				session.wants[h] = pb.Message_Wantlist_Entry_Block
+				session.mu.Unlock()
+			}
 		}
 	}
 }
 
 // --- WantlistManager ---
+type WantlistEntry struct {
+	Hash     hasher.Hash
+	Priority int
+	WantType pb.Message_Wantlist_Entry_WantType
+}
 type WantlistManager struct {
 	wants map[hasher.Hash]WantlistEntry
 	mu    sync.RWMutex
 }
-
 func NewWantlistManager() *WantlistManager {
-	return &WantlistManager{
-		wants: make(map[hasher.Hash]WantlistEntry),
-	}
+	return &WantlistManager{wants: make(map[hasher.Hash]WantlistEntry)}
 }
-
-func (wm *WantlistManager) Add(h hasher.Hash, priority int) {
+func (wm *WantlistManager) Add(h hasher.Hash, priority int, wantType pb.Message_Wantlist_Entry_WantType) {
 	wm.mu.Lock()
 	defer wm.mu.Unlock()
-	wm.wants[h] = WantlistEntry{Hash: h, Priority: priority}
+	wm.wants[h] = WantlistEntry{Hash: h, Priority: priority, WantType: wantType}
 }
-
 func (wm *WantlistManager) Remove(h hasher.Hash) {
 	wm.mu.Lock()
 	defer wm.mu.Unlock()
 	delete(wm.wants, h)
 }
-
 func (wm *WantlistManager) GetWantlist() []WantlistEntry {
 	wm.mu.RLock()
 	defer wm.mu.RUnlock()
@@ -316,13 +458,108 @@ func (wm *WantlistManager) GetWantlist() []WantlistEntry {
 	return wl
 }
 
-// --- PeerLedger (simplified) ---
+// --- PeerLedger ---
 type peerLedger struct {
-	peer      peer.ID
-	bytesSent uint64
-	bytesRecv uint64
+	peer            peer.ID
+	bytesSent       uint64
+	bytesRecv       uint64
+	sentPresence    map[hasher.Hash]time.Time
+	outgoing        chan *pb.Message
+	done            chan struct{}
+	mu              sync.RWMutex
 }
 
-func newPeerLedger() *peerLedger {
-	return &peerLedger{}
+func newPeerLedger(p peer.ID, ctx context.Context, h host.Host) *peerLedger {
+	pl := &peerLedger{
+		peer:         p,
+		sentPresence: make(map[hasher.Hash]time.Time),
+		outgoing:     make(chan *pb.Message, 16),
+		done:         make(chan struct{}),
+	}
+	go pl.sender(ctx, h)
+	return pl
+}
+
+func (pl *peerLedger) sender(ctx context.Context, h host.Host) {
+	var stream network.Stream
+	var writer *bufio.Writer
+
+	defer func() {
+		if stream != nil {
+			stream.Close()
+		}
+	}()
+
+	for {
+		select {
+		case msg := <-pl.outgoing:
+			var err error
+			if stream == nil {
+				stream, err = h.NewStream(ctx, pl.peer, ProtocolBitswap)
+				if err != nil {
+					log.Printf("[Bitswap] Failed to open stream to %s: %v", pl.peer, err)
+					continue
+				}
+				writer = bufio.NewWriter(stream)
+			}
+
+			data, err := proto.Marshal(msg)
+			if err != nil {
+				log.Printf("[Bitswap] Failed to marshal message for %s: %v", pl.peer, err)
+				continue
+			}
+
+			lenBuf := make([]byte, binary.MaxVarintLen64)
+			n := binary.PutUvarint(lenBuf, uint64(len(data)))
+
+			_, err = writer.Write(lenBuf[:n])
+			if err == nil {
+				_, err = writer.Write(data)
+			}
+			if err == nil {
+				err = writer.Flush()
+			}
+
+			if err != nil {
+				log.Printf("[Bitswap] Failed to send message to %s: %v", pl.peer, err)
+				stream.Reset()
+				stream = nil
+				writer = nil
+			} else {
+				pl.BytesSent(uint64(len(data)))
+			}
+
+		case <-pl.done:
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (pl *peerLedger) addSentPresence(h hasher.Hash) {
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
+	pl.sentPresence[h] = time.Now()
+}
+
+func (pl *peerLedger) hasSentPresenceRecently(h hasher.Hash) bool {
+	pl.mu.RLock()
+	defer pl.mu.RUnlock()
+	if t, ok := pl.sentPresence[h]; ok {
+		return time.Since(t) < presenceCacheTTL
+	}
+	return false
+}
+
+func (pl *peerLedger) BytesSent(n uint64) {
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
+	pl.bytesSent += n
+}
+
+func (pl *peerLedger) BytesRecv(n uint64) {
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
+	pl.bytesRecv += n
 }
