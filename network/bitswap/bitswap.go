@@ -544,8 +544,7 @@ func (pl *peerLedger) sender(ctx context.Context, h host.Host) {
 			lenBuf := make([]byte, binary.MaxVarintLen64)
 			n := binary.PutUvarint(lenBuf, uint64(len(data)))
 
-			// Set a write deadline on the stream
-			stream.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			
 
 			_, err = writer.Write(lenBuf[:n])
 			if err == nil {
@@ -554,9 +553,6 @@ func (pl *peerLedger) sender(ctx context.Context, h host.Host) {
 			if err == nil {
 				err = writer.Flush()
 			}
-
-			// Clear the deadline
-			stream.SetWriteDeadline(time.Time{})
 
 			if err != nil {
 				log.Printf("[Bitswap] Failed to send message to %s: %v", pl.peer, err)
