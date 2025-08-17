@@ -531,7 +531,8 @@ func isClientClosedError(err error) bool {
 	// Check for common client-side disconnect errors
 	return strings.Contains(err.Error(), "forcibly closed by the remote host") ||
 		strings.Contains(err.Error(), "broken pipe") ||
-		strings.Contains(err.Error(), "connection reset by peer")
+		strings.Contains(err.Error(), "connection reset by peer") ||
+		strings.Contains(err.Error(), "An established connection was aborted by the software in your host machine")
 }
 
 func max(a, b int64) int64 {
