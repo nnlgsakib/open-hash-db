@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"openhashdb/core/block"
@@ -29,6 +30,76 @@ import (
 	"github.com/gorilla/mux"
 )
 
+const (
+	// Buffer sizes and limits
+	bufferSize       = 64 * 1024 // 64KB buffer for streaming
+	maxConcurrentOps = 10        // Maximum concurrent chunk operations
+	chunkCacheSize   = 100       // Number of chunks to keep in memory
+	prefetchAhead    = 5         // Number of chunks to prefetch ahead
+)
+
+// ChunkCache represents an LRU cache for chunks
+type ChunkCache struct {
+	mu      sync.RWMutex
+	cache   map[string][]byte
+	order   []string
+	maxSize int
+}
+
+// NewChunkCache creates a new chunk cache
+func NewChunkCache(size int) *ChunkCache {
+	return &ChunkCache{
+		cache:   make(map[string][]byte),
+		order:   make([]string, 0, size),
+		maxSize: size,
+	}
+}
+
+// Get retrieves a chunk from cache
+func (cc *ChunkCache) Get(key string) ([]byte, bool) {
+	cc.mu.RLock()
+	data, exists := cc.cache[key]
+	cc.mu.RUnlock()
+	if exists {
+		// Move to front (most recently used)
+		cc.mu.Lock()
+		cc.moveToFront(key)
+		cc.mu.Unlock()
+	}
+	return data, exists
+}
+
+// Put adds a chunk to cache
+func (cc *ChunkCache) Put(key string, data []byte) {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+
+	if _, exists := cc.cache[key]; exists {
+		cc.moveToFront(key)
+		return
+	}
+
+	if len(cc.cache) >= cc.maxSize {
+		// Evict least recently used
+		oldest := cc.order[len(cc.order)-1]
+		delete(cc.cache, oldest)
+		cc.order = cc.order[:len(cc.order)-1]
+	}
+
+	cc.cache[key] = data
+	cc.order = append([]string{key}, cc.order...)
+}
+
+// moveToFront moves key to front of order slice
+func (cc *ChunkCache) moveToFront(key string) {
+	for i, k := range cc.order {
+		if k == key {
+			cc.order = append([]string{key}, append(cc.order[:i], cc.order[i+1:]...)...)
+			break
+		}
+	}
+}
+
 // Server represents the REST API server
 type Server struct {
 	storage    *blockstore.Blockstore
@@ -38,6 +109,8 @@ type Server struct {
 	node       interface{} // libp2p node for network stats
 	router     *mux.Router
 	server     *http.Server
+	chunkCache *ChunkCache
+	bufferPool sync.Pool
 }
 
 // UploadResponse represents the response from upload operations
@@ -77,6 +150,12 @@ func NewServer(bs *blockstore.Blockstore, replicator *replicator.Replicator, nod
 		chunker:    chunker.NewChunker(),
 		node:       node,
 		router:     mux.NewRouter(),
+		chunkCache: NewChunkCache(chunkCacheSize),
+		bufferPool: sync.Pool{
+			New: func() interface{} {
+				return make([]byte, bufferSize)
+			},
+		},
 	}
 
 	if libp2pNode, ok := node.(*libp2p.Node); ok {
@@ -133,13 +212,15 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// Start starts the server
+// Start starts the server with optimized timeouts
 func (s *Server) Start(addr string) error {
 	s.server = &http.Server{
-		Addr:         addr,
-		Handler:      s.router,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		Addr:           addr,
+		Handler:        s.router,
+		ReadTimeout:    5 * time.Minute,  // Increased for large file operations
+		WriteTimeout:   10 * time.Minute, // Increased for large downloads
+		IdleTimeout:    2 * time.Minute,  // Connection keepalive
+		MaxHeaderBytes: 1 << 20,          // 1MB max headers
 	}
 
 	log.Printf("Starting REST API server on %s", addr)
@@ -279,7 +360,7 @@ func (s *Server) uploadFolder(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, response)
 }
 
-// downloadContent handles content downloads.
+// downloadContent handles content downloads with optimized streaming
 func (s *Server) downloadContent(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	hashStr := vars["hash"]
@@ -315,68 +396,128 @@ func (s *Server) downloadContent(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", metadata.MimeType)
 	w.Header().Set("Content-Length", strconv.FormatInt(metadata.Size, 10))
 
-	s.streamChunks(w, r, metadata)
+	s.streamChunksOptimized(w, r, metadata)
 }
 
+// streamDirectoryAsZip creates zip files with optimized streaming
 func (s *Server) streamDirectoryAsZip(w http.ResponseWriter, r *http.Request, metadata *blockstore.ContentMetadata) {
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s.zip\"", metadata.Filename))
 
-	zipWriter := zip.NewWriter(w)
-	defer zipWriter.Close()
+	// Use Transfer-Encoding: chunked for streaming
+	w.Header().Set("Transfer-Encoding", "chunked")
 
-	err := s.addFilesToZip(r.Context(), zipWriter, metadata.Links, "")
-	if err != nil {
-		log.Printf("Error creating zip archive for %s: %v", metadata.Hash.String(), err)
-		// We can't write a proper error response if headers have been sent.
+	// Create a pipe for streaming zip data
+	pr, pw := io.Pipe()
+	defer pr.Close()
+
+	// Start zip creation in a goroutine
+	go func() {
+		defer pw.Close()
+		zipWriter := zip.NewWriter(pw)
+		defer zipWriter.Close()
+
+		if err := s.addFilesToZipOptimized(r.Context(), zipWriter, metadata.Links, ""); err != nil {
+			log.Printf("Error creating zip archive for %s: %v", metadata.Hash.String(), err)
+		}
+	}()
+
+	// Stream the zip data
+	buffer := s.bufferPool.Get().([]byte)
+	defer s.bufferPool.Put(buffer)
+
+	for {
+		n, err := pr.Read(buffer)
+		if n > 0 {
+			if _, writeErr := w.Write(buffer[:n]); writeErr != nil {
+				if !isClientClosedError(writeErr) {
+					log.Printf("Error writing zip data: %v", writeErr)
+				}
+				return
+			}
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			if !isClientClosedError(err) {
+				log.Printf("Error reading zip data: %v", err)
+			}
+			return
+		}
 	}
 }
 
+// addFilesToZipOptimized adds files to zip with concurrent processing
+func (s *Server) addFilesToZipOptimized(ctx context.Context, zipWriter *zip.Writer, links []merkle.Link, basePath string) error {
+	// Use semaphore to limit concurrent operations
+	sem := make(chan struct{}, maxConcurrentOps)
 
-
-func (s *Server) addFilesToZip(ctx context.Context, zipWriter *zip.Writer, links []merkle.Link, basePath string) error {
 	for _, link := range links {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case sem <- struct{}{}:
+		}
+
 		pathInZip := filepath.Join(basePath, link.Name)
 
 		if link.Type == "directory" {
 			// Create a directory entry in the zip file
 			_, err := zipWriter.Create(pathInZip + "/")
 			if err != nil {
+				<-sem
 				return fmt.Errorf("failed to create directory in zip: %w", err)
 			}
 
 			// Get the metadata for the subdirectory to recurse
 			dirMetadata, err := s.storage.GetContent(link.Hash)
 			if err != nil {
+				<-sem
 				return fmt.Errorf("could not get metadata for subdirectory %s (%s): %w", link.Name, link.Hash.String(), err)
 			}
-			if err := s.addFilesToZip(ctx, zipWriter, dirMetadata.Links, pathInZip); err != nil {
+
+			<-sem
+			if err := s.addFilesToZipOptimized(ctx, zipWriter, dirMetadata.Links, pathInZip); err != nil {
 				return err
 			}
 		} else { // "file"
 			fileWriter, err := zipWriter.Create(pathInZip)
 			if err != nil {
+				<-sem
 				return fmt.Errorf("failed to create file in zip: %w", err)
 			}
 
 			// Get file metadata to access its chunks
 			fileMetadata, err := s.storage.GetContent(link.Hash)
 			if err != nil {
+				<-sem
 				return fmt.Errorf("could not get metadata for file %s (%s): %w", link.Name, link.Hash.String(), err)
+			}
+
+			// Prefetch all chunks for this file concurrently
+			if err := s.prefetchChunks(ctx, fileMetadata.Chunks); err != nil {
+				<-sem
+				return fmt.Errorf("failed to prefetch chunks for file %s: %w", pathInZip, err)
 			}
 
 			// Stream the chunks of the file into the zip writer
 			for _, chunkInfo := range fileMetadata.Chunks {
-				if err := s.fetchAndStreamChunk(ctx, fileWriter, chunkInfo.Hash, 0, int(chunkInfo.Size)); err != nil {
+				if err := s.fetchAndStreamChunkOptimized(ctx, fileWriter, chunkInfo.Hash, 0, int(chunkInfo.Size)); err != nil {
+					<-sem
 					return fmt.Errorf("failed to stream chunk to zip for file %s: %w", pathInZip, err)
 				}
 			}
+			<-sem
 		}
 	}
 	return nil
 }
 
-// viewContent handles content viewing.
+// viewContent handles content viewing with optimization
 func (s *Server) viewContent(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	hashStr := vars["hash"]
@@ -417,10 +558,11 @@ func (s *Server) viewContent(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", metadata.MimeType)
 	w.Header().Set("Content-Length", strconv.FormatInt(metadata.Size, 10))
 
-	s.streamChunks(w, r, metadata)
+	s.streamChunksOptimized(w, r, metadata)
 }
 
-func (s *Server) streamChunks(w http.ResponseWriter, r *http.Request, metadata *blockstore.ContentMetadata) {
+// streamChunksOptimized provides optimized chunk streaming with prefetching
+func (s *Server) streamChunksOptimized(w http.ResponseWriter, r *http.Request, metadata *blockstore.ContentMetadata) {
 	ctx := r.Context()
 	flusher, hasFlusher := w.(http.Flusher)
 
@@ -428,11 +570,12 @@ func (s *Server) streamChunks(w http.ResponseWriter, r *http.Request, metadata *
 	w.Header().Set("Accept-Ranges", "bytes")
 	w.Header().Set("Content-Type", metadata.MimeType)
 	w.Header().Set("Last-Modified", metadata.ModTime.UTC().Format(http.TimeFormat))
+	w.Header().Set("Cache-Control", "public, max-age=31536000") // Cache for 1 year (immutable content)
 
 	// Handle Range requests
 	rangeHeader := r.Header.Get("Range")
 	if rangeHeader != "" {
-		s.handleRangeRequest(ctx, w, r, metadata, rangeHeader)
+		s.handleRangeRequestOptimized(ctx, w, r, metadata, rangeHeader)
 		return
 	}
 
@@ -440,8 +583,18 @@ func (s *Server) streamChunks(w http.ResponseWriter, r *http.Request, metadata *
 	w.Header().Set("Content-Length", strconv.FormatInt(metadata.Size, 10))
 	w.WriteHeader(http.StatusOK)
 
+	// Prefetch chunks for better performance
+	if err := s.prefetchChunks(ctx, metadata.Chunks); err != nil {
+		log.Printf("Warning: Failed to prefetch chunks for %s: %v", metadata.Hash, err)
+		// Continue without prefetching
+	}
+
+	// Stream chunks with optimized buffering
+	buffer := s.bufferPool.Get().([]byte)
+	defer s.bufferPool.Put(buffer)
+
 	for _, chunkInfo := range metadata.Chunks {
-		if err := s.fetchAndStreamChunk(ctx, w, chunkInfo.Hash, 0, int(chunkInfo.Size)); err != nil {
+		if err := s.streamChunkWithBuffer(ctx, w, chunkInfo.Hash, 0, int(chunkInfo.Size), buffer); err != nil {
 			if !isClientClosedError(err) {
 				log.Printf("Aborting stream for %s due to error: %v", metadata.Hash, err)
 			}
@@ -453,9 +606,10 @@ func (s *Server) streamChunks(w http.ResponseWriter, r *http.Request, metadata *
 	}
 }
 
-func (s *Server) handleRangeRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, metadata *blockstore.ContentMetadata, rangeHeader string) {
+// handleRangeRequestOptimized handles range requests with optimization
+func (s *Server) handleRangeRequestOptimized(ctx context.Context, w http.ResponseWriter, r *http.Request, metadata *blockstore.ContentMetadata, rangeHeader string) {
 	flusher, hasFlusher := w.(http.Flusher)
-		start, end, err := parseRangeHeader(rangeHeader, metadata.Size)
+	start, end, err := parseRangeHeader(rangeHeader, metadata.Size)
 	if err != nil {
 		s.writeError(w, http.StatusRequestedRangeNotSatisfiable, "Invalid Range header", err)
 		return
@@ -464,7 +618,17 @@ func (s *Server) handleRangeRequest(ctx context.Context, w http.ResponseWriter, 
 
 	w.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
 	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, metadata.Size))
+	w.Header().Set("Cache-Control", "public, max-age=31536000")
 	w.WriteHeader(http.StatusPartialContent)
+
+	// Identify chunks needed for this range and prefetch them
+	neededChunks := s.getChunksForRange(metadata.Chunks, start, end)
+	if err := s.prefetchChunks(ctx, neededChunks); err != nil {
+		log.Printf("Warning: Failed to prefetch range chunks for %s: %v", metadata.Hash, err)
+	}
+
+	buffer := s.bufferPool.Get().([]byte)
+	defer s.bufferPool.Put(buffer)
 
 	var currentOffset int64
 	for _, chunkInfo := range metadata.Chunks {
@@ -478,7 +642,7 @@ func (s *Server) handleRangeRequest(ctx context.Context, w http.ResponseWriter, 
 			offsetInChunk := streamStart - chunkStart
 			lengthToStream := streamEnd - streamStart + 1
 
-			if err := s.fetchAndStreamChunk(ctx, w, chunkInfo.Hash, int(offsetInChunk), int(lengthToStream)); err != nil {
+			if err := s.streamChunkWithBuffer(ctx, w, chunkInfo.Hash, int(offsetInChunk), int(lengthToStream), buffer); err != nil {
 				if !isClientClosedError(err) {
 					log.Printf("Aborting ranged stream for %s due to error: %v", metadata.Hash, err)
 				}
@@ -497,19 +661,99 @@ func (s *Server) handleRangeRequest(ctx context.Context, w http.ResponseWriter, 
 	}
 }
 
-func (s *Server) fetchAndStreamChunk(ctx context.Context, w io.Writer, hash hasher.Hash, offset, length int) error {
-	// Check if the block is already in the local blockstore.
-	if has, _ := s.storage.Has(hash); !has {
-		log.Printf("Chunk %s not found locally, fetching from network...", hash)
-		if bitswapNode, ok := s.node.(interface{ GetBitswap() *bitswap.Engine }); ok {
-			fetchCtx, cancel := context.WithTimeout(ctx, 2*time.Minute) // Timeout for fetching a single chunk
-			defer cancel()
-			// GetBlock is simpler for a single chunk
-			if _, err := bitswapNode.GetBitswap().GetBlock(fetchCtx, hash); err != nil {
-				return fmt.Errorf("failed to fetch chunk %s: %w", hash, err)
+// getChunksForRange returns chunks needed for a specific byte range
+func (s *Server) getChunksForRange(chunks []chunker.ChunkInfo, start, end int64) []chunker.ChunkInfo {
+	var result []chunker.ChunkInfo
+	var offset int64
+
+	for _, chunk := range chunks {
+		chunkEnd := offset + int64(chunk.Size) - 1
+		if offset <= end && chunkEnd >= start {
+			result = append(result, chunk)
+		}
+		offset += int64(chunk.Size)
+		if offset > end {
+			break
+		}
+	}
+	return result
+}
+
+// prefetchChunks fetches multiple chunks concurrently
+func (s *Server) prefetchChunks(ctx context.Context, chunks []chunker.ChunkInfo) error {
+	if len(chunks) == 0 {
+		return nil
+	}
+
+	// Use semaphore to limit concurrent fetches
+	sem := make(chan struct{}, maxConcurrentOps)
+	var wg sync.WaitGroup
+	var firstErr error
+	var errMu sync.Mutex
+
+	for _, chunkInfo := range chunks {
+		// Skip if already in cache
+		if _, exists := s.chunkCache.Get(chunkInfo.Hash.String()); exists {
+			continue
+		}
+
+		// Skip if already in local storage
+		if has, _ := s.storage.Has(chunkInfo.Hash); has {
+			continue
+		}
+
+		wg.Add(1)
+		go func(hash hasher.Hash) {
+			defer wg.Done()
+
+			select {
+			case <-ctx.Done():
+				return
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
 			}
-		} else {
-			return fmt.Errorf("node does not support bitswap, cannot fetch missing chunk %s", hash)
+
+			if err := s.fetchChunk(ctx, hash); err != nil {
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				errMu.Unlock()
+				log.Printf("Failed to prefetch chunk %s: %v", hash, err)
+			}
+		}(chunkInfo.Hash)
+	}
+
+	wg.Wait()
+	return firstErr
+}
+
+// fetchChunk fetches a single chunk and stores it
+func (s *Server) fetchChunk(ctx context.Context, hash hasher.Hash) error {
+	if bitswapNode, ok := s.node.(interface{ GetBitswap() *bitswap.Engine }); ok {
+		fetchCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+
+		if _, err := bitswapNode.GetBitswap().GetBlock(fetchCtx, hash); err != nil {
+			return fmt.Errorf("failed to fetch chunk %s: %w", hash, err)
+		}
+		return nil
+	}
+	return fmt.Errorf("node does not support bitswap, cannot fetch chunk %s", hash)
+}
+
+// streamChunkWithBuffer streams a chunk using a reusable buffer
+func (s *Server) streamChunkWithBuffer(ctx context.Context, w io.Writer, hash hasher.Hash, offset, length int, buffer []byte) error {
+	// Check cache first
+	if data, exists := s.chunkCache.Get(hash.String()); exists {
+		_, err := w.Write(data[offset : offset+length])
+		return err
+	}
+
+	// Check if the block is in local storage
+	if has, _ := s.storage.Has(hash); !has {
+		if err := s.fetchChunk(ctx, hash); err != nil {
+			return err
 		}
 	}
 
@@ -519,12 +763,25 @@ func (s *Server) fetchAndStreamChunk(ctx context.Context, w io.Writer, hash hash
 		return fmt.Errorf("failed to get block %s from storage: %w", hash, err)
 	}
 
+	data := blk.RawData()
+
+	// Add to cache for future use
+	s.chunkCache.Put(hash.String(), data)
+
 	// Write the requested part of the chunk
-	if _, err := w.Write(blk.RawData()[offset : offset+length]); err != nil {
+	if _, err := w.Write(data[offset : offset+length]); err != nil {
 		return err
 	}
 
 	return nil
+}
+
+// fetchAndStreamChunkOptimized is an optimized version of fetchAndStreamChunk
+func (s *Server) fetchAndStreamChunkOptimized(ctx context.Context, w io.Writer, hash hasher.Hash, offset, length int) error {
+	buffer := s.bufferPool.Get().([]byte)
+	defer s.bufferPool.Put(buffer)
+
+	return s.streamChunkWithBuffer(ctx, w, hash, offset, length, buffer)
 }
 
 func isClientClosedError(err error) bool {
@@ -532,7 +789,8 @@ func isClientClosedError(err error) bool {
 	return strings.Contains(err.Error(), "forcibly closed by the remote host") ||
 		strings.Contains(err.Error(), "broken pipe") ||
 		strings.Contains(err.Error(), "connection reset by peer") ||
-		strings.Contains(err.Error(), "An established connection was aborted by the software in your host machine")
+		strings.Contains(err.Error(), "An established connection was aborted by the software in your host machine") ||
+		strings.Contains(err.Error(), "use of closed network connection")
 }
 
 func max(a, b int64) int64 {
@@ -580,9 +838,6 @@ func parseRangeHeader(s string, size int64) (int64, int64, error) {
 	}
 	return start, end, nil
 }
-
-
-
 
 // isMimeTypeRenderable checks if a MIME type can be displayed directly by most browsers.
 func (s *Server) isMimeTypeRenderable(mimeType string) bool {
