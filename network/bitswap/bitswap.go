@@ -522,10 +522,7 @@ func (pl *peerLedger) sender(ctx context.Context, h host.Host) {
 		case msg := <-pl.outgoing:
 			var err error
 			if stream == nil {
-				// Use a timeout for opening the stream to prevent blocking indefinitely.
-				streamCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-				stream, err = h.NewStream(streamCtx, pl.peer, ProtocolBitswap)
-				cancel() // Always call cancel to release context resources.
+				stream, err = h.NewStream(ctx, pl.peer, ProtocolBitswap)
 
 				if err != nil {
 					log.Printf("[Bitswap] Failed to open stream to %s: %v", pl.peer, err)
