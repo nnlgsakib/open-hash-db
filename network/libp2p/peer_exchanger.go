@@ -68,11 +68,10 @@ func (pe *PeerExchanger) connectToNewPeers(addrInfos []peer.AddrInfo, sourcePeer
 		wg.Add(1)
 		go func(pi peer.AddrInfo) {
 			defer wg.Done()
+			var connected bool
 
-			// On exit, if not connected, remove from connecting map to allow retries.
-			// If connected, leave it, and the disconnect handler will clear it.
 			defer func() {
-				if pe.node.Host().Network().Connectedness(pi.ID) != network.Connected {
+				if !connected {
 					pe.connectingMu.Lock()
 					delete(pe.connecting, pi.ID)
 					pe.connectingMu.Unlock()
@@ -80,32 +79,29 @@ func (pe *PeerExchanger) connectToNewPeers(addrInfos []peer.AddrInfo, sourcePeer
 				}
 			}()
 
-			// Double-check connection status inside the goroutine
 			if pe.node.Host().Network().Connectedness(pi.ID) == network.Connected {
+				connected = true
 				return
 			}
 
 			log.Printf("Discovered new peer %s from %s, attempting to connect", pi.ID.String(), sourcePeer.String())
 
-			// Attempt direct connection. We pass the full AddrInfo.
-			// The host will try the available addresses.
 			if len(pi.Addrs) > 0 {
 				err := pe.node.Host().Connect(pe.ctx, pi)
 				if err == nil {
 					log.Printf("Successfully connected directly to new peer %s", pi.ID.String())
-					return // Success, leave in connecting map.
+					connected = true
+					return
 				}
 				log.Printf("Failed to connect directly to %s: %v. Trying via relay.", pi.ID.String(), err)
 			} else {
 				log.Printf("Peer %s has no public addresses, trying via relay.", pi.ID.String())
 			}
 
-			// If direct connection fails, try via relay v2.
-			// The address format is /p2p/<relay-peer-id>/p2p-circuit/p2p/<target-peer-id>
 			relayAddr, err := multiaddr.NewMultiaddr("/p2p/" + sourcePeer.String() + "/p2p-circuit/p2p/" + pi.ID.String())
 			if err != nil {
 				log.Printf("Error creating relay address for %s via %s: %v", pi.ID, sourcePeer, err)
-				return // Cannot proceed with relay. Defer will clean up.
+				return
 			}
 
 			relayPeerInfo := peer.AddrInfo{
@@ -115,10 +111,9 @@ func (pe *PeerExchanger) connectToNewPeers(addrInfos []peer.AddrInfo, sourcePeer
 
 			if err := pe.node.Host().Connect(pe.ctx, relayPeerInfo); err != nil {
 				log.Printf("Failed to connect to %s via relay %s: %v", pi.ID.String(), sourcePeer.String(), err)
-				// Let defer handle cleanup
 			} else {
 				log.Printf("Successfully connected to %s via relay %s", pi.ID.String(), sourcePeer.String())
-				// Success, leave in connecting map.
+				connected = true
 			}
 		}(pi)
 	}
