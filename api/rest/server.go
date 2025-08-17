@@ -325,60 +325,51 @@ func (s *Server) streamDirectoryAsZip(w http.ResponseWriter, r *http.Request, me
 	zipWriter := zip.NewWriter(w)
 	defer zipWriter.Close()
 
-	err := s.addDirectoryToZip(r.Context(), zipWriter, metadata.Links, "")
+	err := s.addFilesToZip(r.Context(), zipWriter, metadata.Links, "")
 	if err != nil {
 		log.Printf("Error creating zip archive for %s: %v", metadata.Hash.String(), err)
 		// We can't write a proper error response if headers have been sent.
 	}
 }
 
-func (s *Server) addDirectoryToZip(ctx context.Context, zipWriter *zip.Writer, links []merkle.Link, basePath string) error {
+
+
+func (s *Server) addFilesToZip(ctx context.Context, zipWriter *zip.Writer, links []merkle.Link, basePath string) error {
 	for _, link := range links {
-		pathInZip := link.Name
-		if basePath != "" {
-			pathInZip = basePath + "/" + link.Name
-		}
+		pathInZip := filepath.Join(basePath, link.Name)
 
 		if link.Type == "directory" {
+			// Create a directory entry in the zip file
+			_, err := zipWriter.Create(pathInZip + "/")
+			if err != nil {
+				return fmt.Errorf("failed to create directory in zip: %w", err)
+			}
+
+			// Get the metadata for the subdirectory to recurse
 			dirMetadata, err := s.storage.GetContent(link.Hash)
 			if err != nil {
 				return fmt.Errorf("could not get metadata for subdirectory %s (%s): %w", link.Name, link.Hash.String(), err)
 			}
-
-			header := &zip.FileHeader{
-				Name:     pathInZip + "/",
-				Modified: dirMetadata.ModTime,
-			}
-			header.SetMode(os.ModeDir | 0755)
-
-			_, err = zipWriter.CreateHeader(header)
-			if err != nil {
-				return fmt.Errorf("failed to create directory header in zip for %s: %w", pathInZip, err)
-			}
-
-			if err := s.addDirectoryToZip(ctx, zipWriter, dirMetadata.Links, pathInZip); err != nil {
+			if err := s.addFilesToZip(ctx, zipWriter, dirMetadata.Links, pathInZip); err != nil {
 				return err
 			}
 		} else { // "file"
+			fileWriter, err := zipWriter.Create(pathInZip)
+			if err != nil {
+				return fmt.Errorf("failed to create file in zip: %w", err)
+			}
+
+			// Get file metadata to access its chunks
 			fileMetadata, err := s.storage.GetContent(link.Hash)
 			if err != nil {
 				return fmt.Errorf("could not get metadata for file %s (%s): %w", link.Name, link.Hash.String(), err)
 			}
 
-			header := &zip.FileHeader{
-				Name:     pathInZip,
-				Modified: fileMetadata.ModTime,
-				Method:   zip.Deflate,
-			}
-			header.SetMode(0644)
-
-			fileWriter, err := zipWriter.CreateHeader(header)
-			if err != nil {
-				return fmt.Errorf("failed to create file in zip for %s: %w", pathInZip, err)
-			}
-
-			if err := s.fetchAndStreamChunks(ctx, fileWriter, fileMetadata.Chunks); err != nil {
-				return fmt.Errorf("failed to stream chunks to zip for file %s: %w", pathInZip, err)
+			// Stream the chunks of the file into the zip writer
+			for _, chunkInfo := range fileMetadata.Chunks {
+				if err := s.fetchAndStreamChunk(ctx, fileWriter, chunkInfo.Hash, 0, int(chunkInfo.Size)); err != nil {
+					return fmt.Errorf("failed to stream chunk to zip for file %s: %w", pathInZip, err)
+				}
 			}
 		}
 	}
@@ -430,93 +421,167 @@ func (s *Server) viewContent(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) streamChunks(w http.ResponseWriter, r *http.Request, metadata *blockstore.ContentMetadata) {
-	// Efficiently fetch and stream chunks
-	err := s.fetchAndStreamChunks(r.Context(), w, metadata.Chunks)
-	if err != nil {
-		// Error logging is handled inside fetchAndStreamChunks.
-		// We can't write an error header here as the body might have been partially written.
-		log.Printf("Aborting stream for content %s due to error: %v", metadata.Hash.String(), err)
-	}
-}
-
-// fetchAndStreamChunks ensures all required chunks are stored locally, fetching them
-// from the network if necessary, and then streams them from the local blockstore.
-// This approach is robust and avoids buffering large amounts of data in memory.
-func (s *Server) fetchAndStreamChunks(ctx context.Context, w io.Writer, chunks []chunker.ChunkInfo) error {
+	ctx := r.Context()
 	flusher, hasFlusher := w.(http.Flusher)
 
-	// Phase 1: Identify missing blocks
-	var missingHashes []hasher.Hash
-	for _, chunkInfo := range chunks {
-		if has, _ := s.storage.Has(chunkInfo.Hash); !has {
-			missingHashes = append(missingHashes, chunkInfo.Hash)
-		}
+	// Set common headers
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Content-Type", metadata.MimeType)
+	w.Header().Set("Last-Modified", metadata.ModTime.UTC().Format(http.TimeFormat))
+
+	// Handle Range requests
+	rangeHeader := r.Header.Get("Range")
+	if rangeHeader != "" {
+		s.handleRangeRequest(ctx, w, r, metadata, rangeHeader)
+		return
 	}
 
-	// Phase 2: Fetch missing blocks from the network
-	if len(missingHashes) > 0 {
-		log.Printf("Found %d missing blocks for content, fetching from network...", len(missingHashes))
-		if bitswapNode, ok := s.node.(interface{ GetBitswap() *bitswap.Engine }); ok {
-			// Use the request context for fetching, but with a generous timeout for large files.
-			// The parent context will handle client disconnects.
-			fetchCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
-			defer cancel()
+	// No Range header, stream the full content
+	w.Header().Set("Content-Length", strconv.FormatInt(metadata.Size, 10))
+	w.WriteHeader(http.StatusOK)
 
-			blockChannel, err := bitswapNode.GetBitswap().GetBlocks(fetchCtx, missingHashes)
-			if err != nil {
-				return fmt.Errorf("failed to start bitswap session for %d chunks: %w", len(missingHashes), err)
+	for _, chunkInfo := range metadata.Chunks {
+		if err := s.fetchAndStreamChunk(ctx, w, chunkInfo.Hash, 0, int(chunkInfo.Size)); err != nil {
+			if !isClientClosedError(err) {
+				log.Printf("Aborting stream for %s due to error: %v", metadata.Hash, err)
 			}
-
-			// Drain the channel to ensure all blocks are fetched. Bitswap engine stores them.
-			receivedCount := 0
-			for range blockChannel {
-				receivedCount++
-			}
-
-			// Verify that all requested blocks were received.
-			if receivedCount < len(missingHashes) {
-				return fmt.Errorf("failed to fetch all missing blocks, got %d of %d", receivedCount, len(missingHashes))
-			}
-			log.Printf("Successfully fetched and stored %d missing blocks.", receivedCount)
-
-			// Optional: Final verification pass to ensure blocks are in the store.
-			for _, h := range missingHashes {
-				if has, _ := s.storage.Has(h); !has {
-					return fmt.Errorf("verification failed: block %s not in store after fetch", h)
-				}
-			}
-
-		} else {
-			return fmt.Errorf("node does not support bitswap, cannot fetch missing chunks")
+			return
 		}
-	}
-
-	// Phase 3: Stream all chunks from local storage
-	for _, chunkInfo := range chunks {
-		blk, err := s.storage.Get(chunkInfo.Hash)
-		if err != nil {
-			// This should ideally not happen if the fetch and verification was successful.
-			return fmt.Errorf("failed to get block %s from storage: %w", chunkInfo.Hash, err)
-		}
-
-		if _, err := w.Write(blk.RawData()); err != nil {
-			if strings.Contains(err.Error(), "forcibly closed by the remote host") ||
-				strings.Contains(err.Error(), "broken pipe") ||
-				strings.Contains(err.Error(), "connection reset by peer") {
-				log.Printf("Client closed connection while streaming. Aborting.")
-			} else {
-				log.Printf("Error writing chunk %s to response: %v", chunkInfo.Hash, err)
-			}
-			return err // Stop streaming
-		}
-
 		if hasFlusher {
 			flusher.Flush()
 		}
 	}
+}
+
+func (s *Server) handleRangeRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, metadata *blockstore.ContentMetadata, rangeHeader string) {
+	flusher, hasFlusher := w.(http.Flusher)
+		start, end, err := parseRangeHeader(rangeHeader, metadata.Size)
+	if err != nil {
+		s.writeError(w, http.StatusRequestedRangeNotSatisfiable, "Invalid Range header", err)
+		return
+	}
+	contentLength := end - start + 1
+
+	w.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, metadata.Size))
+	w.WriteHeader(http.StatusPartialContent)
+
+	var currentOffset int64
+	for _, chunkInfo := range metadata.Chunks {
+		chunkStart := currentOffset
+		chunkEnd := currentOffset + int64(chunkInfo.Size) - 1
+
+		// Check if this chunk is within the requested range
+		if chunkStart <= end && chunkEnd >= start {
+			streamStart := max(chunkStart, start)
+			streamEnd := min(chunkEnd, end)
+			offsetInChunk := streamStart - chunkStart
+			lengthToStream := streamEnd - streamStart + 1
+
+			if err := s.fetchAndStreamChunk(ctx, w, chunkInfo.Hash, int(offsetInChunk), int(lengthToStream)); err != nil {
+				if !isClientClosedError(err) {
+					log.Printf("Aborting ranged stream for %s due to error: %v", metadata.Hash, err)
+				}
+				return
+			}
+		}
+
+		currentOffset += int64(chunkInfo.Size)
+		if currentOffset > end {
+			break
+		}
+	}
+
+	if hasFlusher {
+		flusher.Flush()
+	}
+}
+
+func (s *Server) fetchAndStreamChunk(ctx context.Context, w io.Writer, hash hasher.Hash, offset, length int) error {
+	// Check if the block is already in the local blockstore.
+	if has, _ := s.storage.Has(hash); !has {
+		log.Printf("Chunk %s not found locally, fetching from network...", hash)
+		if bitswapNode, ok := s.node.(interface{ GetBitswap() *bitswap.Engine }); ok {
+			fetchCtx, cancel := context.WithTimeout(ctx, 2*time.Minute) // Timeout for fetching a single chunk
+			defer cancel()
+			// GetBlock is simpler for a single chunk
+			if _, err := bitswapNode.GetBitswap().GetBlock(fetchCtx, hash); err != nil {
+				return fmt.Errorf("failed to fetch chunk %s: %w", hash, err)
+			}
+		} else {
+			return fmt.Errorf("node does not support bitswap, cannot fetch missing chunk %s", hash)
+		}
+	}
+
+	// Retrieve the block from storage
+	blk, err := s.storage.Get(hash)
+	if err != nil {
+		return fmt.Errorf("failed to get block %s from storage: %w", hash, err)
+	}
+
+	// Write the requested part of the chunk
+	if _, err := w.Write(blk.RawData()[offset : offset+length]); err != nil {
+		return err
+	}
 
 	return nil
 }
+
+func isClientClosedError(err error) bool {
+	// Check for common client-side disconnect errors
+	return strings.Contains(err.Error(), "forcibly closed by the remote host") ||
+		strings.Contains(err.Error(), "broken pipe") ||
+		strings.Contains(err.Error(), "connection reset by peer")
+}
+
+func max(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func min(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func parseRangeHeader(s string, size int64) (int64, int64, error) {
+	if s == "" {
+		return 0, 0, nil // No range header
+	}
+	const b = "bytes="
+	if !strings.HasPrefix(s, b) {
+		return 0, 0, fmt.Errorf("invalid range header format")
+	}
+	s = s[len(b):]
+	parts := strings.Split(s, "-")
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("invalid range header format")
+	}
+	start, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid start value")
+	}
+	end, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		// If the end is empty, it means "to the end"
+		if parts[1] == "" {
+			end = size - 1
+		} else {
+			return 0, 0, fmt.Errorf("invalid end value")
+		}
+	}
+	if start > end || start >= size {
+		return 0, 0, fmt.Errorf("invalid range")
+	}
+	return start, end, nil
+}
+
+
+
 
 // isMimeTypeRenderable checks if a MIME type can be displayed directly by most browsers.
 func (s *Server) isMimeTypeRenderable(mimeType string) bool {
