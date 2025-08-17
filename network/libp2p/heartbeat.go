@@ -65,7 +65,7 @@ func NewHeartbeatService(ctx context.Context, node *Node) *HeartbeatService {
 
 // handleHeartbeatStream handles incoming heartbeat requests and peer exchange
 func (hs *HeartbeatService) handleHeartbeatStream(stream network.Stream) {
-	log.Printf("Received heartbeat from %s, starting peer exchange.", stream.Conn().RemotePeer().String())
+	log.Printf("[libp2p] Received heartbeat from %s, starting peer exchange.", stream.Conn().RemotePeer().String())
 	hs.peerExchanger.handleExchange(stream)
 }
 
@@ -103,30 +103,30 @@ func (hs *HeartbeatService) monitor(ctx context.Context, peerID peer.ID) {
 	select {
 	case <-time.After(initialDelay):
 	case <-ctx.Done():
-		log.Printf("Stopping heartbeat monitor for peer %s before initial heartbeat", peerID.String())
+		log.Printf("[libp2p] Stopping heartbeat monitor for peer %s before initial heartbeat", peerID.String())
 		return
 	}
 
-	log.Printf("Starting heartbeat monitor for peer %s", peerID.String())
+	log.Printf("[libp2p] Starting heartbeat monitor for peer %s", peerID.String())
 	ticker := time.NewTicker(HeartbeatInterval)
 	defer ticker.Stop()
 
 	for {
 		if err := hs.sendHeartbeat(peerID); err != nil {
-			log.Printf("Heartbeat to %s failed: %v", peerID.String(), err)
+			log.Printf("[libp2p] Heartbeat to %s failed: %v", peerID.String(), err)
 			heartbeatFailureTotal.Inc()
 			// Reset all connections to the peer on failure
 			hs.node.host.Network().ClosePeer(peerID)
 			connectionResetTotal.Inc()
-			log.Printf("Connection to %s reset due to heartbeat failure", peerID.String())
+			log.Printf("[libp2p] Connection to %s reset due to heartbeat failure", peerID.String())
 			return
 		}
 		heartbeatSuccessTotal.Inc()
-		log.Printf("Successful heartbeat to %s", peerID.String())
+		log.Printf("[libp2p] Successful heartbeat to %s", peerID.String())
 
 		select {
 		case <-ctx.Done():
-			log.Printf("Stopping heartbeat monitor for peer %s", peerID.String())
+			log.Printf("[libp2p] Stopping heartbeat monitor for peer %s", peerID.String())
 			return
 		case <-ticker.C:
 		}
@@ -140,7 +140,7 @@ func (hs *HeartbeatService) sendHeartbeat(peerID peer.ID) error {
 
 	stream, err := hs.node.host.NewStream(network.WithAllowLimitedConn(ctx, "heartbeat"), peerID, ProtocolHeartbeat)
 	if err != nil {
-		log.Printf("Failed to open heartbeat stream to %s: %v", peerID.String(), err)
+		log.Printf("[libp2p] Failed to open heartbeat stream to %s: %v", peerID.String(), err)
 		return err
 	}
 

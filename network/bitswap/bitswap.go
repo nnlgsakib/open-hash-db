@@ -235,6 +235,18 @@ func (e *Engine) getOrCreateLedger(p peer.ID) *peerLedger {
 	return ledger
 }
 
+// HandlePeerDisconnect cleans up resources associated with a disconnected peer.
+func (e *Engine) HandlePeerDisconnect(p peer.ID) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if ledger, exists := e.peers[p]; exists {
+		log.Printf("[Bitswap] Peer %s disconnected, cleaning up ledger.", p)
+		close(ledger.done)
+		delete(e.peers, p)
+	}
+}
+
 func (e *Engine) HandleNewPeer(p peer.ID) {
 	e.getOrCreateLedger(p)
 	go e.sendWantlistToPeer(p, true)
@@ -510,9 +522,14 @@ func (pl *peerLedger) sender(ctx context.Context, h host.Host) {
 		case msg := <-pl.outgoing:
 			var err error
 			if stream == nil {
-				stream, err = h.NewStream(ctx, pl.peer, ProtocolBitswap)
+				// Use a timeout for opening the stream to prevent blocking indefinitely.
+				streamCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+				stream, err = h.NewStream(streamCtx, pl.peer, ProtocolBitswap)
+				cancel() // Always call cancel to release context resources.
+
 				if err != nil {
 					log.Printf("[Bitswap] Failed to open stream to %s: %v", pl.peer, err)
+					// Don't return, just continue. The ledger can try again on the next message.
 					continue
 				}
 				writer = bufio.NewWriter(stream)
@@ -527,6 +544,9 @@ func (pl *peerLedger) sender(ctx context.Context, h host.Host) {
 			lenBuf := make([]byte, binary.MaxVarintLen64)
 			n := binary.PutUvarint(lenBuf, uint64(len(data)))
 
+			// Set a write deadline on the stream
+			stream.SetWriteDeadline(time.Now().Add(10 * time.Second))
+
 			_, err = writer.Write(lenBuf[:n])
 			if err == nil {
 				_, err = writer.Write(data)
@@ -534,6 +554,9 @@ func (pl *peerLedger) sender(ctx context.Context, h host.Host) {
 			if err == nil {
 				err = writer.Flush()
 			}
+
+			// Clear the deadline
+			stream.SetWriteDeadline(time.Time{})
 
 			if err != nil {
 				log.Printf("[Bitswap] Failed to send message to %s: %v", pl.peer, err)

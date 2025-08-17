@@ -75,7 +75,7 @@ func (pe *PeerExchanger) connectToNewPeers(addrInfos []peer.AddrInfo, sourcePeer
 					pe.connectingMu.Lock()
 					delete(pe.connecting, pi.ID)
 					pe.connectingMu.Unlock()
-					log.Printf("Cleaned up peer %s from connecting map after failed attempts.", pi.ID)
+					log.Printf("[libp2p] Cleaned up peer %s from connecting map after failed attempts.", pi.ID)
 				}
 			}()
 
@@ -84,23 +84,23 @@ func (pe *PeerExchanger) connectToNewPeers(addrInfos []peer.AddrInfo, sourcePeer
 				return
 			}
 
-			log.Printf("Discovered new peer %s from %s, attempting to connect", pi.ID.String(), sourcePeer.String())
+			log.Printf("[libp2p] Discovered new peer %s from %s, attempting to connect", pi.ID.String(), sourcePeer.String())
 
 			if len(pi.Addrs) > 0 {
 				err := pe.node.Host().Connect(pe.ctx, pi)
 				if err == nil {
-					log.Printf("Successfully connected directly to new peer %s", pi.ID.String())
+					log.Printf("[libp2p] Successfully connected directly to new peer %s", pi.ID.String())
 					connected = true
 					return
 				}
-				log.Printf("Failed to connect directly to %s: %v. Trying via relay.", pi.ID.String(), err)
+				log.Printf("[libp2p] Failed to connect directly to %s: %v. Trying via relay.", pi.ID.String(), err)
 			} else {
-				log.Printf("Peer %s has no public addresses, trying via relay.", pi.ID.String())
+				log.Printf("[libp2p] Peer %s has no public addresses, trying via relay.", pi.ID.String())
 			}
 
 			relayAddr, err := multiaddr.NewMultiaddr("/p2p/" + sourcePeer.String() + "/p2p-circuit/p2p/" + pi.ID.String())
 			if err != nil {
-				log.Printf("Error creating relay address for %s via %s: %v", pi.ID, sourcePeer, err)
+				log.Printf("[libp2p] Error creating relay address for %s via %s: %v", pi.ID, sourcePeer, err)
 				return
 			}
 
@@ -110,9 +110,9 @@ func (pe *PeerExchanger) connectToNewPeers(addrInfos []peer.AddrInfo, sourcePeer
 			}
 
 			if err := pe.node.Host().Connect(pe.ctx, relayPeerInfo); err != nil {
-				log.Printf("Failed to connect to %s via relay %s: %v", pi.ID.String(), sourcePeer.String(), err)
+				log.Printf("[libp2p] Failed to connect to %s via relay %s: %v", pi.ID.String(), sourcePeer.String(), err)
 			} else {
-				log.Printf("Successfully connected to %s via relay %s", pi.ID.String(), sourcePeer.String())
+				log.Printf("[libp2p] Successfully connected to %s via relay %s", pi.ID.String(), sourcePeer.String())
 				connected = true
 			}
 		}(pi)
@@ -125,20 +125,20 @@ func (pe *PeerExchanger) connectToNewPeers(addrInfos []peer.AddrInfo, sourcePeer
 func (pe *PeerExchanger) handleExchange(stream network.Stream) {
 	defer stream.Close()
 	remotePeer := stream.Conn().RemotePeer()
-	log.Printf("Handling peer exchange with %s", remotePeer.String())
+	log.Printf("[libp2p] Handling peer exchange with %s", remotePeer.String())
 
 	// 1. Receive their peers
 	reader := bufio.NewReader(stream)
 	theirPeersJSON, err := reader.ReadBytes('\n')
 	if err != nil {
-		log.Printf("Failed to read peer list from stream with %s: %v", remotePeer.String(), err)
+		log.Printf("[libp2p] Failed to read peer list from stream with %s: %v", remotePeer.String(), err)
 		stream.Reset()
 		return
 	}
 
 	var theirPeers []peer.AddrInfo
 	if err := json.Unmarshal(theirPeersJSON, &theirPeers); err != nil {
-		log.Printf("Failed to unmarshal peer list from %s: %v", remotePeer.String(), err)
+		log.Printf("[libp2p] Failed to unmarshal peer list from %s: %v", remotePeer.String(), err)
 		stream.Reset()
 		return
 	}
@@ -149,19 +149,19 @@ func (pe *PeerExchanger) handleExchange(stream network.Stream) {
 	// 3. Send our peers
 	ourPeersJSON, err := pe.getPeerListJSON()
 	if err != nil {
-		log.Printf("Failed to get our peer list for exchange with %s: %v", remotePeer.String(), err)
+		log.Printf("[libp2p] Failed to get our peer list for exchange with %s: %v", remotePeer.String(), err)
 		stream.Reset()
 		return
 	}
 
 	writer := bufio.NewWriter(stream)
 	if _, err := writer.Write(append(ourPeersJSON, '\n')); err != nil {
-		log.Printf("Failed to write our peer list to stream with %s: %v", remotePeer.String(), err)
+		log.Printf("[libp2p] Failed to write our peer list to stream with %s: %v", remotePeer.String(), err)
 		stream.Reset()
 		return
 	}
 	if err := writer.Flush(); err != nil {
-		log.Printf("Failed to flush stream with %s: %v", remotePeer.String(), err)
+		log.Printf("[libp2p] Failed to flush stream with %s: %v", remotePeer.String(), err)
 		stream.Reset()
 		return
 	}
@@ -172,24 +172,24 @@ func (pe *PeerExchanger) handleExchange(stream network.Stream) {
 func (pe *PeerExchanger) initiateExchange(stream network.Stream) error {
 	defer stream.Close()
 	remotePeer := stream.Conn().RemotePeer()
-	log.Printf("Initiating peer exchange with %s", remotePeer.String())
+	log.Printf("[libp2p] Initiating peer exchange with %s", remotePeer.String())
 
 	// 1. Send our peers
 	ourPeersJSON, err := pe.getPeerListJSON()
 	if err != nil {
-		log.Printf("Failed to get our peer list for exchange with %s: %v", remotePeer.String(), err)
+		log.Printf("[libp2p] Failed to get our peer list for exchange with %s: %v", remotePeer.String(), err)
 		stream.Reset()
 		return err
 	}
 
 	writer := bufio.NewWriter(stream)
 	if _, err := writer.Write(append(ourPeersJSON, '\n')); err != nil {
-		log.Printf("Failed to write our peer list to stream with %s: %v", remotePeer.String(), err)
+		log.Printf("[libp2p] Failed to write our peer list to stream with %s: %v", remotePeer.String(), err)
 		stream.Reset()
 		return err
 	}
 	if err := writer.Flush(); err != nil {
-		log.Printf("Failed to flush stream with %s: %v", remotePeer.String(), err)
+		log.Printf("[libp2p] Failed to flush stream with %s: %v", remotePeer.String(), err)
 		stream.Reset()
 		return err
 	}
@@ -198,14 +198,14 @@ func (pe *PeerExchanger) initiateExchange(stream network.Stream) error {
 	reader := bufio.NewReader(stream)
 	theirPeersJSON, err := reader.ReadBytes('\n')
 	if err != nil {
-		log.Printf("Failed to read peer list from stream with %s: %v", remotePeer.String(), err)
+		log.Printf("[libp2p] Failed to read peer list from stream with %s: %v", remotePeer.String(), err)
 		stream.Reset()
 		return err
 	}
 
 	var theirPeers []peer.AddrInfo
 	if err := json.Unmarshal(theirPeersJSON, &theirPeers); err != nil {
-		log.Printf("Failed to unmarshal peer list from %s: %v", remotePeer.String(), err)
+		log.Printf("[libp2p] Failed to unmarshal peer list from %s: %v", remotePeer.String(), err)
 		stream.Reset()
 		return err
 	}

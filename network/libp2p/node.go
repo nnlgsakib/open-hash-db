@@ -51,17 +51,17 @@ type PeerEvent struct {
 
 // Node represents a libp2p node
 type Node struct {
-	host                  host.Host
-	ctx                   context.Context
-	cancel                context.CancelFunc
-	mdns                  mdns.Service
-	dht                   *dht.IpfsDHT
-	heartbeatService      *HeartbeatService
-	blockstore            *blockstore.Blockstore
-	bitswap               *bitswap.Engine
-	GossipHandler         func(peer.ID, []byte) error
-	peerEvents            []PeerEvent
-	peerEventsMu          sync.RWMutex
+	host             host.Host
+	ctx              context.Context
+	cancel           context.CancelFunc
+	mdns             mdns.Service
+	dht              *dht.IpfsDHT
+	heartbeatService *HeartbeatService
+	blockstore       *blockstore.Blockstore
+	bitswap          *bitswap.Engine
+	GossipHandler    func(peer.ID, []byte) error
+	peerEvents       []PeerEvent
+	peerEventsMu     sync.RWMutex
 }
 
 // NewNodeWithKeyPath creates a new libp2p node
@@ -72,10 +72,10 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 	if keyPath != "" {
 		privKey, err = loadOrCreateIdentity(keyPath)
 		if err != nil {
-			return nil, fmt.Errorf("failed to load identity: %w", err)
+			return nil, fmt.Errorf("[libp2p] failed to load identity: %w", err)
 		}
 	} else {
-		log.Println("Warning: no keyPath, generating ephemeral identity")
+		log.Println("[libp2p] Warning: no keyPath, generating ephemeral identity")
 		privKey, _, err = crypto.GenerateKeyPairWithReader(crypto.RSA, 2048, rand.Reader)
 		if err != nil {
 			return nil, fmt.Errorf("failed to generate ephemeral key: %w", err)
@@ -85,7 +85,7 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 	allBootnodes := append(DefaultBootnodes, bootnodes...)
 	addrInfos, err := convertBootnodesToAddrInfo(allBootnodes)
 	if err != nil {
-		log.Printf("Warning: failed to parse some bootnode addresses: %v", err)
+		log.Printf("[libp2p] Warning: failed to parse some bootnode addresses: %v", err)
 	}
 
 	listenAddrs := []string{
@@ -124,11 +124,11 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 
 	nodeCtx, cancel := context.WithCancel(ctx)
 	node := &Node{
-		host:                  h,
-		ctx:                   nodeCtx,
-		cancel:                cancel,
-		dht:                   nodeDHT,
-		peerEvents:            make([]PeerEvent, 0, MaxPeerEventLogs),
+		host:       h,
+		ctx:        nodeCtx,
+		cancel:     cancel,
+		dht:        nodeDHT,
+		peerEvents: make([]PeerEvent, 0, MaxPeerEventLogs),
 	}
 	node.heartbeatService = NewHeartbeatService(nodeCtx, node)
 
@@ -138,11 +138,11 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 	h.SetStreamHandler(ProtocolGossip, node.handleGossipStream)
 
 	if err := node.setupMDNS(); err != nil {
-		log.Printf("Warning: failed to setup mDNS: %v", err)
+		log.Printf("[libp2p] Warning: failed to setup mDNS: %v", err)
 	}
 
-	log.Printf("Node started with ID: %s", h.ID().String())
-	log.Printf("Listening on addresses:")
+	log.Printf("[libp2p] Node started with ID: %s", h.ID().String())
+	log.Printf("[libp2p] Listening on addresses:")
 	for _, addr := range h.Addrs() {
 		log.Printf("  %s/p2p/%s", addr, h.ID().String())
 	}
@@ -156,7 +156,7 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 				return
 			case <-ticker.C:
 				if err := node.bootstrapDHT(); err != nil {
-					log.Printf("Failed to bootstrap DHT: %v", err)
+					log.Printf("[libp2p] Failed to bootstrap DHT: %v", err)
 				}
 			}
 		}
@@ -164,10 +164,10 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 
 	go func() {
 		if err := node.bootstrapDHT(); err != nil {
-			log.Printf("Warning: failed to bootstrap DHT: %v", err)
+			log.Printf("[libp2p] Warning: failed to bootstrap DHT: %v", err)
 		}
 		if err := node.connectToBootnodes(allBootnodes); err != nil {
-			log.Printf("Warning: failed to connect to some bootnodes: %v", err)
+			log.Printf("[libp2p] Warning: failed to connect to some bootnodes: %v", err)
 		}
 	}()
 
@@ -218,7 +218,7 @@ func (n *networkNotifiee) Connected(net network.Network, conn network.Conn) {
 		protocols, err := n.node.host.Peerstore().GetProtocols(p)
 		if err != nil {
 			// Can happen if the peer disconnects quickly
-			log.Printf("Could not get protocols for peer %s: %v", p, err)
+			log.Printf("[libp2p] Could not get protocols for peer %s: %v", p, err)
 			return
 		}
 
@@ -234,12 +234,12 @@ func (n *networkNotifiee) Connected(net network.Network, conn network.Conn) {
 			return // Not a relay
 		}
 
-		log.Printf("Attempting to reserve slot with newly connected relay: %s", p)
+		log.Printf("[libp2p] Attempting to reserve slot with newly connected relay: %s", p)
 		_, err = relayv2client.Reserve(ctx, n.node.host, pinfo)
 		if err != nil {
-			log.Printf("Failed to reserve slot with %s: %v", p, err)
+			log.Printf("[libp2p] Failed to reserve slot with %s: %v", p, err)
 		} else {
-			log.Printf("Successfully reserved slot with %s", p)
+			log.Printf("[libp2p] Successfully reserved slot with %s", p)
 		}
 	}(conn.RemotePeer())
 }
@@ -251,6 +251,9 @@ func (n *networkNotifiee) Disconnected(net network.Network, conn network.Conn) {
 	}
 	n.node.logPeerEvent(conn.RemotePeer(), "disconnected", addrs)
 	n.node.heartbeatService.StopMonitoring(conn.RemotePeer())
+	if n.node.bitswap != nil {
+		n.node.bitswap.HandlePeerDisconnect(conn.RemotePeer())
+	}
 }
 
 func (n *networkNotifiee) Listen(net network.Network, addr multiaddr.Multiaddr)      {}
@@ -260,7 +263,7 @@ func (n *networkNotifiee) ListenClose(net network.Network, addr multiaddr.Multia
 func (n *Node) setupMDNS() error {
 	mdnsService := mdns.NewMdnsService(n.host, ServiceTag, &discoveryNotifee{node: n})
 	if err := mdnsService.Start(); err != nil {
-		return fmt.Errorf("failed to start mDNS: %w", err)
+		return fmt.Errorf("[libp2p] failed to start mDNS: %w", err)
 	}
 	n.mdns = mdnsService
 	return nil
@@ -270,12 +273,12 @@ func (n *Node) setupMDNS() error {
 func (n *Node) Close() error {
 	if n.mdns != nil {
 		if err := n.mdns.Close(); err != nil {
-			log.Printf("Error closing mDNS: %v", err)
+			log.Printf("[libp2p] Error closing mDNS: %v", err)
 		}
 	}
 	if n.dht != nil {
 		if err := n.dht.Close(); err != nil {
-			log.Printf("Error closing DHT: %v", err)
+			log.Printf("[libp2p] Error closing DHT: %v", err)
 		}
 	}
 	n.cancel()
@@ -305,7 +308,7 @@ func (n *Node) ConnectedPeers() []peer.ID {
 func (n *Node) Connect(ctx context.Context, peerAddr string) error {
 	maddr, err := peer.AddrInfoFromString(peerAddr)
 	if err != nil {
-		return fmt.Errorf("failed to parse peer address %s: %w", peerAddr, err)
+		return fmt.Errorf("[libp2p] failed to parse peer address %s: %w", peerAddr, err)
 	}
 
 	if swarm, ok := n.host.Network().(*swarm.Swarm); ok {
@@ -319,15 +322,15 @@ func (n *Node) Connect(ctx context.Context, peerAddr string) error {
 
 		err = n.host.Connect(ctx, *maddr)
 		if err == nil {
-			log.Printf("Connected to peer: %s", maddr.ID.String())
+			log.Printf("[libp2p] Connected to peer: %s", maddr.ID.String())
 			return nil
 		}
-		log.Printf("Attempt %d/%d: Failed to connect to peer %s: %v", attempt, maxRetries, maddr.ID.String(), err)
+		log.Printf("[libp2p] Attempt %d/%d: Failed to connect to peer %s: %v", attempt, maxRetries, maddr.ID.String(), err)
 		if attempt < maxRetries {
 			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond) // Exponential backoff
 		}
 	}
-	return fmt.Errorf("failed to connect to peer %s after %d attempts: %w", maddr.ID.String(), maxRetries, err)
+	return fmt.Errorf("[libp2p] failed to connect to peer %s after %d attempts: %w", maddr.ID.String(), maxRetries, err)
 }
 
 // BroadcastGossip broadcasts gossip message
@@ -336,7 +339,7 @@ func (n *Node) BroadcastGossip(ctx context.Context, data []byte) error {
 	for _, peerID := range peers {
 		go func(pid peer.ID) {
 			if err := n.sendData(ctx, pid, ProtocolGossip, data); err != nil {
-				log.Printf("Failed to send gossip to %s: %v", pid.String(), err)
+				log.Printf("[libp2p] Failed to send gossip to %s: %v", pid.String(), err)
 			}
 		}(peerID)
 	}
@@ -352,25 +355,25 @@ func (n *Node) sendData(ctx context.Context, peerID peer.ID, protocolID protocol
 
 		stream, err := n.host.NewStream(network.WithAllowLimitedConn(ctx, "send-data"), peerID, protocolID)
 		if err != nil {
-			log.Printf("Attempt %d/%d: Failed to open stream to %s: %v", attempt, maxRetries, peerID.String(), err)
+			log.Printf("[libp2p] Attempt %d/%d: Failed to open stream to %s: %v", attempt, maxRetries, peerID.String(), err)
 			if attempt == maxRetries {
-				return fmt.Errorf("failed to open stream to %s after %d attempts: %w", peerID.String(), maxRetries, err)
+				return fmt.Errorf("[libp2p] failed to open stream to %s after %d attempts: %w", peerID.String(), maxRetries, err)
 			}
 			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
 			continue
 		}
 		defer stream.Close()
 		if _, err := stream.Write(data); err != nil {
-			log.Printf("Attempt %d/%d: Failed to write data to %s: %v", attempt, maxRetries, peerID.String(), err)
+			log.Printf("[libp2p] Attempt %d/%d: Failed to write data to %s: %v", attempt, maxRetries, peerID.String(), err)
 			if attempt == maxRetries {
-				return fmt.Errorf("failed to write data to %s after %d attempts: %w", peerID.String(), maxRetries, err)
+				return fmt.Errorf("[libp2p] failed to write data to %s after %d attempts: %w", peerID.String(), maxRetries, err)
 			}
 			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
 			continue
 		}
 		return nil
 	}
-	return fmt.Errorf("failed to send data to %s: max retries exceeded", peerID.String())
+	return fmt.Errorf("[libp2p] failed to send data to %s: max retries exceeded", peerID.String())
 }
 
 // handleGossipStream handles gossip streams
@@ -378,18 +381,18 @@ func (n *Node) handleGossipStream(stream network.Stream) {
 	defer stream.Close()
 
 	remotePeer := stream.Conn().RemotePeer()
-	log.Printf("Handling gossip stream from %s", remotePeer.String())
+	log.Printf("[libp2p] Handling gossip stream from %s", remotePeer.String())
 
 	data := make([]byte, 64*1024)
 	bytesRead, err := stream.Read(data)
 	if err != nil {
-		log.Printf("Failed to read gossip stream from %s: %v", remotePeer.String(), err)
+		log.Printf("[libp2p] Failed to read gossip stream from %s: %v", remotePeer.String(), err)
 		return
 	}
 
 	if n.GossipHandler != nil {
 		if err := n.GossipHandler(remotePeer, data[:bytesRead]); err != nil {
-			log.Printf("Gossip handler error from %s: %v", remotePeer.String(), err)
+			log.Printf("[libp2p] Gossip handler error from %s: %v", remotePeer.String(), err)
 		}
 	}
 }
@@ -409,9 +412,9 @@ func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := n.node.host.Connect(ctx, pi); err != nil {
-		log.Printf("Failed to connect to discovered peer %s: %v", pi.ID.String(), err)
+		log.Printf("[libp2p] Failed to connect to discovered peer %s: %v", pi.ID.String(), err)
 	} else {
-		log.Printf("Successfully connected to discovered peer %s", pi.ID.String())
+		log.Printf("[libp2p] Successfully connected to discovered peer %s", pi.ID.String())
 	}
 }
 
@@ -451,11 +454,11 @@ func (n *Node) connectToBootnodes(bootnodes []string) error {
 		nodesToConnect = DefaultBootnodes
 	}
 	if len(nodesToConnect) == 0 {
-		log.Printf("No bootnodes specified")
+		log.Printf("[libp2p] No bootnodes specified")
 		return nil
 	}
 
-	log.Printf("Connecting to %d bootnode(s)...", len(nodesToConnect))
+	log.Printf("[libp2p] Connecting to %d bootnode(s)...", len(nodesToConnect))
 	var wg sync.WaitGroup
 	connectedCount := 0
 	var lastErr error
@@ -474,33 +477,33 @@ func (n *Node) connectToBootnodes(bootnodes []string) error {
 				mu.Lock()
 				lastErr = err
 				mu.Unlock()
-				log.Printf("Failed to connect to bootnode %s: %v", addr, err)
+				log.Printf("[libp2p] Failed to connect to bootnode %s: %v", addr, err)
 			} else {
 				mu.Lock()
 				connectedCount++
 				mu.Unlock()
 				pinfo, err := peer.AddrInfoFromString(addr)
 				if err != nil {
-					log.Printf("Could not parse bootnode address %s for reservation: %v", addr, err)
+					log.Printf("[libp2p] Could not parse bootnode address %s for reservation: %v", addr, err)
 					return
 				}
-				log.Printf("Attempting to reserve slot with bootnode %s", pinfo.ID)
+				log.Printf("[libp2p] Attempting to reserve slot with bootnode %s", pinfo.ID)
 				reserveCtx, reserveCancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer reserveCancel()
 				_, err = relayv2client.Reserve(reserveCtx, n.host, *pinfo)
 				if err != nil {
-					log.Printf("Failed to reserve slot with %s: %v", pinfo.ID, err)
+					log.Printf("[libp2p] Failed to reserve slot with %s: %v", pinfo.ID, err)
 				} else {
-					log.Printf("Successfully reserved slot with %s.", pinfo.ID)
+					log.Printf("[libp2p] Successfully reserved slot with %s.", pinfo.ID)
 				}
 			}
 		}(bootnode)
 	}
 	wg.Wait()
 
-	log.Printf("Connected to %d out of %d bootnodes", connectedCount, len(nodesToConnect))
+	log.Printf("[libp2p] Connected to %d out of %d bootnodes", connectedCount, len(nodesToConnect))
 	if connectedCount == 0 && len(nodesToConnect) > 0 {
-		return fmt.Errorf("failed to connect to any bootnodes: %w", lastErr)
+		return fmt.Errorf("[libp2p] failed to connect to any bootnodes: %w", lastErr)
 	}
 	return nil
 }
@@ -508,9 +511,9 @@ func (n *Node) connectToBootnodes(bootnodes []string) error {
 // bootstrapDHT bootstraps the DHT
 func (n *Node) bootstrapDHT() error {
 	if n.dht == nil {
-		return fmt.Errorf("DHT not initialized")
+		return fmt.Errorf("[libp2p] DHT not initialized")
 	}
-	log.Printf("Bootstrapping DHT...")
+	log.Printf("[libp2p] Bootstrapping DHT...")
 	ctx, cancel := context.WithTimeout(n.ctx, 30*time.Second)
 	defer cancel()
 	return n.dht.Bootstrap(ctx)
@@ -519,21 +522,21 @@ func (n *Node) bootstrapDHT() error {
 // AnnounceContent announces content availability
 func (n *Node) AnnounceContent(contentHashStr string) error {
 	if n.dht == nil {
-		return fmt.Errorf("DHT not initialized")
+		return fmt.Errorf("[libp2p] DHT not initialized")
 	}
 
 	hash, err := hasher.HashFromString(contentHashStr)
 	if err != nil {
-		return fmt.Errorf("invalid content hash: %w", err)
+		return fmt.Errorf("[libp2p] invalid content hash: %w", err)
 	}
 
 	if n.blockstore == nil {
-		log.Printf("Blockstore not configured for content %s", contentHashStr)
-		return fmt.Errorf("blockstore not configured")
+		log.Printf("[libp2p] Blockstore not configured for content %s", contentHashStr)
+		return fmt.Errorf("[libp2p] blockstore not configured")
 	}
 	if !n.blockstore.HasContent(hash) {
-		log.Printf("Validation failed for content %s: content not in blockstore", contentHashStr)
-		return fmt.Errorf("content not in blockstore")
+		log.Printf("[libp2p] Validation failed for content %s: content not in blockstore", contentHashStr)
+		return fmt.Errorf("[libp2p] content not in blockstore")
 	}
 
 	const maxRetries = 5
@@ -543,33 +546,33 @@ func (n *Node) AnnounceContent(contentHashStr string) error {
 
 		mh, err := multihash.Sum([]byte(contentHashStr), multihash.SHA2_256, -1)
 		if err != nil {
-			log.Printf("Attempt %d/%d: Failed to create multihash for %s: %v", attempt, maxRetries, contentHashStr, err)
+			log.Printf("[libp2p] Attempt %d/%d: Failed to create multihash for %s: %v", attempt, maxRetries, contentHashStr, err)
 			if attempt == maxRetries {
-				return fmt.Errorf("failed to create multihash: %w", err)
+				return fmt.Errorf("[libp2p] failed to create multihash: %w", err)
 			}
 			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
 			continue
 		}
 		contentCID := cid.NewCidV1(cid.Raw, mh)
 
-		log.Printf("Attempt %d/%d: Announcing content provider for hash: %s (CID: %s)", attempt, maxRetries, contentHashStr, contentCID.String())
+		log.Printf("[libp2p] Attempt %d/%d: Announcing content provider for hash: %s (CID: %s)", attempt, maxRetries, contentHashStr, contentCID.String())
 		if err := n.dht.Provide(ctx, contentCID, true); err != nil {
-			log.Printf("Attempt %d/%d: Failed to announce content %s: %v", attempt, maxRetries, contentHashStr, err)
+			log.Printf("[libp2p] Attempt %d/%d: Failed to announce content %s: %v", attempt, maxRetries, contentHashStr, err)
 			if attempt == maxRetries {
-				return fmt.Errorf("failed to announce content after %d attempts: %w", maxRetries, err)
+				return fmt.Errorf("[libp2p] failed to announce content after %d attempts: %w", maxRetries, err)
 			}
 			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
 			continue
 		}
 		return nil
 	}
-	return fmt.Errorf("failed to announce content %s: max retries exceeded", contentHashStr)
+	return fmt.Errorf("[libp2p] failed to announce content %s: max retries exceeded", contentHashStr)
 }
 
 // FindContentProviders finds content providers
 func (n *Node) FindContentProviders(contentHash string) ([]peer.AddrInfo, error) {
 	if n.dht == nil {
-		return nil, fmt.Errorf("DHT not initialized")
+		return nil, fmt.Errorf("[libp2p] DHT not initialized")
 	}
 
 	ctx, cancel := context.WithTimeout(n.ctx, 90*time.Second)
@@ -579,25 +582,25 @@ func (n *Node) FindContentProviders(contentHash string) ([]peer.AddrInfo, error)
 	if err != nil {
 		mh, err := multihash.Sum([]byte(contentHash), multihash.SHA2_256, -1)
 		if err != nil {
-			log.Printf("Failed to create multihash for %s: %v", contentHash, err)
-			return nil, fmt.Errorf("failed to create multihash: %w", err)
+			log.Printf("[libp2p] Failed to create multihash for %s: %v", contentHash, err)
+			return nil, fmt.Errorf("[libp2p] failed to create multihash: %w", err)
 		}
 		hash = mh
 	}
 
 	contentCID := cid.NewCidV1(cid.Raw, hash)
-	log.Printf("Finding providers for content hash: %s (CID: %s)", contentHash, contentCID.String())
+	log.Printf("[libp2p] Finding providers for content hash: %s (CID: %s)", contentHash, contentCID.String())
 
 	providers := n.dht.FindProvidersAsync(ctx, contentCID, 20)
 	var result []peer.AddrInfo
 	for provider := range providers {
 		if provider.ID != n.ID() {
 			result = append(result, provider)
-			log.Printf("Found provider: %s for hash %s", provider.ID.String(), contentHash)
+			log.Printf("[libp2p] Found provider: %s for hash %s", provider.ID.String(), contentHash)
 		}
 	}
 
-	log.Printf("Found %d provider(s) for hash: %s", len(result), contentHash)
+	log.Printf("[libp2p] Found %d provider(s) for hash: %s", len(result), contentHash)
 	return result, nil
 }
 
@@ -639,37 +642,37 @@ func (n *Node) logPeerEvent(peerID peer.ID, eventType string, addrs []string) {
 
 func loadOrCreateIdentity(keyPath string) (crypto.PrivKey, error) {
 	if err := os.MkdirAll(filepath.Dir(keyPath), 0755); err != nil {
-		return nil, fmt.Errorf("failed to create key directory: %w", err)
+		return nil, fmt.Errorf("[libp2p] failed to create key directory: %w", err)
 	}
 
 	if keyData, err := os.ReadFile(keyPath); err == nil {
 		keyBytes, err := base64.StdEncoding.DecodeString(string(keyData))
 		if err != nil {
-			log.Printf("Warning: failed to decode key, creating new: %v", err)
+			log.Printf("[libp2p] Warning: failed to decode key, creating new: %v", err)
 		} else {
 			privKey, err := crypto.UnmarshalPrivateKey(keyBytes)
 			if err == nil {
-				log.Printf("Loaded identity from %s", keyPath)
+				log.Printf("[libp2p] Loaded identity from %s", keyPath)
 				return privKey, nil
 			}
-			log.Printf("Warning: failed to unmarshal key, creating new: %v", err)
+			log.Printf("[libp2p] Warning: failed to unmarshal key, creating new: %v", err)
 		}
 	}
 
-	log.Printf("Generating new identity at %s", keyPath)
+	log.Printf("[libp2p] Generating new identity at %s", keyPath)
 	privKey, _, err := crypto.GenerateKeyPairWithReader(crypto.RSA, 2048, rand.Reader)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate key pair: %w", err)
+		return nil, fmt.Errorf("[libp2p] failed to generate key pair: %w", err)
 	}
 
 	keyBytes, err := crypto.MarshalPrivateKey(privKey)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal private key: %w", err)
+		return nil, fmt.Errorf("[libp2p] failed to marshal private key: %w", err)
 	}
 
 	keyData := base64.StdEncoding.EncodeToString(keyBytes)
 	if err := os.WriteFile(keyPath, []byte(keyData), 0600); err != nil {
-		return nil, fmt.Errorf("failed to save private key: %w", err)
+		return nil, fmt.Errorf("[libp2p] failed to save private key: %w", err)
 	}
 
 	return privKey, nil
@@ -683,7 +686,7 @@ func convertBootnodesToAddrInfo(bootnodes []string) ([]peer.AddrInfo, error) {
 		}
 		addrInfo, err := peer.AddrInfoFromString(addr)
 		if err != nil {
-			log.Printf("Failed to parse bootnode address %s: %v", addr, err)
+			log.Printf("[libp2p] Failed to parse bootnode address %s: %v", addr, err)
 			continue
 		}
 		addrInfos = append(addrInfos, *addrInfo)
