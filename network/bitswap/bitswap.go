@@ -58,34 +58,48 @@ func NewEngine(ctx context.Context, h host.Host, bs *blockstore.Blockstore) *Eng
 	return e
 }
 
-// GetBlock fetches a single block.
+// GetBlock fetches a single block, waiting for it to become available from the network.
+// The lifetime of this operation is controlled by the passed-in context.
 func (e *Engine) GetBlock(ctx context.Context, h hasher.Hash) (block.Block, error) {
+	// First, check if the block is already in the local blockstore.
 	if has, _ := e.blockstore.Has(h); has {
 		return e.blockstore.Get(h)
 	}
 
+	// Create a new bitswap session for this request.
 	session := e.newSession(ctx)
 	defer e.closeSession(session.id)
 
+	// Add the desired block to the session's wantlist and the engine's global wantlist.
+	// We initially ask for 'Have' to see which peers have the block.
 	session.AddWant(h, pb.Message_Wantlist_Entry_Have)
 	e.wantlist.Add(h, 1, pb.Message_Wantlist_Entry_Have)
-	e.broadcastWantlist()
+	e.broadcastWantlist() // Broadcast the updated wantlist to connected peers.
 
+	// This select waits for a block to be received or the context to be canceled.
+	// It relies on the caller to provide a context with an appropriate deadline.
 	select {
+	case blk := <-session.blockChannel:
+		// The block was received directly, possibly from a peer who had it cached
+		// or responded with the block instead of a HAVE message.
+		return blk, nil
+
 	case peerWithBlock := <-session.peerHasBlockChannel:
+		// A peer has indicated they have the block. Now, specifically request the block from them.
 		e.sendWantBlockToPeer(peerWithBlock, h)
+
+		// This inner select waits for the block to arrive from the specific peer.
 		select {
 		case blk := <-session.blockChannel:
 			return blk, nil
 		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(20 * time.Second):
-			return nil, fmt.Errorf("timeout waiting for block %s", h)
+			// The context expired or was canceled while waiting for the block from the specific peer.
+			return nil, fmt.Errorf("context done while waiting for block %s from peer %s: %w", h, peerWithBlock, ctx.Err())
 		}
+
 	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-time.After(20 * time.Second):
-		return nil, fmt.Errorf("timeout waiting for peer with block %s", h)
+		// The context was canceled or expired while waiting for any peer to have the block.
+		return nil, fmt.Errorf("context done while waiting for a peer with block %s: %w", h, ctx.Err())
 	}
 }
 

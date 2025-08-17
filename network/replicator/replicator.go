@@ -268,6 +268,13 @@ func (r *Replicator) FetchAndStore(hash hasher.Hash) error {
 			for range blockChannel {
 				replicatedCount++
 			}
+
+			if replicatedCount < len(blockHashes) {
+				err := fmt.Errorf("replication failed for %s: received %d of %d blocks", hash.String(), replicatedCount, len(blockHashes))
+				log.Print(err)
+				replicationFailuresTotal.Inc()
+				return err
+			}
 			log.Printf("[Replicator] Fetched %d/%d blocks for content %s", replicatedCount, len(blockHashes), hash.String())
 		}
 	}

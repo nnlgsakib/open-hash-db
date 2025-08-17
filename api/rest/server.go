@@ -377,14 +377,8 @@ func (s *Server) addDirectoryToZip(ctx context.Context, zipWriter *zip.Writer, l
 				return fmt.Errorf("failed to create file in zip for %s: %w", pathInZip, err)
 			}
 
-			for _, chunkInfo := range fileMetadata.Chunks {
-				data, err := s.getChunkData(ctx, chunkInfo.Hash)
-				if err != nil {
-					return fmt.Errorf("could not get chunk %s for file %s: %w", chunkInfo.Hash.String(), pathInZip, err)
-				}
-				if _, err = fileWriter.Write(data); err != nil {
-					return fmt.Errorf("failed to write chunk data to zip for file %s: %w", pathInZip, err)
-				}
+			if err := s.fetchAndStreamChunks(ctx, fileWriter, fileMetadata.Chunks); err != nil {
+				return fmt.Errorf("failed to stream chunks to zip for file %s: %w", pathInZip, err)
 			}
 		}
 	}
@@ -436,66 +430,92 @@ func (s *Server) viewContent(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) streamChunks(w http.ResponseWriter, r *http.Request, metadata *blockstore.ContentMetadata) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "Streaming unsupported!", http.StatusInternalServerError)
-		return
-	}
-
-	for i, chunkInfo := range metadata.Chunks {
-		data, err := s.getChunkData(r.Context(), chunkInfo.Hash)
-		if err != nil {
-			log.Printf("Error getting chunk %d for content %s: %v", i, metadata.Hash.String(), err)
-			// We can't recover from a missing chunk, so we stop.
-			// The client will receive a truncated response.
-			return
-		}
-
-		if _, err := w.Write(data); err != nil {
-			// Check if the error is due to the client closing the connection.
-			// This is a common occurrence and not necessarily a server error.
-			if strings.Contains(err.Error(), "forcibly closed by the remote host") ||
-				strings.Contains(err.Error(), "broken pipe") ||
-				strings.Contains(err.Error(), "connection reset by peer") {
-				log.Printf("Client closed connection while streaming %s. Download aborted.", metadata.Hash.String())
-			} else {
-				log.Printf("Error writing chunk %d to response for content %s: %v", i, metadata.Hash.String(), err)
-			}
-			// Stop streaming if we can't write to the client.
-			return
-		}
-
-		// Flush the data to the client after each chunk.
-		if flusher != nil {
-			flusher.Flush()
-		}
+	// Efficiently fetch and stream chunks
+	err := s.fetchAndStreamChunks(r.Context(), w, metadata.Chunks)
+	if err != nil {
+		// Error logging is handled inside fetchAndStreamChunks.
+		// We can't write an error header here as the body might have been partially written.
+		log.Printf("Aborting stream for content %s due to error: %v", metadata.Hash.String(), err)
 	}
 }
 
-// getChunkData retrieves chunk data, fetching from network if necessary.
-func (s *Server) getChunkData(ctx context.Context, chunkHash hasher.Hash) ([]byte, error) {
-	has, err := s.storage.Has(chunkHash)
-	if err != nil {
-		return nil, fmt.Errorf("error checking blockstore for chunk %s: %w", chunkHash, err)
-	}
-	if has {
-		blk, err := s.storage.Get(chunkHash)
-		if err != nil {
-			return nil, err
+// fetchAndStreamChunks ensures all required chunks are stored locally, fetching them
+// from the network if necessary, and then streams them from the local blockstore.
+// This approach is robust and avoids buffering large amounts of data in memory.
+func (s *Server) fetchAndStreamChunks(ctx context.Context, w io.Writer, chunks []chunker.ChunkInfo) error {
+	flusher, hasFlusher := w.(http.Flusher)
+
+	// Phase 1: Identify missing blocks
+	var missingHashes []hasher.Hash
+	for _, chunkInfo := range chunks {
+		if has, _ := s.storage.Has(chunkInfo.Hash); !has {
+			missingHashes = append(missingHashes, chunkInfo.Hash)
 		}
-		return blk.RawData(), nil
 	}
 
-	// Use bitswap to get the block
-	if bitswapNode, ok := s.node.(interface{ GetBitswap() *bitswap.Engine }); ok {
-		blk, err := bitswapNode.GetBitswap().GetBlock(ctx, chunkHash)
-		if err != nil {
-			return nil, err
+	// Phase 2: Fetch missing blocks from the network
+	if len(missingHashes) > 0 {
+		log.Printf("Found %d missing blocks for content, fetching from network...", len(missingHashes))
+		if bitswapNode, ok := s.node.(interface{ GetBitswap() *bitswap.Engine }); ok {
+			// Use the request context for fetching, but with a generous timeout for large files.
+			// The parent context will handle client disconnects.
+			fetchCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+			defer cancel()
+
+			blockChannel, err := bitswapNode.GetBitswap().GetBlocks(fetchCtx, missingHashes)
+			if err != nil {
+				return fmt.Errorf("failed to start bitswap session for %d chunks: %w", len(missingHashes), err)
+			}
+
+			// Drain the channel to ensure all blocks are fetched. Bitswap engine stores them.
+			receivedCount := 0
+			for range blockChannel {
+				receivedCount++
+			}
+
+			// Verify that all requested blocks were received.
+			if receivedCount < len(missingHashes) {
+				return fmt.Errorf("failed to fetch all missing blocks, got %d of %d", receivedCount, len(missingHashes))
+			}
+			log.Printf("Successfully fetched and stored %d missing blocks.", receivedCount)
+
+			// Optional: Final verification pass to ensure blocks are in the store.
+			for _, h := range missingHashes {
+				if has, _ := s.storage.Has(h); !has {
+					return fmt.Errorf("verification failed: block %s not in store after fetch", h)
+				}
+			}
+
+		} else {
+			return fmt.Errorf("node does not support bitswap, cannot fetch missing chunks")
 		}
-		return blk.RawData(), nil
 	}
 
-	return nil, fmt.Errorf("node does not support bitswap")
+	// Phase 3: Stream all chunks from local storage
+	for _, chunkInfo := range chunks {
+		blk, err := s.storage.Get(chunkInfo.Hash)
+		if err != nil {
+			// This should ideally not happen if the fetch and verification was successful.
+			return fmt.Errorf("failed to get block %s from storage: %w", chunkInfo.Hash, err)
+		}
+
+		if _, err := w.Write(blk.RawData()); err != nil {
+			if strings.Contains(err.Error(), "forcibly closed by the remote host") ||
+				strings.Contains(err.Error(), "broken pipe") ||
+				strings.Contains(err.Error(), "connection reset by peer") {
+				log.Printf("Client closed connection while streaming. Aborting.")
+			} else {
+				log.Printf("Error writing chunk %s to response: %v", chunkInfo.Hash, err)
+			}
+			return err // Stop streaming
+		}
+
+		if hasFlusher {
+			flusher.Flush()
+		}
+	}
+
+	return nil
 }
 
 // isMimeTypeRenderable checks if a MIME type can be displayed directly by most browsers.
