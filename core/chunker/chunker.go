@@ -18,22 +18,22 @@ const (
 
 // Chunk represents a single chunk of data
 type Chunk struct {
-	Hash hasher.Hash `json:"hash"`
-	Data []byte      `json:"data"`
-	Size int         `json:"size"`
+	Hash hasher.Hash
+	Data []byte
+	Size int
 }
 
 // ChunkInfo represents metadata about a chunk without the actual data
 type ChunkInfo struct {
-	Hash hasher.Hash `json:"hash"`
-	Size int         `json:"size"`
+	Hash hasher.Hash
+	Size int
 }
 
 // ChunkedFile represents a file split into chunks
 type ChunkedFile struct {
-	Chunks    []ChunkInfo `json:"chunks"`
-	TotalSize int64       `json:"total_size"`
-	RootHash  hasher.Hash `json:"root_hash"`
+	Chunks    []ChunkInfo
+	TotalSize int64
+	RootHash  hasher.Hash
 }
 
 // Chunker handles file chunking operations

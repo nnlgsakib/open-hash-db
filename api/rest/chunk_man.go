@@ -6,17 +6,17 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"openhashdb/core/blockstore"
-	"openhashdb/core/chunker"
-	"openhashdb/core/hasher"
-	"openhashdb/network/bitswap"
 	"strconv"
 	"sync"
 	"time"
+
+	"openhashdb/core/hasher"
+	"openhashdb/network/bitswap"
+	"openhashdb/protobuf/pb"
 )
 
 // streamChunksOptimized provides optimized chunk streaming with prefetching
-func (s *Server) streamChunksOptimized(w http.ResponseWriter, r *http.Request, metadata *blockstore.ContentMetadata) {
+func (s *Server) streamChunksOptimized(w http.ResponseWriter, r *http.Request, metadata *pb.ContentMetadata) {
 	ctx := r.Context()
 
 	if metadata.IsErasureCoded {
@@ -29,7 +29,7 @@ func (s *Server) streamChunksOptimized(w http.ResponseWriter, r *http.Request, m
 	// Set common headers
 	w.Header().Set("Accept-Ranges", "bytes")
 	w.Header().Set("Content-Type", metadata.MimeType)
-	w.Header().Set("Last-Modified", metadata.ModTime.UTC().Format(http.TimeFormat))
+	w.Header().Set("Last-Modified", metadata.ModTime.AsTime().UTC().Format(http.TimeFormat))
 	w.Header().Set("Cache-Control", "public, max-age=31536000") // Cache for 1 year (immutable content)
 
 	// Handle Range requests
@@ -45,7 +45,7 @@ func (s *Server) streamChunksOptimized(w http.ResponseWriter, r *http.Request, m
 
 	// Prefetch chunks for better performance
 	if err := s.prefetchChunks(ctx, metadata.Chunks); err != nil {
-		log.Printf("Warning: Failed to prefetch chunks for %s: %v", metadata.Hash, err)
+		log.Printf("Warning: Failed to prefetch chunks for %s: %v", string(metadata.Hash), err)
 		// Continue without prefetching
 	}
 
@@ -54,9 +54,14 @@ func (s *Server) streamChunksOptimized(w http.ResponseWriter, r *http.Request, m
 	defer s.bufferPool.Put(buffer)
 
 	for _, chunkInfo := range metadata.Chunks {
-		if err := s.streamChunkWithBuffer(ctx, w, chunkInfo.Hash, 0, int(chunkInfo.Size), buffer); err != nil {
+		chunkHash, err := hasher.HashFromBytes(chunkInfo.Hash)
+		if err != nil {
+			log.Printf("Aborting stream for %s due to invalid chunk hash: %v", string(metadata.Hash), err)
+			return
+		}
+		if err := s.streamChunkWithBuffer(ctx, w, chunkHash, 0, int(chunkInfo.Size), buffer); err != nil {
 			if !isClientClosedError(err) {
-				log.Printf("Aborting stream for %s due to error: %v", metadata.Hash, err)
+				log.Printf("Aborting stream for %s due to error: %v", string(metadata.Hash), err)
 			}
 			return
 		}
@@ -66,17 +71,22 @@ func (s *Server) streamChunksOptimized(w http.ResponseWriter, r *http.Request, m
 	}
 }
 
-func (s *Server) streamErasureCodedContent(w http.ResponseWriter, r *http.Request, metadata *blockstore.ContentMetadata) {
-	log.Printf("Streaming erasure-coded content %s", metadata.Hash)
+func (s *Server) streamErasureCodedContent(w http.ResponseWriter, r *http.Request, metadata *pb.ContentMetadata) {
+	log.Printf("Streaming erasure-coded content %s", string(metadata.Hash))
 
 	// 1. Collect all shard hashes
 	shardHashes := make([]hasher.Hash, len(metadata.Chunks))
 	for i, shardInfo := range metadata.Chunks {
-		shardHashes[i] = shardInfo.Hash
+		h, err := hasher.HashFromBytes(shardInfo.Hash)
+		if err != nil {
+			s.writeError(w, http.StatusInternalServerError, "Invalid shard hash", err)
+			return
+		}
+		shardHashes[i] = h
 	}
 
 	// 2. Fetch enough shards to reconstruct
-	shardsToFetch := metadata.DataShards
+	shardsToFetch := int(metadata.DataShards)
 	bitswapNode, ok := s.node.(interface{ GetBitswap() *bitswap.Engine })
 	if !ok {
 		s.writeError(w, http.StatusInternalServerError, "Node does not support bitswap", nil)
@@ -147,8 +157,8 @@ func (s *Server) streamErasureCodedContent(w http.ResponseWriter, r *http.Reques
 }
 
 // getChunksForRange returns chunks needed for a specific byte range
-func (s *Server) getChunksForRange(chunks []chunker.ChunkInfo, start, end int64) []chunker.ChunkInfo {
-	var result []chunker.ChunkInfo
+func (s *Server) getChunksForRange(chunks []*pb.ChunkInfo, start, end int64) []*pb.ChunkInfo {
+	var result []*pb.ChunkInfo
 	var offset int64
 
 	for _, chunk := range chunks {
@@ -165,7 +175,7 @@ func (s *Server) getChunksForRange(chunks []chunker.ChunkInfo, start, end int64)
 }
 
 // prefetchChunks fetches multiple chunks concurrently
-func (s *Server) prefetchChunks(ctx context.Context, chunks []chunker.ChunkInfo) error {
+func (s *Server) prefetchChunks(ctx context.Context, chunks []*pb.ChunkInfo) error {
 	if len(chunks) == 0 {
 		return nil
 	}
@@ -177,13 +187,17 @@ func (s *Server) prefetchChunks(ctx context.Context, chunks []chunker.ChunkInfo)
 	var errMu sync.Mutex
 
 	for _, chunkInfo := range chunks {
+		chunkHash, err := hasher.HashFromBytes(chunkInfo.Hash)
+		if err != nil {
+			continue
+		}
 		// Skip if already in cache
-		if _, exists := s.chunkCache.Get(chunkInfo.Hash.String()); exists {
+		if _, exists := s.chunkCache.Get(chunkHash.String()); exists {
 			continue
 		}
 
 		// Skip if already in local storage
-		if has, _ := s.storage.Has(chunkInfo.Hash); has {
+		if has, _ := s.storage.Has(chunkHash); has {
 			continue
 		}
 
@@ -206,7 +220,7 @@ func (s *Server) prefetchChunks(ctx context.Context, chunks []chunker.ChunkInfo)
 				errMu.Unlock()
 				log.Printf("Failed to prefetch chunk %s: %v", hash, err)
 			}
-		}(chunkInfo.Hash)
+		}(chunkHash)
 	}
 
 	wg.Wait()

@@ -3,8 +3,9 @@ package rest
 import (
 	"log"
 	"net/http"
-	"openhashdb/core/hasher"
 	"strconv"
+
+	"openhashdb/core/hasher"
 
 	"github.com/gorilla/mux"
 )

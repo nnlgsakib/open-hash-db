@@ -14,6 +14,7 @@ import (
 	"openhashdb/core/blockstore"
 	"openhashdb/core/hasher"
 	"openhashdb/network/bitswap"
+	"openhashdb/protobuf/pb"
 
 	"github.com/ipfs/go-cid"
 	"github.com/libp2p/go-libp2p"
@@ -33,6 +34,7 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/multiformats/go-multihash"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 const (
@@ -40,14 +42,6 @@ const (
 	ServiceTag       = "openhashdb"
 	MaxPeerEventLogs = 100
 )
-
-// PeerEvent represents a peer discovery, connection, or disconnection event
-type PeerEvent struct {
-	PeerID    peer.ID   `json:"peer_id"`
-	Type      string    `json:"type"`
-	Timestamp time.Time `json:"timestamp"`
-	Addresses []string  `json:"addresses"`
-}
 
 // Node represents a libp2p node
 type Node struct {
@@ -60,7 +54,7 @@ type Node struct {
 	blockstore       *blockstore.Blockstore
 	bitswap          *bitswap.Engine
 	GossipHandler    func(peer.ID, []byte) error
-	peerEvents       []PeerEvent
+	peerEvents       []*pb.PeerEvent
 	peerEventsMu     sync.RWMutex
 }
 
@@ -128,7 +122,7 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 		ctx:        nodeCtx,
 		cancel:     cancel,
 		dht:        nodeDHT,
-		peerEvents: make([]PeerEvent, 0, MaxPeerEventLogs),
+		peerEvents: make([]*pb.PeerEvent, 0, MaxPeerEventLogs),
 	}
 	node.heartbeatService = NewHeartbeatService(nodeCtx, node)
 
@@ -422,32 +416,26 @@ func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
 }
 
 // GetNetworkStats returns network statistics
-func (n *Node) GetNetworkStats() map[string]interface{} {
+func (n *Node) GetNetworkStats() *pb.NetworkStatsResponse {
 	peers := n.ConnectedPeers()
 	n.peerEventsMu.RLock()
-	peerEvents := make([]map[string]interface{}, len(n.peerEvents))
-	for i, event := range n.peerEvents {
-		peerEvents[i] = map[string]interface{}{
-			"peer_id":   event.PeerID.String(),
-			"type":      event.Type,
-			"timestamp": event.Timestamp.Format(time.RFC3339),
-			"addresses": event.Addresses,
-		}
-	}
+	peerEvents := make([]*pb.PeerEvent, len(n.peerEvents))
+	copy(peerEvents, n.peerEvents)
 	n.peerEventsMu.RUnlock()
 
-	stats := map[string]interface{}{
-		"peer_id":         n.ID().String(),
-		"connected_peers": len(peers),
-		"peer_list":       make([]string, len(peers)),
-		"addresses":       n.Addrs(),
-		"dht":             n.GetDHTStats(),
-		"peer_events":     peerEvents,
+	peerList := make([]string, len(peers))
+	for i, p := range peers {
+		peerList[i] = p.String()
 	}
-	for i, peer := range peers {
-		stats["peer_list"].([]string)[i] = peer.String()
+
+	return &pb.NetworkStatsResponse{
+		PeerId:         n.ID().String(),
+		ConnectedPeers: int32(len(peers)),
+		PeerList:       peerList,
+		Addresses:      n.Addrs(),
+		Dht:            n.GetDHTStats(),
+		PeerEvents:     peerEvents,
 	}
-	return stats
 }
 
 // IsSelf checks if a given AddrInfo belongs to the current node.
@@ -624,17 +612,16 @@ func (n *Node) FindContentProviders(contentHash string) ([]peer.AddrInfo, error)
 }
 
 // GetDHTStats returns DHT statistics
-func (n *Node) GetDHTStats() map[string]interface{} {
+func (n *Node) GetDHTStats() *pb.DHTStats {
 	if n.dht == nil {
-		return map[string]interface{}{
-			"enabled": false,
+		return &pb.DHTStats{
+			Enabled: false,
 		}
 	}
 	routingTable := n.dht.RoutingTable()
-	return map[string]interface{}{
-		"enabled":     true,
-		"peer_count":  routingTable.Size(),
-		"bucket_info": routingTable.GetPeerInfos(),
+	return &pb.DHTStats{
+		Enabled:    true,
+		PeerCount:  int32(routingTable.Size()),
 	}
 }
 
@@ -643,10 +630,10 @@ func (n *Node) logPeerEvent(peerID peer.ID, eventType string, addrs []string) {
 	n.peerEventsMu.Lock()
 	defer n.peerEventsMu.Unlock()
 
-	event := PeerEvent{
-		PeerID:    peerID,
+	event := &pb.PeerEvent{
+		PeerId:    peerID.String(),
 		Type:      eventType,
-		Timestamp: time.Now(),
+		Timestamp: timestamppb.Now(),
 		Addresses: addrs,
 	}
 
@@ -656,7 +643,7 @@ func (n *Node) logPeerEvent(peerID peer.ID, eventType string, addrs []string) {
 	}
 
 	log.Printf("Peer %s event: %s at %s, Addresses: %v",
-		peerID.String(), eventType, event.Timestamp.Format(time.RFC3339), addrs)
+		peerID.String(), eventType, event.Timestamp.AsTime().Format(time.RFC3339), addrs)
 }
 
 func loadOrCreateIdentity(keyPath string) (crypto.PrivKey, error) {

@@ -1,6 +1,6 @@
 syntax = "proto3";
 package bitswap.pb;
-option go_package = "openhashdb/network/bitswap/pb";
+option go_package = "openhashdb/protobuf/pb";
 
 message Message {
     message Wantlist {

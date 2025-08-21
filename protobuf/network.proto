@@ -1,0 +1,21 @@
+syntax = "proto3";
+package network.pb;
+option go_package = "openhashdb/protobuf/pb";
+
+import "google/protobuf/timestamp.proto";
+
+message ContentAnnouncement {
+    bytes hash = 1;
+    int64 size = 2;
+    google.protobuf.Timestamp timestamp = 3;
+    string peer_id = 4;
+}
+
+message PeerInfo {
+    string id = 1;
+    repeated string addrs = 2;
+}
+
+message PeerInfoList {
+    repeated PeerInfo peers = 1;
+}

@@ -2,21 +2,22 @@ package replicator
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"sync"
 	"time"
 
 	"openhashdb/core/blockstore"
-	"openhashdb/core/chunker"
 	"openhashdb/core/hasher"
 	"openhashdb/network/bitswap"
 	"openhashdb/network/libp2p"
+	"openhashdb/protobuf/pb"
 
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // Metrics for monitoring
@@ -48,16 +49,8 @@ type ReplicationFactor int
 const (
 	DefaultReplicationFactor ReplicationFactor = 3
 	LargeFileSizeThreshold                     = 200 * 1024 * 1024 // 200MB
-	DefaultGCRunInterval                     = 6 * time.Hour
+	DefaultGCRunInterval                       = 6 * time.Hour
 )
-
-// ContentAnnouncement represents an announcement of new content
-type ContentAnnouncement struct {
-	Hash      hasher.Hash `json:"hash"`
-	Size      int64       `json:"size"`
-	Timestamp time.Time   `json:"timestamp"`
-	PeerID    string      `json:"peer_id"`
-}
 
 // Replicator handles content replication and availability
 type Replicator struct {
@@ -109,14 +102,14 @@ func (r *Replicator) AnnounceContent(hash hasher.Hash, size int64) error {
 		log.Printf("[Replicator] Warning: failed to announce content to DHT: %v", err)
 	}
 
-	announcement := ContentAnnouncement{
-		Hash:      hash,
+	announcement := &pb.ContentAnnouncement{
+		Hash:      hash[:],
 		Size:      size,
-		Timestamp: time.Now(),
-		PeerID:    r.node.ID().String(),
+		Timestamp: timestamppb.Now(),
+		PeerId:    r.node.ID().String(),
 	}
 
-	data, err := json.Marshal(announcement)
+	data, err := proto.Marshal(announcement)
 	if err != nil {
 		return fmt.Errorf("failed to marshal announcement: %w", err)
 	}
@@ -167,30 +160,34 @@ func (r *Replicator) GetPinnedContent() []string {
 
 // handleGossipMessage handles incoming gossip messages
 func (r *Replicator) handleGossipMessage(peerID peer.ID, data []byte) error {
-	var announcement ContentAnnouncement
-	if err := json.Unmarshal(data, &announcement); err == nil {
+	var announcement pb.ContentAnnouncement
+	if err := proto.Unmarshal(data, &announcement); err == nil {
 		return r.handleContentAnnouncement(peerID, &announcement)
 	}
 	return nil
 }
 
 // handleContentAnnouncement handles content announcements by replicating content.
-func (r *Replicator) handleContentAnnouncement(peerID peer.ID, announcement *ContentAnnouncement) error {
-	if r.blockstore.HasContent(announcement.Hash) {
+func (r *Replicator) handleContentAnnouncement(peerID peer.ID, announcement *pb.ContentAnnouncement) error {
+	h, err := hasher.HashFromBytes(announcement.Hash)
+	if err != nil {
+		return err
+	}
+	if r.blockstore.HasContent(h) {
 		return nil
 	}
 
 	r.mu.Lock()
-	if _, ongoing := r.replicatingNow[announcement.Hash.String()]; ongoing {
+	if _, ongoing := r.replicatingNow[h.String()]; ongoing {
 		r.mu.Unlock()
 		return nil
 	}
-	r.replicatingNow[announcement.Hash.String()] = struct{}{}
+	r.replicatingNow[h.String()] = struct{}{}
 	r.mu.Unlock()
 
 	defer func() {
 		r.mu.Lock()
-		delete(r.replicatingNow, announcement.Hash.String())
+		delete(r.replicatingNow, h.String())
 		r.mu.Unlock()
 	}()
 
@@ -198,7 +195,7 @@ func (r *Replicator) handleContentAnnouncement(peerID peer.ID, announcement *Con
 		return nil
 	}
 
-	providers, err := r.node.FindContentProviders(announcement.Hash.String())
+	providers, err := r.node.FindContentProviders(h.String())
 	if err != nil {
 		return nil
 	}
@@ -207,8 +204,8 @@ func (r *Replicator) handleContentAnnouncement(peerID peer.ID, announcement *Con
 		return nil
 	}
 
-	log.Printf("[Replicator] Replication factor not met for %s, starting replication...", announcement.Hash.String())
-	go r.FetchAndStore(announcement.Hash)
+	log.Printf("[Replicator] Replication factor not met for %s, starting replication...", h.String())
+	go r.FetchAndStore(h)
 
 	return nil
 }
@@ -226,24 +223,23 @@ func (r *Replicator) FetchAndStore(hash hasher.Hash) error {
 		return err
 	}
 
-	var metadata blockstore.ContentMetadata
-	if err := json.Unmarshal(rootBlock.RawData(), &metadata); err != nil {
+	var metadata pb.ContentMetadata
+	if err := proto.Unmarshal(rootBlock.RawData(), &metadata); err != nil {
 		log.Printf("[Replicator] Fetched root block %s is not valid metadata, treating as raw file.", hash.String())
-		chunkInfo := chunker.ChunkInfo{
-			Hash: rootBlock.Hash(),
-			Size: len(rootBlock.RawData()),
-		}
-		metadata = blockstore.ContentMetadata{
+		// Create metadata for a single-block file
+		rootBlockH := rootBlock.Hash()
+		metadata = pb.ContentMetadata{
 			Filename:    hash.String(),
-			Size:        int64(chunkInfo.Size),
+			Size:        int64(len(rootBlock.RawData())),
 			IsDirectory: false,
-			Chunks:      []chunker.ChunkInfo{chunkInfo},
-			CreatedAt:   time.Now(),
-			ModTime:     time.Now(),
+			Chunks:      []*pb.ChunkInfo{{Hash: rootBlockH[:], Size: int64(len(rootBlock.RawData()))}},
+			CreatedAt:   timestamppb.Now(),
+			ModTime:     timestamppb.Now(),
 			RefCount:    1,
 		}
-		metadataBytes, _ := json.Marshal(metadata)
-		metadata.Hash = hasher.HashBytes(metadataBytes)
+		metadataBytes, _ := proto.Marshal(&metadata)
+		metadataHash := hasher.HashBytes(metadataBytes)
+		metadata.Hash = metadataHash[:]
 	}
 
 	if err := r.blockstore.StoreContent(&metadata); err != nil {
@@ -254,8 +250,12 @@ func (r *Replicator) FetchAndStore(hash hasher.Hash) error {
 	if !metadata.IsDirectory && len(metadata.Chunks) > 0 {
 		blockHashes := make([]hasher.Hash, 0)
 		for _, chunk := range metadata.Chunks {
-			if chunk.Hash != rootBlock.Hash() {
-				blockHashes = append(blockHashes, chunk.Hash)
+			chunkHash, err := hasher.HashFromBytes(chunk.Hash)
+			if err != nil {
+				continue
+			}
+			if chunkHash != rootBlock.Hash() {
+				blockHashes = append(blockHashes, chunkHash)
 			}
 		}
 
@@ -284,8 +284,12 @@ func (r *Replicator) FetchAndStore(hash hasher.Hash) error {
 	log.Printf("[Replicator] Successfully replicated content %s", hash.String())
 	replicationSuccessTotal.Inc()
 
-	if err := r.AnnounceContent(metadata.Hash, metadata.Size); err != nil {
-		log.Printf("[Replicator] Failed to announce newly replicated content %s: %v", metadata.Hash.String(), err)
+	metadataHash, err := hasher.HashFromBytes(metadata.Hash)
+	if err != nil {
+		return err
+	}
+	if err := r.AnnounceContent(metadataHash, metadata.Size); err != nil {
+		log.Printf("[Replicator] Failed to announce newly replicated content %s: %v", metadataHash.String(), err)
 	}
 	return nil
 }
@@ -385,13 +389,13 @@ func (r *Replicator) triggerGC() {
 }
 
 // GetStats returns replication statistics
-func (r *Replicator) GetStats() map[string]interface{} {
+func (r *Replicator) GetStats() *pb.ReplicationStats {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	return map[string]interface{}{
-		"replication_factor": int(r.replicationFactor),
-		"pinned_content":     len(r.pinnedContent),
-		"replicating_now":    len(r.replicatingNow),
+	return &pb.ReplicationStats{
+		ReplicationFactor: int32(r.replicationFactor),
+		PinnedContent:     int32(len(r.pinnedContent)),
+		ReplicatingNow:    int32(len(r.replicatingNow)),
 	}
 }

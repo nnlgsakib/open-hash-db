@@ -6,17 +6,20 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"openhashdb/api/pages"
-	"openhashdb/core/block"
-	"openhashdb/core/blockstore"
-	"openhashdb/core/hasher"
-	"openhashdb/core/merkle"
-	"openhashdb/core/utils"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
+
+	"openhashdb/api/pages"
+	"openhashdb/core/block"
+	"openhashdb/core/hasher"
+	"openhashdb/core/merkle"
+	"openhashdb/core/utils"
+	"openhashdb/protobuf/pb"
+
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 func isClientClosedError(err error) bool {
@@ -100,9 +103,9 @@ func (s *Server) showDownloadPage(w http.ResponseWriter, hashStr, filename strin
 		hashStr, filename, hashStr, filename)
 }
 
-func (s *Server) showDirectoryListing(w http.ResponseWriter, r *http.Request, metadata *blockstore.ContentMetadata) {
-	if strings.Contains(r.Header.Get("Accept"), "application/json") {
-		s.writeJSON(w, http.StatusOK, metadata.Links)
+func (s *Server) showDirectoryListing(w http.ResponseWriter, r *http.Request, metadata *pb.ContentMetadata) {
+	if strings.Contains(r.Header.Get("Accept"), "application/x-protobuf") {
+		s.writeJSON(w, http.StatusOK, metadata)
 		return
 	}
 
@@ -110,15 +113,15 @@ func (s *Server) showDirectoryListing(w http.ResponseWriter, r *http.Request, me
 	w.WriteHeader(http.StatusOK)
 
 	var html strings.Builder
-	html.WriteString(fmt.Sprintf(pages.DirViewerPage, metadata.Filename, metadata.Filename, metadata.Hash.String()))
+	html.WriteString(fmt.Sprintf(pages.DirViewerPage, metadata.Filename, metadata.Filename, string(metadata.Hash)))
 
 	for _, link := range metadata.Links {
 		var linkHref, nameDisplay string
 		if link.Type == "directory" {
-			linkHref = fmt.Sprintf("/view/%s", link.Hash.String())
+			linkHref = fmt.Sprintf("/view/%s", string(link.Hash))
 			nameDisplay = link.Name + "/"
 		} else {
-			linkHref = fmt.Sprintf("/download/%s", link.Hash.String())
+			linkHref = fmt.Sprintf("/download/%s", string(link.Hash))
 			nameDisplay = link.Name
 		}
 		html.WriteString(fmt.Sprintf(`
@@ -128,7 +131,7 @@ func (s *Server) showDirectoryListing(w http.ResponseWriter, r *http.Request, me
 				<td>%d bytes</td>
 				<td><a href="/info/%s" title="View details of %s">%s...</a></td>
 			</tr>
-		`, link.Type, linkHref, link.Name, nameDisplay, link.Size, link.Hash.String(), link.Name, link.Hash.String()[:16]))
+		`, link.Type, linkHref, link.Name, nameDisplay, link.Size, string(link.Hash), link.Name, string(link.Hash)[:16]))
 	}
 
 	html.WriteString(
@@ -157,27 +160,32 @@ func (s *Server) storeUploadedFile(filename string, reader io.Reader, useEC bool
 			}
 		}
 
-		metadata := &blockstore.ContentMetadata{
-			Hash:            merkleFile.Root,
-			Filename:        filename,
-			MimeType:        utils.GetMimeType(filename),
-			Size:            merkleFile.TotalSize,
-			ModTime:         time.Now(),
-			IsDirectory:     false,
-			CreatedAt:       time.Now(),
-			RefCount:        1,
-			IsErasureCoded:  true,
-			DataShards:      s.sharder.DataShardCount(),
-			ParityShards:    s.sharder.ParityShardCount(),
-			Chunks:          merkleFile.Chunks, // Shard info
+		chunks := make([]*pb.ChunkInfo, len(merkleFile.Chunks))
+		for i, c := range merkleFile.Chunks {
+			chunks[i] = &pb.ChunkInfo{Hash: c.Hash[:], Size: int64(c.Size)}
+		}
+
+		metadata := &pb.ContentMetadata{
+			Hash:           merkleFile.Root[:],
+			Filename:       filename,
+			MimeType:       utils.GetMimeType(filename),
+			Size:           merkleFile.TotalSize,
+			ModTime:        timestamppb.Now(),
+			IsDirectory:    false,
+			CreatedAt:      timestamppb.Now(),
+			RefCount:       1,
+			IsErasureCoded: true,
+			DataShards:     int32(s.sharder.DataShardCount()),
+			ParityShards:   int32(s.sharder.ParityShardCount()),
+			Chunks:         chunks, // Shard info
 		}
 
 		// Store the metadata itself as a block
-		metaBytes, err := json.Marshal(metadata)
+		metaBytes, err := proto.Marshal(metadata)
 		if err != nil {
 			return hasher.Hash{}, 0, fmt.Errorf("failed to marshal metadata: %w", err)
 		}
-		if err := s.storage.Put(block.NewBlockWithHash(metadata.Hash, metaBytes)); err != nil {
+		if err := s.storage.Put(block.NewBlockWithHash(merkleFile.Root, metaBytes)); err != nil {
 			return hasher.Hash{}, 0, fmt.Errorf("failed to store metadata block: %w", err)
 		}
 
@@ -203,24 +211,29 @@ func (s *Server) storeUploadedFile(filename string, reader io.Reader, useEC bool
 			}
 		}
 
-		metadata := &blockstore.ContentMetadata{
-			Hash:        merkleFile.Root,
+		pbChunks := make([]*pb.ChunkInfo, len(merkleFile.Chunks))
+		for i, c := range merkleFile.Chunks {
+			pbChunks[i] = &pb.ChunkInfo{Hash: c.Hash[:], Size: int64(c.Size)}
+		}
+
+		metadata := &pb.ContentMetadata{
+			Hash:        merkleFile.Root[:],
 			Filename:    filename,
 			MimeType:    utils.GetMimeType(filename),
 			Size:        merkleFile.TotalSize,
-			ModTime:     time.Now(),
+			ModTime:     timestamppb.Now(),
 			IsDirectory: false,
-			CreatedAt:   time.Now(),
+			CreatedAt:   timestamppb.Now(),
 			RefCount:    1,
-			Chunks:      merkleFile.Chunks,
+			Chunks:      pbChunks,
 		}
 
 		// Store the metadata itself as a block
-		metaBytes, err := json.Marshal(metadata)
+		metaBytes, err := proto.Marshal(metadata)
 		if err != nil {
 			return hasher.Hash{}, 0, fmt.Errorf("failed to marshal metadata: %w", err)
 		}
-		if err := s.storage.Put(block.NewBlockWithHash(metadata.Hash, metaBytes)); err != nil {
+		if err := s.storage.Put(block.NewBlockWithHash(merkleFile.Root, metaBytes)); err != nil {
 			return hasher.Hash{}, 0, fmt.Errorf("failed to store metadata block: %w", err)
 		}
 
@@ -282,24 +295,29 @@ func (s *Server) storeUploadedDirectory(path string, name string) (*merkle.Link,
 		totalSize += l.Size
 	}
 
-	dirMetadata := &blockstore.ContentMetadata{
-		Hash:        dirHash,
+	pbLinks := make([]*pb.Link, len(links))
+	for i, l := range links {
+		pbLinks[i] = &pb.Link{Name: l.Name, Hash: l.Hash[:], Size: l.Size, Type: l.Type}
+	}
+
+	dirMetadata := &pb.ContentMetadata{
+		Hash:        dirHash[:],
 		Filename:    name,
 		MimeType:    "inode/directory",
 		Size:        totalSize,
-		ModTime:     time.Now(),
+		ModTime:     timestamppb.Now(),
 		IsDirectory: true,
-		CreatedAt:   time.Now(),
+		CreatedAt:   timestamppb.Now(),
 		RefCount:    1,
-		Links:       links,
+		Links:       pbLinks,
 	}
 
 	// Store the metadata itself as a block
-	metaBytes, err := json.Marshal(dirMetadata)
+	metaBytes, err := proto.Marshal(dirMetadata)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal directory metadata: %w", err)
 	}
-	if err := s.storage.Put(block.NewBlockWithHash(dirMetadata.Hash, metaBytes)); err != nil {
+	if err := s.storage.Put(block.NewBlockWithHash(dirHash, metaBytes)); err != nil {
 		return nil, fmt.Errorf("failed to store directory metadata block: %w", err)
 	}
 
@@ -325,7 +343,7 @@ func (s *Server) writeJSON(w http.ResponseWriter, status int, data interface{}) 
 	}
 }
 
-// writeError writes an error response
+// writeError writes a JSON error response
 func (s *Server) writeError(w http.ResponseWriter, status int, message string, err error) {
 	errorMsg := message
 	if err != nil {
@@ -333,10 +351,11 @@ func (s *Server) writeError(w http.ResponseWriter, status int, message string, e
 		log.Printf("API Error: %s", errorMsg)
 	}
 
-	response := ErrorResponse{
-		Error:   http.StatusText(status),
-		Code:    status,
-		Message: errorMsg,
+	response := map[string]interface{}{
+		"error": map[string]interface{}{
+			"code":    status,
+			"message": errorMsg,
+		},
 	}
 
 	s.writeJSON(w, status, response)

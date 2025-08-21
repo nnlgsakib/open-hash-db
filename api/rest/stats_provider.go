@@ -2,27 +2,23 @@ package rest
 
 import (
 	"net/http"
-	"time"
+
+	"openhashdb/protobuf/pb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // getNetworkStats returns network statistics
 func (s *Server) getNetworkStats(w http.ResponseWriter, r *http.Request) {
 	if s.node == nil {
-		stats := map[string]interface{}{
-			"error": "Network node not available",
-		}
-		s.writeJSON(w, http.StatusServiceUnavailable, stats)
+		s.writeError(w, http.StatusServiceUnavailable, "Network node not available", nil)
 		return
 	}
 
-	if nodeWithStats, ok := s.node.(interface{ GetNetworkStats() map[string]interface{} }); ok {
+	if nodeWithStats, ok := s.node.(interface{ GetNetworkStats() *pb.NetworkStatsResponse }); ok {
 		stats := nodeWithStats.GetNetworkStats()
 		s.writeJSON(w, http.StatusOK, stats)
 	} else {
-		stats := map[string]interface{}{
-			"error": "Network stats not supported by this node type",
-		}
-		s.writeJSON(w, http.StatusServiceUnavailable, stats)
+		s.writeError(w, http.StatusServiceUnavailable, "Network stats not supported by this node type", nil)
 	}
 }
 
@@ -33,14 +29,14 @@ func (s *Server) getStats(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusInternalServerError, "Failed to get storage stats", err)
 		return
 	}
-	storageStats := map[string]interface{}{"content_count": len(content)}
+	storageStats := &pb.StorageStats{ContentCount: int64(len(content))}
 
 	replicationStats := s.replicator.GetStats()
 
-	stats := map[string]interface{}{
-		"storage":     storageStats,
-		"replication": replicationStats,
-		"timestamp":   time.Now(),
+	stats := &pb.StatsResponse{
+		Storage:     storageStats,
+		Replication: replicationStats,
+		Timestamp:   timestamppb.Now(),
 	}
 
 	s.writeJSON(w, http.StatusOK, stats)

@@ -7,13 +7,14 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"openhashdb/core/blockstore"
-	"openhashdb/core/merkle"
 	"path/filepath"
+
+	"openhashdb/core/hasher"
+	"openhashdb/protobuf/pb"
 )
 
 // streamDirectoryAsZip creates zip files with optimized streaming
-func (s *Server) streamDirectoryAsZip(w http.ResponseWriter, r *http.Request, metadata *blockstore.ContentMetadata) {
+func (s *Server) streamDirectoryAsZip(w http.ResponseWriter, r *http.Request, metadata *pb.ContentMetadata) {
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s.zip\"", metadata.Filename))
 
@@ -31,7 +32,7 @@ func (s *Server) streamDirectoryAsZip(w http.ResponseWriter, r *http.Request, me
 		defer zipWriter.Close()
 
 		if err := s.addFilesToZipOptimized(r.Context(), zipWriter, metadata.Links, ""); err != nil {
-			log.Printf("Error creating zip archive for %s: %v", metadata.Hash.String(), err)
+			log.Printf("Error creating zip archive for %s: %v", string(metadata.Hash), err)
 		}
 	}()
 
@@ -57,15 +58,15 @@ func (s *Server) streamDirectoryAsZip(w http.ResponseWriter, r *http.Request, me
 		}
 		if err != nil {
 			if !isClientClosedError(err) {
-				log.Printf("Error reading zip data: %v", err)
+					log.Printf("Error reading zip data: %v", err)
 			}
-			return
+				return
 		}
 	}
 }
 
 // addFilesToZipOptimized adds files to zip with concurrent processing
-func (s *Server) addFilesToZipOptimized(ctx context.Context, zipWriter *zip.Writer, links []merkle.Link, basePath string) error {
+func (s *Server) addFilesToZipOptimized(ctx context.Context, zipWriter *zip.Writer, links []*pb.Link, basePath string) error {
 	// Use semaphore to limit concurrent operations
 	sem := make(chan struct{}, maxConcurrentOps)
 
@@ -86,11 +87,17 @@ func (s *Server) addFilesToZipOptimized(ctx context.Context, zipWriter *zip.Writ
 				return fmt.Errorf("failed to create directory in zip: %w", err)
 			}
 
-			// Get the metadata for the subdirectory to recurse
-			dirMetadata, err := s.storage.GetContent(link.Hash)
+			linkHash, err := hasher.HashFromBytes(link.Hash)
 			if err != nil {
 				<-sem
-				return fmt.Errorf("could not get metadata for subdirectory %s (%s): %w", link.Name, link.Hash.String(), err)
+				return fmt.Errorf("invalid link hash: %w", err)
+			}
+
+			// Get the metadata for the subdirectory to recurse
+			dirMetadata, err := s.storage.GetContent(linkHash)
+			if err != nil {
+				<-sem
+				return fmt.Errorf("could not get metadata for subdirectory %s (%s): %w", link.Name, string(link.Hash), err)
 			}
 
 			<-sem
@@ -104,11 +111,17 @@ func (s *Server) addFilesToZipOptimized(ctx context.Context, zipWriter *zip.Writ
 				return fmt.Errorf("failed to create file in zip: %w", err)
 			}
 
-			// Get file metadata to access its chunks
-			fileMetadata, err := s.storage.GetContent(link.Hash)
+			linkHash, err := hasher.HashFromBytes(link.Hash)
 			if err != nil {
 				<-sem
-				return fmt.Errorf("could not get metadata for file %s (%s): %w", link.Name, link.Hash.String(), err)
+				return fmt.Errorf("invalid link hash: %w", err)
+			}
+
+			// Get file metadata to access its chunks
+			fileMetadata, err := s.storage.GetContent(linkHash)
+			if err != nil {
+				<-sem
+				return fmt.Errorf("could not get metadata for file %s (%s): %w", link.Name, string(link.Hash), err)
 			}
 
 			// Prefetch all chunks for this file concurrently
@@ -119,7 +132,12 @@ func (s *Server) addFilesToZipOptimized(ctx context.Context, zipWriter *zip.Writ
 
 			// Stream the chunks of the file into the zip writer
 			for _, chunkInfo := range fileMetadata.Chunks {
-				if err := s.fetchAndStreamChunkOptimized(ctx, fileWriter, chunkInfo.Hash, 0, int(chunkInfo.Size)); err != nil {
+				chunkHash, err := hasher.HashFromBytes(chunkInfo.Hash)
+				if err != nil {
+					<-sem
+					return fmt.Errorf("invalid chunk hash: %w", err)
+				}
+				if err := s.fetchAndStreamChunkOptimized(ctx, fileWriter, chunkHash, 0, int(chunkInfo.Size)); err != nil {
 					<-sem
 					return fmt.Errorf("failed to stream chunk to zip for file %s: %w", pathInZip, err)
 				}

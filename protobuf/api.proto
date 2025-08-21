@@ -1,0 +1,90 @@
+syntax = "proto3";
+package api.pb;
+option go_package = "openhashdb/protobuf/pb";
+
+import "google/protobuf/timestamp.proto";
+import "protobuf/core.proto";
+
+message UploadResponse {
+    string hash = 1;
+    int64 size = 2;
+    string filename = 3;
+    string message = 4;
+}
+
+message ErrorResponse {
+    string error = 1;
+    int32 code = 2;
+    string message = 3;
+}
+
+message ContentInfo {
+    bytes hash = 1;
+    string filename = 2;
+    string mime_type = 3;
+    int64 size = 4;
+    google.protobuf.Timestamp mod_time = 5;
+    bool is_directory = 6;
+    google.protobuf.Timestamp created_at = 7;
+    int32 ref_count = 8;
+    repeated core.pb.ChunkInfo chunks = 9;
+    repeated core.pb.Link links = 10;
+    string message = 11;
+}
+
+message ContentInfoList {
+    repeated ContentInfo infos = 1;
+}
+
+message HealthResponse {
+    string status = 1;
+    google.protobuf.Timestamp timestamp = 2;
+    string version = 3;
+}
+
+message StorageStats {
+    int64 content_count = 1;
+}
+
+message ReplicationStats {
+    int32 replication_factor = 1;
+    int32 pinned_content = 2;
+    int32 replicating_now = 3;
+}
+
+message StatsResponse {
+    StorageStats storage = 1;
+    ReplicationStats replication = 2;
+    google.protobuf.Timestamp timestamp = 3;
+}
+
+message PinResponse {
+    string hash = 1;
+    string message = 2;
+}
+
+message PinListResponse {
+    repeated string hashes = 1;
+}
+
+message PeerEvent {
+    string peer_id = 1;
+    string type = 2;
+    google.protobuf.Timestamp timestamp = 3;
+    repeated string addresses = 4;
+}
+
+message DHTStats {
+    bool enabled = 1;
+    int32 peer_count = 2;
+    // bucket_info is complex, skipping for now
+}
+
+message NetworkStatsResponse {
+    string peer_id = 1;
+    int32 connected_peers = 2;
+    repeated string peer_list = 3;
+    repeated string addresses = 4;
+    DHTStats dht = 5;
+    repeated PeerEvent peer_events = 6;
+}

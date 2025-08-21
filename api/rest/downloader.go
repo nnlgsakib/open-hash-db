@@ -4,8 +4,9 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"openhashdb/core/hasher"
 	"strconv"
+
+	"openhashdb/core/hasher"
 
 	"github.com/gorilla/mux"
 )

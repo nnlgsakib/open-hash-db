@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"openhashdb/protobuf/pb"
 )
 
 // uploadFile handles single file uploads
@@ -18,7 +20,7 @@ func (s *Server) uploadFile(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-		useEC := r.URL.Query().Get("ec") == "true"
+	useEC := r.URL.Query().Get("ec") == "true"
 	hash, size, err := s.storeUploadedFile(header.Filename, file, useEC)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to store file", err)
@@ -30,7 +32,7 @@ func (s *Server) uploadFile(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Failed to announce content: %v", err)
 	}
 
-	response := UploadResponse{
+	response := &pb.UploadResponse{
 		Hash:     hash.String(),
 		Size:     size,
 		Filename: header.Filename,
@@ -125,7 +127,7 @@ func (s *Server) uploadFolder(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Failed to announce content: %v", err)
 	}
 
-	response := UploadResponse{
+	response := &pb.UploadResponse{
 		Hash:     link.Hash.String(),
 		Size:     link.Size,
 		Filename: folderName,

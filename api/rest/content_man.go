@@ -1,13 +1,15 @@
 package rest
 
 import (
-	"encoding/json"
+	"encoding/hex"
 	"log"
 	"net/http"
-	"openhashdb/core/blockstore"
+
 	"openhashdb/core/hasher"
+	"openhashdb/protobuf/pb"
 
 	"github.com/gorilla/mux"
+	"google.golang.org/protobuf/proto"
 )
 
 // getContentInfo returns information about content
@@ -25,17 +27,35 @@ func (s *Server) getContentInfo(w http.ResponseWriter, r *http.Request) {
 	metadata, err := s.storage.GetContent(hash)
 	if err == nil {
 		// Content found locally
-		info := ContentInfo{
-			Hash:        metadata.Hash.String(),
+		chunks := make([]*JSONChunkInfo, len(metadata.Chunks))
+		for i, c := range metadata.Chunks {
+			chunks[i] = &JSONChunkInfo{
+				Hash: hex.EncodeToString(c.Hash),
+				Size: c.Size,
+			}
+		}
+
+		links := make([]*JSONLink, len(metadata.Links))
+		for i, l := range metadata.Links {
+			links[i] = &JSONLink{
+				Name: l.Name,
+				Hash: hex.EncodeToString(l.Hash),
+				Size: l.Size,
+				Type: l.Type,
+			}
+		}
+
+		info := &JSONContentInfo{
+			Hash:        hex.EncodeToString(metadata.Hash),
 			Filename:    metadata.Filename,
 			MimeType:    metadata.MimeType,
 			Size:        metadata.Size,
-			ModTime:     metadata.ModTime,
+			ModTime:     metadata.ModTime.AsTime(),
 			IsDirectory: metadata.IsDirectory,
-			CreatedAt:   metadata.CreatedAt,
+			CreatedAt:   metadata.CreatedAt.AsTime(),
 			RefCount:    metadata.RefCount,
-			Chunks:      metadata.Chunks,
-			Links:       metadata.Links,
+			Chunks:      chunks,
+			Links:       links,
 		}
 		s.writeJSON(w, http.StatusOK, info)
 		return
@@ -56,8 +76,8 @@ func (s *Server) getContentInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var fetchedMetadata blockstore.ContentMetadata
-	if err := json.Unmarshal(blk.RawData(), &fetchedMetadata); err != nil {
+	var fetchedMetadata pb.ContentMetadata
+	if err := proto.Unmarshal(blk.RawData(), &fetchedMetadata); err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to parse fetched metadata", err)
 		return
 	}
@@ -78,17 +98,34 @@ func (s *Server) getContentInfo(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	// Respond to the user immediately
-	info := ContentInfo{
-		Hash:        fetchedMetadata.Hash.String(),
+	chunks := make([]*JSONChunkInfo, len(fetchedMetadata.Chunks))
+	for i, c := range fetchedMetadata.Chunks {
+		chunks[i] = &JSONChunkInfo{
+			Hash: hex.EncodeToString(c.Hash),
+			Size: c.Size,
+		}
+	}
+
+	links := make([]*JSONLink, len(fetchedMetadata.Links))
+	for i, l := range fetchedMetadata.Links {
+		links[i] = &JSONLink{
+			Name: l.Name,
+			Hash: hex.EncodeToString(l.Hash),
+			Size: l.Size,
+			Type: l.Type,
+		}
+	}
+	info := &JSONContentInfo{
+		Hash:        hex.EncodeToString(fetchedMetadata.Hash),
 		Filename:    fetchedMetadata.Filename,
-		MimeType:    fetchedMetadata.MimeType,
+			MimeType:    fetchedMetadata.MimeType,
 		Size:        fetchedMetadata.Size,
-		ModTime:     fetchedMetadata.ModTime,
+		ModTime:     fetchedMetadata.ModTime.AsTime(),
 		IsDirectory: fetchedMetadata.IsDirectory,
-		CreatedAt:   fetchedMetadata.CreatedAt,
+		CreatedAt:   fetchedMetadata.CreatedAt.AsTime(),
 		RefCount:    fetchedMetadata.RefCount,
-		Chunks:      fetchedMetadata.Chunks,
-		Links:       fetchedMetadata.Links,
+		Chunks:      chunks,
+		Links:       links,
 		Message:     "Not found locally. Found on network, replicating in background.",
 	}
 

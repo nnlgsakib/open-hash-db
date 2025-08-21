@@ -1,7 +1,6 @@
 package merkle
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"sort"
@@ -10,27 +9,30 @@ import (
 	"openhashdb/core/chunker"
 	"openhashdb/core/hasher"
 	"openhashdb/core/sharder"
+	"openhashdb/protobuf/pb"
+
+	"google.golang.org/protobuf/proto"
 )
 
 // Link represents a link to another Merkle tree (a file or a directory).
 type Link struct {
-	Name string      `json:"name"`
-	Hash hasher.Hash `json:"hash"` // Merkle Root of the linked content
-	Size int64       `json:"size"`
-	Type string      `json:"type"` // "file" or "directory"
+	Name string
+	Hash hasher.Hash // Merkle Root of the linked content
+	Size int64
+	Type string // "file" or "directory"
 }
 
 // File represents a file as a Merkle tree of its chunks.
 type File struct {
-	Root      hasher.Hash         `json:"root"`
-	Chunks    []chunker.ChunkInfo `json:"chunks"`
-	TotalSize int64               `json:"total_size"`
+	Root      hasher.Hash
+	Chunks    []chunker.ChunkInfo
+	TotalSize int64
 }
 
 // Directory represents a directory as a list of links to its contents.
 // The Merkle root of a directory is the hash of the serialized, sorted list of links.
 type Directory struct {
-	Links []Link `json:"links"`
+	Links []Link
 }
 
 // BuildFileTree chunks a file and builds a Merkle tree representation.
@@ -119,8 +121,18 @@ func BuildDirectoryTree(links []Link) (hasher.Hash, error) {
 		return links[i].Name < links[j].Name
 	})
 
-	dir := Directory{Links: links}
-	data, err := json.Marshal(dir)
+	pbLinks := make([]*pb.Link, len(links))
+	for i, link := range links {
+		pbLinks[i] = &pb.Link{
+			Name: link.Name,
+			Hash: link.Hash[:],
+			Size: link.Size,
+			Type: link.Type,
+		}
+	}
+
+	dir := &pb.Directory{Links: pbLinks}
+	data, err := proto.Marshal(dir)
 	if err != nil {
 		return hasher.Hash{}, fmt.Errorf("failed to marshal directory links: %w", err)
 	}

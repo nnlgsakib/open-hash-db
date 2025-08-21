@@ -1,39 +1,65 @@
 package block
 
-import "openhashdb/core/hasher"
+import (
+	"openhashdb/core/hasher"
+	"openhashdb/protobuf/pb"
+)
 
 // Block represents a unit of data in the system.
 type Block interface {
 	Hash() hasher.Hash
 	RawData() []byte
+	ToProto() *pb.Block
 }
 
-// basicBlock is a basic implementation of the Block interface.
-type basicBlock struct {
-	BlockHash hasher.Hash `json:"hash"`
-	RawBlockData []byte      `json:"data"`
+// block is a basic implementation of the Block interface.
+type block struct {
+	p *pb.Block
+	h hasher.Hash
 }
 
 // NewBlock creates a new block from data.
 func NewBlock(data []byte) Block {
-	return &basicBlock{
-		BlockHash: hasher.HashBytes(data),
-		RawBlockData: data,
+	h := hasher.HashBytes(data)
+	return &block{
+		p: &pb.Block{
+			Hash: h[:],
+			Data: data,
+		},
+		h: h,
 	}
 }
 
 // NewBlockWithHash creates a new block from a hash and data.
 func NewBlockWithHash(h hasher.Hash, data []byte) Block {
-	return &basicBlock{
-		BlockHash: h,
-		RawBlockData: data,
+	return &block{
+		p: &pb.Block{
+			Hash: h[:],
+			Data: data,
+		},
+		h: h,
 	}
 }
 
-func (b *basicBlock) Hash() hasher.Hash {
-	return b.BlockHash
+func FromProto(p *pb.Block) (Block, error) {
+	h, err := hasher.HashFromBytes(p.Hash)
+	if err != nil {
+		return nil, err
+	}
+	return &block{
+		p: p,
+		h: h,
+	}, nil
 }
 
-func (b *basicBlock) RawData() []byte {
-	return b.RawBlockData
+func (b *block) Hash() hasher.Hash {
+	return b.h
+}
+
+func (b *block) RawData() []byte {
+	return b.p.Data
+}
+
+func (b *block) ToProto() *pb.Block {
+	return b.p
 }

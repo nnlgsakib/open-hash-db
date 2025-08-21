@@ -13,7 +13,7 @@ import (
 	"openhashdb/core/block"
 	"openhashdb/core/blockstore"
 	"openhashdb/core/hasher"
-	"openhashdb/network/bitswap/pb"
+	"openhashdb/protobuf/pb"
 
 	"github.com/google/uuid"
 	"github.com/libp2p/go-libp2p/core/host"

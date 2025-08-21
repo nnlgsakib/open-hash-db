@@ -1,0 +1,42 @@
+syntax = "proto3";
+package core.pb;
+option go_package = "openhashdb/protobuf/pb";
+
+import "google/protobuf/timestamp.proto";
+
+message Block {
+    bytes hash = 1;
+    bytes data = 2;
+}
+
+message ChunkInfo {
+    bytes hash = 1;
+    int64 size = 2;
+}
+
+message Link {
+    string name = 1;
+    bytes hash = 2;
+    int64 size = 3;
+    string type = 4;
+}
+
+message Directory {
+    repeated Link links = 1;
+}
+
+message ContentMetadata {
+    bytes hash = 1;
+    string filename = 2;
+    string mime_type = 3;
+    int64 size = 4;
+    google.protobuf.Timestamp mod_time = 5;
+    bool is_directory = 6;
+    google.protobuf.Timestamp created_at = 7;
+    int32 ref_count = 8;
+    bool is_erasure_coded = 9;
+    int32 data_shards = 10;
+    int32 parity_shards = 11;
+    repeated ChunkInfo chunks = 12;
+    repeated Link links = 13;
+}

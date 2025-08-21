@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"encoding/hex"
 	"openhashdb/api/rest"
 	"openhashdb/core/block"
 	"openhashdb/core/blockstore"
@@ -24,9 +25,11 @@ import (
 	"openhashdb/network/bitswap"
 	"openhashdb/network/libp2p"
 	"openhashdb/network/replicator"
+	"openhashdb/protobuf/pb"
 	"openhashdb/version"
 
 	"github.com/spf13/cobra"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 var (
@@ -377,16 +380,24 @@ func addFile(path string) error {
 		return fmt.Errorf("failed to stat file: %w", err)
 	}
 
-	metadata := &blockstore.ContentMetadata{
-		Hash:        merkleFile.Root,
+	pbChunks := make([]*pb.ChunkInfo, len(chunks))
+	for i, chunk := range chunks {
+		pbChunks[i] = &pb.ChunkInfo{
+			Hash: chunk.Hash[:],
+			Size: int64(len(chunk.Data)),
+		}
+	}
+
+	metadata := &pb.ContentMetadata{
+		Hash:        merkleFile.Root[:],
 		Filename:    filepath.Base(path),
 		MimeType:    utils.GetMimeType(path),
 		Size:        merkleFile.TotalSize,
-		ModTime:     info.ModTime(),
+		ModTime:     timestamppb.New(info.ModTime()),
 		IsDirectory: false,
-		CreatedAt:   time.Now(),
+		CreatedAt:   timestamppb.Now(),
 		RefCount:    1,
-		Chunks:      merkleFile.Chunks,
+		Chunks:      pbChunks,
 	}
 
 	if err := bs.StoreContent(metadata); err != nil {
@@ -460,16 +471,24 @@ func storeDirectoryRecursive(path string, name string) (*merkle.Link, error) {
 
 			info, _ := entry.Info()
 
-			fileMetadata := &blockstore.ContentMetadata{
-				Hash:        merkleFile.Root,
+			pbChunks := make([]*pb.ChunkInfo, len(chunks))
+			for i, chunk := range chunks {
+				pbChunks[i] = &pb.ChunkInfo{
+					Hash: chunk.Hash[:],
+					Size: int64(len(chunk.Data)),
+				}
+			}
+
+			fileMetadata := &pb.ContentMetadata{
+				Hash:        merkleFile.Root[:],
 				Filename:    entry.Name(),
 				MimeType:    utils.GetMimeType(entry.Name()),
 				Size:        merkleFile.TotalSize,
-				ModTime:     info.ModTime(),
+				ModTime:     timestamppb.New(info.ModTime()),
 				IsDirectory: false,
-				CreatedAt:   time.Now(),
+				CreatedAt:   timestamppb.Now(),
 				RefCount:    1,
-				Chunks:      merkleFile.Chunks,
+				Chunks:      pbChunks,
 			}
 			if err := bs.StoreContent(fileMetadata); err != nil {
 				return nil, fmt.Errorf("failed to store metadata for %s: %w", entry.Name(), err)
@@ -500,16 +519,26 @@ func storeDirectoryRecursive(path string, name string) (*merkle.Link, error) {
 		return nil, err
 	}
 
-	dirMetadata := &blockstore.ContentMetadata{
-		Hash:        dirHash,
+	pbLinks := make([]*pb.Link, len(links))
+	for i, link := range links {
+		pbLinks[i] = &pb.Link{
+			Name: link.Name,
+			Hash: link.Hash[:],
+			Size: link.Size,
+			Type: link.Type,
+		}
+	}
+
+	dirMetadata := &pb.ContentMetadata{
+		Hash:        dirHash[:],
 		Filename:    name,
 		MimeType:    "inode/directory",
 		Size:        totalSize,
-		ModTime:     info.ModTime(),
+		ModTime:     timestamppb.New(info.ModTime()),
 		IsDirectory: true,
-		CreatedAt:   time.Now(),
+		CreatedAt:   timestamppb.Now(),
 		RefCount:    1,
-		Links:       links,
+		Links:       pbLinks,
 	}
 
 	if err := bs.StoreContent(dirMetadata); err != nil {
@@ -552,7 +581,7 @@ func getContent(hash hasher.Hash) error {
 }
 
 // displayContent displays content information and data
-func displayContent(metadata *blockstore.ContentMetadata, hash hasher.Hash) error {
+func displayContent(metadata *pb.ContentMetadata, hash hasher.Hash) error {
 	if metadata.IsDirectory {
 		fmt.Printf("📁 Directory: %s\n", metadata.Filename)
 		fmt.Printf("   Hash: %s\n", hash.String())
@@ -564,7 +593,7 @@ func displayContent(metadata *blockstore.ContentMetadata, hash hasher.Hash) erro
 			if link.Type == "directory" {
 				typeIcon = "📁"
 			}
-			fmt.Printf("     %s %s (%s, %d bytes)\n", typeIcon, link.Name, link.Hash.String()[:8], link.Size)
+			fmt.Printf("     %s %s (%s, %d bytes)\n", typeIcon, link.Name, hex.EncodeToString(link.Hash)[:8], link.Size)
 		}
 	} else {
 		// Regular file
@@ -584,12 +613,12 @@ func viewContent(hash hasher.Hash) error {
 		return fmt.Errorf("content not found: %w", err)
 	}
 
-	fmt.Printf("Hash: %s\n", metadata.Hash.String())
+	fmt.Printf("Hash: %s\n", hex.EncodeToString(metadata.Hash))
 	fmt.Printf("Filename: %s\n", metadata.Filename)
 	fmt.Printf("MIME Type: %s\n", metadata.MimeType)
 	fmt.Printf("Size: %d bytes\n", metadata.Size)
-	fmt.Printf("Modified: %s\n", metadata.ModTime.Format(time.RFC3339))
-	fmt.Printf("Created: %s\n", metadata.CreatedAt.Format(time.RFC3339))
+	fmt.Printf("Modified: %s\n", metadata.ModTime.AsTime().Format(time.RFC3339))
+	fmt.Printf("Created: %s\n", metadata.CreatedAt.AsTime().Format(time.RFC3339))
 	fmt.Printf("Reference Count: %d\n", metadata.RefCount)
 	fmt.Printf("Is Directory: %t\n", metadata.IsDirectory)
 
@@ -629,7 +658,7 @@ func listContent() error {
 		fmt.Printf("%s %s\n", typeIcon, metadata.Filename)
 		fmt.Printf("   Hash: %s\n", hash.String())
 		fmt.Printf("   Size: %d bytes\n", metadata.Size)
-		fmt.Printf("   Created: %s\n", metadata.CreatedAt.Format("2006-01-02 15:04:05"))
+		fmt.Printf("   Created: %s\n", metadata.CreatedAt.AsTime().Format("2006-01-02 15:04:05"))
 		fmt.Println()
 	}
 

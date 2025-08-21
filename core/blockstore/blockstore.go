@@ -2,24 +2,22 @@ package blockstore
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"sync"
-	"time"
 
 	"openhashdb/core/block"
-	"openhashdb/core/chunker"
 	"openhashdb/core/hasher"
-	"openhashdb/core/merkle"
+	"openhashdb/protobuf/pb"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/opt"
 	"github.com/syndtr/goleveldb/leveldb/util"
+	"google.golang.org/protobuf/proto"
 )
 
 // Metrics for blockstore operations
@@ -56,23 +54,6 @@ const (
 	// blockPrefix is no longer used for leveldb but const is kept for reference
 	blockPrefix = "block:"
 )
-
-// ContentMetadata represents metadata for stored content (DAGs).
-type ContentMetadata struct {
-	Hash            hasher.Hash         `json:"hash"`
-	Filename        string              `json:"filename"`
-	MimeType        string              `json:"mime_type"`
-	Size            int64               `json:"size"`
-	ModTime         time.Time           `json:"mod_time"`
-	IsDirectory     bool                `json:"is_directory"`
-	CreatedAt       time.Time           `json:"created_at"`
-	RefCount        int                 `json:"ref_count"`
-	IsErasureCoded  bool                `json:"is_erasure_coded,omitempty"`
-	DataShards      int                 `json:"data_shards,omitempty"`
-	ParityShards    int                 `json:"parity_shards,omitempty"`
-	Chunks          []chunker.ChunkInfo `json:"chunks,omitempty"` // For chunked files, these are chunks. For EC files, these are shards.
-	Links           []merkle.Link       `json:"links,omitempty"`
-}
 
 // Blockstore handles persistent storage of blocks.
 type Blockstore struct {
@@ -257,9 +238,13 @@ func (bs *Blockstore) AllKeysChan(ctx context.Context) (<-chan hasher.Hash, erro
 // --- Content (DAG) Metadata Management ---
 
 // StoreContent stores content metadata.
-func (bs *Blockstore) StoreContent(metadata *ContentMetadata) error {
-	key := contentPrefix + metadata.Hash.String()
-	data, err := json.Marshal(metadata)
+func (bs *Blockstore) StoreContent(metadata *pb.ContentMetadata) error {
+	h, err := hasher.HashFromBytes(metadata.Hash)
+	if err != nil {
+		return err
+	}
+	key := contentPrefix + h.String()
+	data, err := proto.Marshal(metadata)
 	if err != nil {
 		return fmt.Errorf("failed to marshal metadata: %w", err)
 	}
@@ -267,7 +252,7 @@ func (bs *Blockstore) StoreContent(metadata *ContentMetadata) error {
 }
 
 // GetContent retrieves content metadata.
-func (bs *Blockstore) GetContent(hash hasher.Hash) (*ContentMetadata, error) {
+func (bs *Blockstore) GetContent(hash hasher.Hash) (*pb.ContentMetadata, error) {
 	key := contentPrefix + hash.String()
 	data, err := bs.db.Get([]byte(key), nil)
 	if err != nil {
@@ -277,8 +262,8 @@ func (bs *Blockstore) GetContent(hash hasher.Hash) (*ContentMetadata, error) {
 		return nil, fmt.Errorf("failed to get content metadata: %w", err)
 	}
 
-	var metadata ContentMetadata
-	if err := json.Unmarshal(data, &metadata); err != nil {
+	var metadata pb.ContentMetadata
+	if err := proto.Unmarshal(data, &metadata); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal metadata: %w", err)
 	}
 	return &metadata, nil
@@ -378,7 +363,7 @@ func (bs *Blockstore) GC(ctx context.Context, rootHashes <-chan hasher.Hash) (in
 				if err := bs.Delete(blockHash); err != nil {
 					log.Printf("GC: Failed to delete block %s: %v", blockHash.String(), err)
 				} else {
-					deletedCount++
+				deletedCount++
 				}
 			}
 		}
@@ -411,16 +396,26 @@ func (bs *Blockstore) markLive(ctx context.Context, rootHash hasher.Hash, liveBl
 
 	// Mark all the data chunks of this content as live.
 	for _, chunk := range metadata.Chunks {
-		liveBlocks.Store(chunk.Hash, struct{}{})
+		h, err := hasher.HashFromBytes(chunk.Hash)
+		if err != nil {
+			log.Printf("GC: Error converting chunk hash: %v", err)
+			continue
+		}
+		liveBlocks.Store(h, struct{}{})
 	}
 
 	// Recursively mark all linked content.
 	var linkWg sync.WaitGroup
 	for _, link := range metadata.Links {
 		linkWg.Add(1)
-		go func(linkHash hasher.Hash) {
+		go func(linkHash []byte) {
 			defer linkWg.Done()
-			bs.markLive(ctx, linkHash, liveBlocks)
+			h, err := hasher.HashFromBytes(linkHash)
+			if err != nil {
+				log.Printf("GC: Error converting link hash: %v", err)
+				return
+			}
+			bs.markLive(ctx, h, liveBlocks)
 		}(link.Hash)
 	}
 	linkWg.Wait()

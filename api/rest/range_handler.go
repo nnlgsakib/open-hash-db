@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"openhashdb/core/blockstore"
 	"strconv"
+
+	"openhashdb/core/hasher"
+	"openhashdb/protobuf/pb"
 )
 
 // handleRangeRequestOptimized handles range requests with optimization
-func (s *Server) handleRangeRequestOptimized(ctx context.Context, w http.ResponseWriter, r *http.Request, metadata *blockstore.ContentMetadata, rangeHeader string) {
+func (s *Server) handleRangeRequestOptimized(ctx context.Context, w http.ResponseWriter, r *http.Request, metadata *pb.ContentMetadata, rangeHeader string) {
 	flusher, hasFlusher := w.(http.Flusher)
 	start, end, err := parseRangeHeader(rangeHeader, metadata.Size)
 	if err != nil {
@@ -27,7 +29,7 @@ func (s *Server) handleRangeRequestOptimized(ctx context.Context, w http.Respons
 	// Identify chunks needed for this range and prefetch them
 	neededChunks := s.getChunksForRange(metadata.Chunks, start, end)
 	if err := s.prefetchChunks(ctx, neededChunks); err != nil {
-		log.Printf("Warning: Failed to prefetch range chunks for %s: %v", metadata.Hash, err)
+		log.Printf("Warning: Failed to prefetch range chunks for %s: %v", string(metadata.Hash), err)
 	}
 
 	buffer := s.bufferPool.Get().([]byte)
@@ -45,9 +47,15 @@ func (s *Server) handleRangeRequestOptimized(ctx context.Context, w http.Respons
 			offsetInChunk := streamStart - chunkStart
 			lengthToStream := streamEnd - streamStart + 1
 
-			if err := s.streamChunkWithBuffer(ctx, w, chunkInfo.Hash, int(offsetInChunk), int(lengthToStream), buffer); err != nil {
+			chunkHash, err := hasher.HashFromBytes(chunkInfo.Hash)
+			if err != nil {
+				log.Printf("Aborting ranged stream for %s due to invalid chunk hash: %v", string(metadata.Hash), err)
+				return
+			}
+
+			if err := s.streamChunkWithBuffer(ctx, w, chunkHash, int(offsetInChunk), int(lengthToStream), buffer); err != nil {
 				if !isClientClosedError(err) {
-					log.Printf("Aborting ranged stream for %s due to error: %v", metadata.Hash, err)
+					log.Printf("Aborting ranged stream for %s due to error: %v", string(metadata.Hash), err)
 				}
 				return
 			}

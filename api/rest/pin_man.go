@@ -2,7 +2,9 @@ package rest
 
 import (
 	"net/http"
+
 	"openhashdb/core/hasher"
+	"openhashdb/protobuf/pb"
 
 	"github.com/gorilla/mux"
 )
@@ -23,9 +25,9 @@ func (s *Server) pinContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response := map[string]interface{}{
-		"hash":    hash.String(),
-		"message": "Content pinned successfully",
+	response := &pb.PinResponse{
+		Hash:    hash.String(),
+		Message: "Content pinned successfully",
 	}
 
 	s.writeJSON(w, http.StatusOK, response)
@@ -47,9 +49,9 @@ func (s *Server) unpinContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response := map[string]interface{}{
-		"hash":    hash.String(),
-		"message": "Content unpinned successfully",
+	response := &pb.PinResponse{
+		Hash:    hash.String(),
+		Message: "Content unpinned successfully",
 	}
 
 	s.writeJSON(w, http.StatusOK, response)
