@@ -403,6 +403,9 @@ type discoveryNotifee struct {
 }
 
 func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
+	if n.node.IsSelf(pi) {
+		return
+	}
 	addrs := make([]string, 0, len(pi.Addrs))
 	for _, addr := range pi.Addrs {
 		addrs = append(addrs, addr.String())
@@ -445,6 +448,22 @@ func (n *Node) GetNetworkStats() map[string]interface{} {
 		stats["peer_list"].([]string)[i] = peer.String()
 	}
 	return stats
+}
+
+// IsSelf checks if a given AddrInfo belongs to the current node.
+func (n *Node) IsSelf(pi peer.AddrInfo) bool {
+	if pi.ID == n.host.ID() {
+		return true
+	}
+	myAddrs := n.host.Addrs()
+	for _, a := range pi.Addrs {
+		for _, myA := range myAddrs {
+			if a.Equal(myA) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // connectToBootnodes connects to bootnodes in parallel

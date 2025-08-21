@@ -52,7 +52,7 @@ func (pe *PeerExchanger) connectToNewPeers(addrInfos []peer.AddrInfo, sourcePeer
 
 	for _, pi := range addrInfos {
 		// Don't connect to self or already connected peers
-		if pi.ID == pe.node.Host().ID() || pe.node.Host().Network().Connectedness(pi.ID) == network.Connected {
+		if pe.node.IsSelf(pi) || pe.node.Host().Network().Connectedness(pi.ID) == network.Connected {
 			continue
 		}
 
