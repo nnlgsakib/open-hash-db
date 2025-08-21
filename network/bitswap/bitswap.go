@@ -24,36 +24,36 @@ import (
 )
 
 const (
-	ProtocolBitswap         = protocol.ID("/openhashdb/bitswap/1.2.0")
-	sendWantlistInterval    = 10 * time.Second
-	presenceCacheTTL        = 1 * time.Minute
-	maxConcurrentDownloads  = 8
-	providerSearchTimeout = 30 * time.Second
+	ProtocolBitswap        = protocol.ID("/openhashdb/bitswap/1.2.0")
+	sendWantlistInterval   = 10 * time.Second
+	presenceCacheTTL       = 1 * time.Minute
+	maxConcurrentDownloads = 8
+	providerSearchTimeout  = 30 * time.Second
 )
 
 // Engine is the main bitswap engine.
 type Engine struct {
-	host          host.Host
-	blockstore    *blockstore.Blockstore
-	wantlist      *WantlistManager
-	peers         map[peer.ID]*peerLedger
-	downloadMgr   *DownloadManager
-	mu            sync.RWMutex
-	ctx           context.Context
-	cancel        context.CancelFunc
+	host        host.Host
+	blockstore  *blockstore.Blockstore
+	wantlist    *WantlistManager
+	peers       map[peer.ID]*peerLedger
+	downloadMgr *DownloadManager
+	mu          sync.RWMutex
+	ctx         context.Context
+	cancel      context.CancelFunc
 }
 
 // NewEngine creates a new bitswap engine.
 func NewEngine(ctx context.Context, h host.Host, bs *blockstore.Blockstore) *Engine {
 	ctx, cancel := context.WithCancel(ctx)
 	e := &Engine{
-		host:       h,
-		blockstore: bs,
-		wantlist:   NewWantlistManager(),
-		peers:      make(map[peer.ID]*peerLedger),
+		host:        h,
+		blockstore:  bs,
+		wantlist:    NewWantlistManager(),
+		peers:       make(map[peer.ID]*peerLedger),
 		downloadMgr: NewDownloadManager(),
-		ctx:        ctx,
-		cancel:     cancel,
+		ctx:         ctx,
+		cancel:      cancel,
 	}
 	h.SetStreamHandler(ProtocolBitswap, e.handleNewStream)
 	go e.periodicWantlistBroadcast()
@@ -167,7 +167,7 @@ func (e *Engine) downloadWorker(session *DownloadSession, wg *sync.WaitGroup) {
 			continue
 		}
 
-		log.Printf("[Bitswap Worker] Requesting block %s from peer %s", hash, peer)
+		// log.Printf("[Bitswap Worker] Requesting block %s from peer %s", hash, peer)
 		e.sendWantBlockToPeer(peer, hash)
 	}
 }
@@ -394,14 +394,14 @@ func (dm *DownloadManager) NewSession(ctx context.Context, hashes []hasher.Hash)
 
 	sessCtx, cancel := context.WithCancel(ctx)
 	s := &DownloadSession{
-		id:          uuid.New().String(),
-		ctx:         sessCtx,
-		cancel:      cancel,
-		wants:       make(chan hasher.Hash, len(hashes)),
-		providers:   make(map[hasher.Hash]map[peer.ID]struct{}),
-		provChans:   make(map[hasher.Hash]chan peer.ID),
-		output:      make(chan block.Block, len(hashes)),
-		doneBlocks:  make(map[hasher.Hash]struct{}),
+		id:         uuid.New().String(),
+		ctx:        sessCtx,
+		cancel:     cancel,
+		wants:      make(chan hasher.Hash, len(hashes)),
+		providers:  make(map[hasher.Hash]map[peer.ID]struct{}),
+		provChans:  make(map[hasher.Hash]chan peer.ID),
+		output:     make(chan block.Block, len(hashes)),
+		doneBlocks: make(map[hasher.Hash]struct{}),
 	}
 
 	for _, h := range hashes {
@@ -439,15 +439,15 @@ func (dm *DownloadManager) DistributeHave(h hasher.Hash, p peer.ID) {
 }
 
 type DownloadSession struct {
-	id          string
-	ctx         context.Context
-	cancel      context.CancelFunc
-	wants       chan hasher.Hash
-	providers   map[hasher.Hash]map[peer.ID]struct{}
-	provChans   map[hasher.Hash]chan peer.ID
-	output      chan block.Block
-	doneBlocks  map[hasher.Hash]struct{}
-	mu          sync.RWMutex
+	id         string
+	ctx        context.Context
+	cancel     context.CancelFunc
+	wants      chan hasher.Hash
+	providers  map[hasher.Hash]map[peer.ID]struct{}
+	provChans  map[hasher.Hash]chan peer.ID
+	output     chan block.Block
+	doneBlocks map[hasher.Hash]struct{}
+	mu         sync.RWMutex
 }
 
 func (s *DownloadSession) NextWant() (hasher.Hash, bool) {
