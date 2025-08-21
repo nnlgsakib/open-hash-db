@@ -28,7 +28,7 @@ const (
 	sendWantlistInterval   = 10 * time.Second
 	presenceCacheTTL       = 1 * time.Minute
 	maxConcurrentDownloads = 8
-	providerSearchTimeout  = 30 * time.Second
+	providerSearchTimeout  = 5 * time.Minute
 )
 
 // Engine is the main bitswap engine.
@@ -223,6 +223,7 @@ func (e *Engine) handleIncomingBlocks(blocks []*pb.Message_Block, remotePeer pee
 			continue
 		}
 		newBlock := block.NewBlockWithHash(hash, b.Data)
+		log.Printf("[Bitswap] Received block %s from %s", newBlock.Hash().String(), remotePeer.String())
 		e.blockstore.Put(newBlock)
 		e.wantlist.Remove(newBlock.Hash())
 		e.downloadMgr.DistributeBlock(newBlock)
@@ -341,7 +342,12 @@ func (e *Engine) sendMatchingBlocks(p peer.ID, wl *pb.Message_Wantlist) {
 				log.Printf("[Bitswap] Core Error: Failed to get block %s from blockstore, but Has() was true: %v", hash, err)
 				continue
 			}
+			if err != nil {
+				log.Printf("[Bitswap] Core Error: Failed to get block %s from blockstore, but Has() was true: %v", hash, err)
+				continue
+			}
 			blockHash := blk.Hash()
+			log.Printf("[Bitswap] Sending block %s to %s", blk.Hash().String(), p.String())
 			blocksToSend = append(blocksToSend, &pb.Message_Block{
 				Hash: blockHash[:],
 				Data: blk.RawData(),

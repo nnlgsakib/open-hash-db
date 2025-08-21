@@ -17,7 +17,7 @@ import (
 const (
 	ProtocolHeartbeat = protocol.ID("/openhashdb/heartbeat/1.0.0")
 	HeartbeatInterval = 15 * time.Second
-	HeartbeatTimeout  = 30 * time.Second
+	HeartbeatTimeout  = 60 * time.Second
 )
 
 // Metrics

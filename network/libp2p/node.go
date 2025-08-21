@@ -205,7 +205,7 @@ func (n *networkNotifiee) Connected(net network.Network, conn network.Conn) {
 	go func(p peer.ID) {
 		// Use a background context because the connection is already established
 		// and we don't want to block the notifier.
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
 		defer cancel()
 
 		pinfo := n.node.host.Peerstore().PeerInfo(p)
@@ -344,7 +344,7 @@ func (n *Node) BroadcastGossip(ctx context.Context, data []byte) error {
 func (n *Node) sendData(ctx context.Context, peerID peer.ID, protocolID protocol.ID, data []byte) error {
 	const maxRetries = 5
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		ctx, cancel := context.WithTimeout(ctx, 1*time.Minute)
 		defer cancel()
 
 		stream, err := n.host.NewStream(network.WithAllowLimitedConn(ctx, "send-data"), peerID, protocolID)
@@ -478,7 +478,7 @@ func (n *Node) connectToBootnodes(bootnodes []string) error {
 		wg.Add(1)
 		go func(addr string) {
 			defer wg.Done()
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
 			defer cancel()
 			if err := n.Connect(ctx, addr); err != nil {
 				mu.Lock()
@@ -495,7 +495,7 @@ func (n *Node) connectToBootnodes(bootnodes []string) error {
 					return
 				}
 				log.Printf("[libp2p] Attempting to reserve slot with bootnode %s", pinfo.ID)
-				reserveCtx, reserveCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				reserveCtx, reserveCancel := context.WithTimeout(context.Background(), 1*time.Minute)
 				defer reserveCancel()
 				_, err = relayv2client.Reserve(reserveCtx, n.host, *pinfo)
 				if err != nil {
@@ -521,7 +521,7 @@ func (n *Node) bootstrapDHT() error {
 		return fmt.Errorf("[libp2p] DHT not initialized")
 	}
 	log.Printf("[libp2p] Bootstrapping DHT...")
-	ctx, cancel := context.WithTimeout(n.ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(n.ctx, 1*time.Minute)
 	defer cancel()
 	return n.dht.Bootstrap(ctx)
 }
@@ -548,7 +548,7 @@ func (n *Node) AnnounceContent(contentHashStr string) error {
 
 	const maxRetries = 5
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		ctx, cancel := context.WithTimeout(n.ctx, 30*time.Second)
+		ctx, cancel := context.WithTimeout(n.ctx, 1*time.Minute)
 		defer cancel()
 
 		mh, err := multihash.Sum([]byte(contentHashStr), multihash.SHA2_256, -1)
@@ -582,7 +582,7 @@ func (n *Node) FindContentProviders(contentHash string) ([]peer.AddrInfo, error)
 		return nil, fmt.Errorf("[libp2p] DHT not initialized")
 	}
 
-	ctx, cancel := context.WithTimeout(n.ctx, 90*time.Second)
+	ctx, cancel := context.WithTimeout(n.ctx, 2*time.Minute)
 	defer cancel()
 
 	hash, err := multihash.FromHexString(contentHash)
