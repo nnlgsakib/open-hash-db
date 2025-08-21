@@ -53,7 +53,8 @@ var (
 
 const (
 	contentPrefix = "content:"
-	blockPrefix   = "block:"
+	// blockPrefix is no longer used for leveldb but const is kept for reference
+	blockPrefix = "block:"
 )
 
 // ContentMetadata represents metadata for stored content (DAGs).
@@ -75,8 +76,9 @@ type ContentMetadata struct {
 
 // Blockstore handles persistent storage of blocks.
 type Blockstore struct {
-	db       *leveldb.DB
-	rootPath string
+	db         *leveldb.DB
+	rootPath   string
+	shardsPath string
 }
 
 // NewBlockstore creates a new blockstore instance at the given root path.
@@ -84,6 +86,11 @@ func NewBlockstore(rootPath string) (*Blockstore, error) {
 	// Ensure the root directory exists
 	if err := os.MkdirAll(rootPath, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create database root directory %s: %w", rootPath, err)
+	}
+
+	shardsPath := filepath.Join(rootPath, "shards")
+	if err := os.MkdirAll(shardsPath, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create shards directory %s: %w", shardsPath, err)
 	}
 
 	leveldbPath := filepath.Join(rootPath, "leveldb")
@@ -99,8 +106,9 @@ func NewBlockstore(rootPath string) (*Blockstore, error) {
 	}
 
 	bs := &Blockstore{
-		db:       db,
-		rootPath: rootPath,
+		db:         db,
+		rootPath:   rootPath,
+		shardsPath: shardsPath,
 	}
 
 	if space, err := bs.GetAvailableSpace(); err == nil {
@@ -109,6 +117,21 @@ func NewBlockstore(rootPath string) (*Blockstore, error) {
 
 	blockstoreOperationsTotal.WithLabelValues("open_db", "success").Inc()
 	return bs, nil
+}
+
+// getShardPath returns the directory and full file path for a given block hash.
+// It creates a 2-level directory structure to avoid too many files in one directory.
+// e.g., <root>/shards/ab/cd/abcdef123...
+func (bs *Blockstore) getShardPath(h hasher.Hash) (string, string) {
+	hashStr := h.String()
+	if len(hashStr) < 4 {
+		// Should not happen with sha256, but handle defensively
+		dir := bs.shardsPath
+		return dir, filepath.Join(dir, hashStr)
+	}
+	// Use first 2 chars for the first level, next 2 for the second.
+	dir := filepath.Join(bs.shardsPath, hashStr[:2], hashStr[2:4])
+	return dir, filepath.Join(dir, hashStr)
 }
 
 // Close closes the blockstore.
@@ -124,15 +147,15 @@ func (bs *Blockstore) Close() error {
 
 // Get retrieves a block from the blockstore.
 func (bs *Blockstore) Get(h hasher.Hash) (block.Block, error) {
-	key := []byte(blockPrefix + h.String())
-	data, err := bs.db.Get(key, nil)
+	_, filePath := bs.getShardPath(h)
+	data, err := os.ReadFile(filePath)
 	if err != nil {
-		if err == leveldb.ErrNotFound {
+		if os.IsNotExist(err) {
 			blockstoreOperationsTotal.WithLabelValues("get", "not_found").Inc()
 			return nil, fmt.Errorf("block not found: %s", h.String())
 		}
 		blockstoreOperationsTotal.WithLabelValues("get", "error").Inc()
-		return nil, fmt.Errorf("failed to get block %s: %w", h.String(), err)
+		return nil, fmt.Errorf("failed to get block %s from disk: %w", h.String(), err)
 	}
 
 	blockstoreOperationsTotal.WithLabelValues("get", "success").Inc()
@@ -142,21 +165,22 @@ func (bs *Blockstore) Get(h hasher.Hash) (block.Block, error) {
 // Put stores a block in the blockstore.
 func (bs *Blockstore) Put(b block.Block) error {
 	hash := b.Hash()
-	key := []byte(blockPrefix + hash.String())
+	dir, filePath := bs.getShardPath(hash)
 
-	exists, err := bs.db.Has(key, nil)
-	if err != nil {
-		blockstoreOperationsTotal.WithLabelValues("put", "error").Inc()
-		return fmt.Errorf("failed to check for block %s: %w", hash.String(), err)
-	}
-	if exists {
+	// Check if block already exists on disk to avoid unnecessary writes
+	if _, err := os.Stat(filePath); err == nil {
 		blockstoreOperationsTotal.WithLabelValues("put", "exists").Inc()
 		return nil // Block already exists
 	}
 
-	if err := bs.db.Put(key, b.RawData(), nil); err != nil {
+	if err := os.MkdirAll(dir, 0755); err != nil {
 		blockstoreOperationsTotal.WithLabelValues("put", "error").Inc()
-		return fmt.Errorf("failed to store block %s: %w", hash.String(), err)
+		return fmt.Errorf("failed to create shard directory for block %s: %w", hash.String(), err)
+	}
+
+	if err := os.WriteFile(filePath, b.RawData(), 0644); err != nil {
+		blockstoreOperationsTotal.WithLabelValues("put", "error").Inc()
+		return fmt.Errorf("failed to store block %s to disk: %w", hash.String(), err)
 	}
 
 	if space, err := bs.GetAvailableSpace(); err == nil {
@@ -169,21 +193,28 @@ func (bs *Blockstore) Put(b block.Block) error {
 
 // Has checks if a block exists in the blockstore.
 func (bs *Blockstore) Has(h hasher.Hash) (bool, error) {
-	key := []byte(blockPrefix + h.String())
-	return bs.db.Has(key, nil)
+	_, filePath := bs.getShardPath(h)
+	_, err := os.Stat(filePath)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
 }
 
 // GetSize returns the size of a block.
 func (bs *Blockstore) GetSize(h hasher.Hash) (int, error) {
-	key := []byte(blockPrefix + h.String())
-	data, err := bs.db.Get(key, nil)
+	_, filePath := bs.getShardPath(h)
+	stat, err := os.Stat(filePath)
 	if err != nil {
-		if err == leveldb.ErrNotFound {
+		if os.IsNotExist(err) {
 			return -1, fmt.Errorf("block not found: %s", h.String())
 		}
 		return -1, err
 	}
-	return len(data), nil
+	return int(stat.Size()), nil
 }
 
 // AllKeysChan returns a channel that streams all block keys.
@@ -192,27 +223,32 @@ func (bs *Blockstore) AllKeysChan(ctx context.Context) (<-chan hasher.Hash, erro
 	go func() {
 		defer close(ch)
 
-		prefix := []byte(blockPrefix)
-		iter := bs.db.NewIterator(util.BytesPrefix(prefix), nil)
-		defer iter.Release()
+		err := filepath.Walk(bs.shardsPath, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if info.IsDir() {
+				return nil
+			}
 
-		for iter.Next() {
-			key := iter.Key()
-			// Trim prefix to get the hash string
-			hashStr := string(key[len(prefix):])
+			// The filename is the hash
+			hashStr := info.Name()
 			h, err := hasher.HashFromString(hashStr)
 			if err != nil {
-				log.Printf("Skipping invalid block key in database: %s", key)
-				continue
+				log.Printf("Skipping invalid block file in shards: %s", path)
+				return nil // Continue walking
 			}
+
 			select {
 			case ch <- h:
 			case <-ctx.Done():
-				return
+				return ctx.Err()
 			}
-		}
-		if err := iter.Error(); err != nil {
-			log.Printf("Error iterating through blockstore: %v", err)
+			return nil
+		})
+
+		if err != nil {
+			log.Printf("Error walking through shards directory: %v", err)
 		}
 	}()
 	return ch, nil
@@ -282,11 +318,16 @@ func (bs *Blockstore) ListContent() ([]hasher.Hash, error) {
 
 // Delete removes a block from the blockstore.
 func (bs *Blockstore) Delete(h hasher.Hash) error {
-	key := []byte(blockPrefix + h.String())
-	err := bs.db.Delete(key, nil)
+	_, filePath := bs.getShardPath(h)
+	err := os.Remove(filePath)
 	if err != nil {
+		if os.IsNotExist(err) {
+			// If it doesn't exist, we can consider it a success.
+			blockstoreOperationsTotal.WithLabelValues("delete", "success").Inc()
+			return nil
+		}
 		blockstoreOperationsTotal.WithLabelValues("delete", "error").Inc()
-		return fmt.Errorf("failed to delete block %s: %w", h.String(), err)
+		return fmt.Errorf("failed to delete block %s from disk: %w", h.String(), err)
 	}
 	blockstoreOperationsTotal.WithLabelValues("delete", "success").Inc()
 	return nil
