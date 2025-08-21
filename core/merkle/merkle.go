@@ -4,9 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
+
+	"openhashdb/core/block"
 	"openhashdb/core/chunker"
 	"openhashdb/core/hasher"
-	"sort"
+	"openhashdb/core/sharder"
 )
 
 // Link represents a link to another Merkle tree (a file or a directory).
@@ -57,6 +60,56 @@ func BuildFileTree(r io.Reader, c *chunker.Chunker) (*File, []chunker.Chunk, err
 	}
 
 	return file, chunks, nil
+}
+
+// BuildErasureCodedFileTree erasure codes a file and builds a Merkle tree representation.
+// It returns the created File object and the individual shards as block.Block objects.
+func BuildErasureCodedFileTree(r io.Reader, s sharder.ErasureCoder) (*File, []block.Block, error) {
+	data, err := sharder.ReadAll(r)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to read data for sharding: %w", err)
+	}
+
+	if len(data) == 0 {
+		// Handle empty file
+		emptyHash := hasher.HashBytes([]byte{})
+		file := &File{
+			Root:      emptyHash,
+			Chunks:    []chunker.ChunkInfo{},
+			TotalSize: 0,
+		}
+		return file, []block.Block{}, nil
+	}
+
+	shards, err := s.Encode(data)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to erasure code data: %w", err)
+	}
+
+	shardBlocks := make([]block.Block, s.ShardCount())
+	shardInfos := make([]chunker.ChunkInfo, s.ShardCount())
+	shardHashes := make([]hasher.Hash, s.ShardCount())
+
+	for i, shardData := range shards {
+		shardBlock := block.NewBlock(shardData)
+		shardBlocks[i] = shardBlock
+		shardHashes[i] = shardBlock.Hash()
+		shardInfos[i] = chunker.ChunkInfo{
+			Hash: shardBlock.Hash(),
+			Size: len(shardData),
+		}
+	}
+
+	// The root of an erasure-coded file is the Merkle root of its shard hashes.
+	rootHash := hasher.HashMultiple(shardHashes...)
+
+	file := &File{
+		Root:      rootHash,
+		Chunks:    shardInfos, // Chunks field now holds shard info
+		TotalSize: int64(len(data)),
+	}
+
+	return file, shardBlocks, nil
 }
 
 // BuildDirectoryTree creates a hash for a directory from its links.

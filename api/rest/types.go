@@ -5,6 +5,7 @@ import (
 	"openhashdb/core/blockstore"
 	"openhashdb/core/chunker"
 	"openhashdb/core/merkle"
+	"openhashdb/core/sharder"
 	"openhashdb/network/replicator"
 	"openhashdb/network/streammanager"
 	"sync"
@@ -19,6 +20,7 @@ type Server struct {
 	replicator *replicator.Replicator
 	streamer   *streammanager.StreamManager
 	chunker    *chunker.Chunker
+	sharder    sharder.ErasureCoder
 	node       interface{} // libp2p node for network stats
 	router     *mux.Router
 	server     *http.Server

@@ -141,47 +141,96 @@ func (s *Server) showDirectoryListing(w http.ResponseWriter, r *http.Request, me
 	fmt.Fprint(w, html.String())
 }
 
-func (s *Server) storeUploadedFile(filename string, reader io.Reader) (hasher.Hash, int64, error) {
-	merkleFile, chunks, err := merkle.BuildFileTree(reader, s.chunker)
-	if err != nil {
-		return hasher.Hash{}, 0, fmt.Errorf("failed to build merkle tree: %w", err)
-	}
+func (s *Server) storeUploadedFile(filename string, reader io.Reader, useEC bool) (hasher.Hash, int64, error) {
+	if useEC {
+		// Erasure Coding Path
+		merkleFile, shards, err := merkle.BuildErasureCodedFileTree(reader, s.sharder)
+		if err != nil {
+			return hasher.Hash{}, 0, fmt.Errorf("failed to build erasure-coded merkle tree: %w", err)
+		}
 
-	for _, chunk := range chunks {
-		if has, _ := s.storage.Has(chunk.Hash); !has {
-			if err := s.storage.Put(block.NewBlock(chunk.Data)); err != nil {
-				return hasher.Hash{}, 0, fmt.Errorf("failed to store chunk %s: %w", chunk.Hash.String(), err)
+		for _, shard := range shards {
+			if has, _ := s.storage.Has(shard.Hash()); !has {
+				if err := s.storage.Put(shard); err != nil {
+					return hasher.Hash{}, 0, fmt.Errorf("failed to store shard %s: %w", shard.Hash().String(), err)
+				}
 			}
 		}
-	}
 
-	metadata := &blockstore.ContentMetadata{
-		Hash:        merkleFile.Root,
-		Filename:    filename,
-		MimeType:    utils.GetMimeType(filename),
-		Size:        merkleFile.TotalSize,
-		ModTime:     time.Now(),
-		IsDirectory: false,
-		CreatedAt:   time.Now(),
-		RefCount:    1,
-		Chunks:      merkleFile.Chunks,
-	}
+		metadata := &blockstore.ContentMetadata{
+			Hash:            merkleFile.Root,
+			Filename:        filename,
+			MimeType:        utils.GetMimeType(filename),
+			Size:            merkleFile.TotalSize,
+			ModTime:         time.Now(),
+			IsDirectory:     false,
+			CreatedAt:       time.Now(),
+			RefCount:        1,
+			IsErasureCoded:  true,
+			DataShards:      s.sharder.DataShardCount(),
+			ParityShards:    s.sharder.ParityShardCount(),
+			Chunks:          merkleFile.Chunks, // Shard info
+		}
 
-	// Store the metadata itself as a block
-	metaBytes, err := json.Marshal(metadata)
-	if err != nil {
-		return hasher.Hash{}, 0, fmt.Errorf("failed to marshal metadata: %w", err)
-	}
-	if err := s.storage.Put(block.NewBlockWithHash(metadata.Hash, metaBytes)); err != nil {
-		return hasher.Hash{}, 0, fmt.Errorf("failed to store metadata block: %w", err)
-	}
+		// Store the metadata itself as a block
+		metaBytes, err := json.Marshal(metadata)
+		if err != nil {
+			return hasher.Hash{}, 0, fmt.Errorf("failed to marshal metadata: %w", err)
+		}
+		if err := s.storage.Put(block.NewBlockWithHash(metadata.Hash, metaBytes)); err != nil {
+			return hasher.Hash{}, 0, fmt.Errorf("failed to store metadata block: %w", err)
+		}
 
-	if err := s.storage.StoreContent(metadata); err != nil {
-		return hasher.Hash{}, 0, fmt.Errorf("failed to store metadata: %w", err)
-	}
+		if err := s.storage.StoreContent(metadata); err != nil {
+			return hasher.Hash{}, 0, fmt.Errorf("failed to store metadata: %w", err)
+		}
 
-	log.Printf("Successfully stored file %s with Merkle root %s", filename, merkleFile.Root.String())
-	return merkleFile.Root, merkleFile.TotalSize, nil
+		log.Printf("Successfully stored erasure-coded file %s with Merkle root %s", filename, merkleFile.Root.String())
+		return merkleFile.Root, merkleFile.TotalSize, nil
+
+	} else {
+		// Chunking Path (existing logic)
+		merkleFile, chunks, err := merkle.BuildFileTree(reader, s.chunker)
+		if err != nil {
+			return hasher.Hash{}, 0, fmt.Errorf("failed to build merkle tree: %w", err)
+		}
+
+		for _, chunk := range chunks {
+			if has, _ := s.storage.Has(chunk.Hash); !has {
+				if err := s.storage.Put(block.NewBlock(chunk.Data)); err != nil {
+					return hasher.Hash{}, 0, fmt.Errorf("failed to store chunk %s: %w", chunk.Hash.String(), err)
+				}
+			}
+		}
+
+		metadata := &blockstore.ContentMetadata{
+			Hash:        merkleFile.Root,
+			Filename:    filename,
+			MimeType:    utils.GetMimeType(filename),
+			Size:        merkleFile.TotalSize,
+			ModTime:     time.Now(),
+			IsDirectory: false,
+			CreatedAt:   time.Now(),
+			RefCount:    1,
+			Chunks:      merkleFile.Chunks,
+		}
+
+		// Store the metadata itself as a block
+		metaBytes, err := json.Marshal(metadata)
+		if err != nil {
+			return hasher.Hash{}, 0, fmt.Errorf("failed to marshal metadata: %w", err)
+		}
+		if err := s.storage.Put(block.NewBlockWithHash(metadata.Hash, metaBytes)); err != nil {
+			return hasher.Hash{}, 0, fmt.Errorf("failed to store metadata block: %w", err)
+		}
+
+		if err := s.storage.StoreContent(metadata); err != nil {
+			return hasher.Hash{}, 0, fmt.Errorf("failed to store metadata: %w", err)
+		}
+
+		log.Printf("Successfully stored file %s with Merkle root %s", filename, merkleFile.Root.String())
+		return merkleFile.Root, merkleFile.TotalSize, nil
+	}
 }
 
 func (s *Server) storeUploadedDirectory(path string, name string) (*merkle.Link, error) {
@@ -207,7 +256,7 @@ func (s *Server) storeUploadedDirectory(path string, name string) (*merkle.Link,
 				return nil, err
 			}
 
-			hash, size, err := s.storeUploadedFile(entry.Name(), file)
+			hash, size, err := s.storeUploadedFile(entry.Name(), file, false)
 			file.Close()
 			if err != nil {
 				return nil, err

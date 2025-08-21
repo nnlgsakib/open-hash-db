@@ -48,6 +48,7 @@ type ReplicationFactor int
 const (
 	DefaultReplicationFactor ReplicationFactor = 3
 	LargeFileSizeThreshold                     = 200 * 1024 * 1024 // 200MB
+	DefaultGCRunInterval                     = 6 * time.Hour
 )
 
 // ContentAnnouncement represents an announcement of new content
@@ -87,6 +88,7 @@ func NewReplicator(bs *blockstore.Blockstore, node *libp2p.Node, bitswap *bitswa
 
 	node.GossipHandler = r.handleGossipMessage
 	go r.announceContentPeriodically()
+	go r.runGC()
 
 	return r
 }
@@ -330,6 +332,55 @@ func (r *Replicator) announcePinnedContent() {
 		if err := r.AnnounceContent(hash, metadata.Size); err != nil {
 			log.Printf("[Replicator] Failed to announce pinned content %s: %v", hash.String(), err)
 		}
+	}
+}
+
+// runGC periodically runs the garbage collector.
+func (r *Replicator) runGC() {
+	// Run once shortly after startup
+	initialDelay := time.After(5 * time.Minute)
+	ticker := time.NewTicker(DefaultGCRunInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-initialDelay:
+			log.Println("[Replicator] Kicking off initial garbage collection run.")
+			r.triggerGC()
+		case <-ticker.C:
+			log.Println("[Replicator] Kicking off scheduled garbage collection run.")
+			r.triggerGC()
+		case <-r.ctx.Done():
+			return
+		}
+	}
+}
+
+func (r *Replicator) triggerGC() {
+	r.mu.RLock()
+	pinned := make([]string, 0, len(r.pinnedContent))
+	for hashStr := range r.pinnedContent {
+		pinned = append(pinned, hashStr)
+	}
+	r.mu.RUnlock()
+
+	if len(pinned) == 0 {
+		log.Println("[Replicator] No pinned content, skipping GC run.")
+		return
+	}
+
+	rootHashes := make(chan hasher.Hash, len(pinned))
+	for _, hashStr := range pinned {
+		h, err := hasher.HashFromString(hashStr)
+		if err == nil {
+			rootHashes <- h
+		}
+	}
+	close(rootHashes)
+
+	_, err := r.blockstore.GC(r.ctx, rootHashes)
+	if err != nil {
+		log.Printf("[Replicator] Garbage collection run failed: %v", err)
 	}
 }
 

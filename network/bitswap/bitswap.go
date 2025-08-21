@@ -24,21 +24,23 @@ import (
 )
 
 const (
-	ProtocolBitswap      = protocol.ID("/openhashdb/bitswap/1.2.0")
-	sendWantlistInterval = 10 * time.Second
-	presenceCacheTTL     = 1 * time.Minute
+	ProtocolBitswap         = protocol.ID("/openhashdb/bitswap/1.2.0")
+	sendWantlistInterval    = 10 * time.Second
+	presenceCacheTTL        = 1 * time.Minute
+	maxConcurrentDownloads  = 8
+	providerSearchTimeout = 30 * time.Second
 )
 
 // Engine is the main bitswap engine.
 type Engine struct {
-	host       host.Host
-	blockstore *blockstore.Blockstore
-	wantlist   *WantlistManager
-	sessions   map[string]*Session
-	peers      map[peer.ID]*peerLedger
-	mu         sync.RWMutex
-	ctx        context.Context
-	cancel     context.CancelFunc
+	host          host.Host
+	blockstore    *blockstore.Blockstore
+	wantlist      *WantlistManager
+	peers         map[peer.ID]*peerLedger
+	downloadMgr   *DownloadManager
+	mu            sync.RWMutex
+	ctx           context.Context
+	cancel        context.CancelFunc
 }
 
 // NewEngine creates a new bitswap engine.
@@ -48,8 +50,8 @@ func NewEngine(ctx context.Context, h host.Host, bs *blockstore.Blockstore) *Eng
 		host:       h,
 		blockstore: bs,
 		wantlist:   NewWantlistManager(),
-		sessions:   make(map[string]*Session),
 		peers:      make(map[peer.ID]*peerLedger),
+		downloadMgr: NewDownloadManager(),
 		ctx:        ctx,
 		cancel:     cancel,
 	}
@@ -59,99 +61,115 @@ func NewEngine(ctx context.Context, h host.Host, bs *blockstore.Blockstore) *Eng
 }
 
 // GetBlock fetches a single block, waiting for it to become available from the network.
-// The lifetime of this operation is controlled by the passed-in context.
 func (e *Engine) GetBlock(ctx context.Context, h hasher.Hash) (block.Block, error) {
-	// First, check if the block is already in the local blockstore.
 	if has, _ := e.blockstore.Has(h); has {
 		return e.blockstore.Get(h)
 	}
 
-	// Create a new bitswap session for this request.
-	session := e.newSession(ctx)
-	defer e.closeSession(session.id)
+	blocks, err := e.GetBlocks(ctx, []hasher.Hash{h})
+	if err != nil {
+		return nil, err
+	}
 
-	// Add the desired block to the session's wantlist and the engine's global wantlist.
-	// We initially ask for 'Have' to see which peers have the block.
-	session.AddWant(h, pb.Message_Wantlist_Entry_Have)
-	e.wantlist.Add(h, 1, pb.Message_Wantlist_Entry_Have)
-	e.broadcastWantlist() // Broadcast the updated wantlist to connected peers.
-
-	// This select waits for a block to be received or the context to be canceled.
-	// It relies on the caller to provide a context with an appropriate deadline.
 	select {
-	case blk := <-session.blockChannel:
-		// The block was received directly, possibly from a peer who had it cached
-		// or responded with the block instead of a HAVE message.
-		return blk, nil
-
-	case peerWithBlock := <-session.peerHasBlockChannel:
-		// A peer has indicated they have the block. Now, specifically request the block from them.
-		e.sendWantBlockToPeer(peerWithBlock, h)
-
-		// This inner select waits for the block to arrive from the specific peer.
-		select {
-		case blk := <-session.blockChannel:
-			return blk, nil
-		case <-ctx.Done():
-			// The context expired or was canceled while waiting for the block from the specific peer.
-			return nil, fmt.Errorf("context done while waiting for block %s from peer %s: %w", h, peerWithBlock, ctx.Err())
+	case b, ok := <-blocks:
+		if !ok {
+			return nil, fmt.Errorf("failed to get block %s, channel closed", h)
 		}
-
+		return b, nil
 	case <-ctx.Done():
-		// The context was canceled or expired while waiting for any peer to have the block.
-		return nil, fmt.Errorf("context done while waiting for a peer with block %s: %w", h, ctx.Err())
+		return nil, ctx.Err()
 	}
 }
 
-// GetBlocks fetches multiple blocks.
+// GetBlocks fetches multiple blocks concurrently from the network.
 func (e *Engine) GetBlocks(ctx context.Context, hashes []hasher.Hash) (<-chan block.Block, error) {
+	session := e.downloadMgr.NewSession(ctx, hashes)
 	output := make(chan block.Block)
-	session := e.newSession(ctx)
 
 	go func() {
-		defer e.closeSession(session.id)
 		defer close(output)
+		defer e.downloadMgr.CloseSession(session.id)
 
-		wantsCount := 0
+		var initialWants []hasher.Hash
 		for _, h := range hashes {
 			if has, _ := e.blockstore.Has(h); !has {
-				session.AddWant(h, pb.Message_Wantlist_Entry_Have)
-				e.wantlist.Add(h, 1, pb.Message_Wantlist_Entry_Have)
-				wantsCount++
+				initialWants = append(initialWants, h)
+			} else {
+				blk, err := e.blockstore.Get(h)
+				if err == nil {
+					session.MarkAsDone(h)
+					output <- blk
+				}
 			}
 		}
 
-		if wantsCount == 0 {
+		if len(initialWants) == 0 {
 			return
 		}
 
+		log.Printf("[Bitswap] GetBlocks: Starting session %s for %d blocks", session.id, len(initialWants))
+
+		// Add wants to global wantlist and broadcast
+		for _, h := range initialWants {
+			e.wantlist.Add(h, 1, pb.Message_Wantlist_Entry_Have)
+		}
 		e.broadcastWantlist()
 
-		go func() {
-			for {
+		var wg sync.WaitGroup
+		for i := 0; i < maxConcurrentDownloads; i++ {
+			wg.Add(1)
+			go e.downloadWorker(session, &wg)
+		}
+
+		// Collect results
+		for i := 0; i < len(initialWants); i++ {
+			select {
+			case blk := <-session.output:
 				select {
-				case peerWithBlock := <-session.peerHasBlockChannel:
-					hashToGet := <-session.hashToGetChannel
-					go e.sendWantBlockToPeer(peerWithBlock, hashToGet)
-				case <-session.done:
-					return
+				case output <- blk:
 				case <-ctx.Done():
 					return
 				}
-			}
-		}()
-
-		for i := 0; i < wantsCount; i++ {
-			select {
-			case blk := <-session.blockChannel:
-				output <- blk
 			case <-ctx.Done():
+				log.Printf("[Bitswap] GetBlocks context done for session %s", session.id)
 				return
 			}
 		}
+		log.Printf("[Bitswap] GetBlocks finished for session %s", session.id)
 	}()
 
 	return output, nil
+}
+
+func (e *Engine) downloadWorker(session *DownloadSession, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for {
+		select {
+		case <-session.ctx.Done():
+			return
+		default:
+		}
+
+		hash, ok := session.NextWant()
+		if !ok {
+			return // No more blocks to download
+		}
+
+		providerCtx, cancel := context.WithTimeout(session.ctx, providerSearchTimeout)
+		peer, err := session.WaitForProvider(providerCtx, hash)
+		cancel()
+
+		if err != nil {
+			log.Printf("[Bitswap Worker] Could not find provider for block %s: %v", hash, err)
+			session.RequeueWant(hash) // Re-queue to try again later
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
+		log.Printf("[Bitswap Worker] Requesting block %s from peer %s", hash, peer)
+		e.sendWantBlockToPeer(peer, hash)
+	}
 }
 
 // handleNewStream handles incoming bitswap streams.
@@ -199,7 +217,6 @@ func (e *Engine) handleNewStream(s network.Stream) {
 }
 
 func (e *Engine) handleIncomingBlocks(blocks []*pb.Message_Block, remotePeer peer.ID) {
-	// log.Printf("[Bitswap] Received %d blocks from %s", len(blocks), remotePeer)
 	for _, b := range blocks {
 		hash, err := hasher.HashFromBytes(b.Hash)
 		if err != nil {
@@ -208,7 +225,7 @@ func (e *Engine) handleIncomingBlocks(blocks []*pb.Message_Block, remotePeer pee
 		newBlock := block.NewBlockWithHash(hash, b.Data)
 		e.blockstore.Put(newBlock)
 		e.wantlist.Remove(newBlock.Hash())
-		e.distributeBlock(newBlock)
+		e.downloadMgr.DistributeBlock(newBlock)
 	}
 }
 
@@ -219,7 +236,7 @@ func (e *Engine) handleIncomingPresences(presences []*pb.Message_BlockPresence, 
 			continue
 		}
 		if pres.Type == pb.Message_BlockPresence_Have {
-			e.distributeHave(hash, remotePeer)
+			e.downloadMgr.DistributeHave(hash, remotePeer)
 		}
 	}
 }
@@ -235,7 +252,6 @@ func (e *Engine) getOrCreateLedger(p peer.ID) *peerLedger {
 	return ledger
 }
 
-// HandlePeerDisconnect cleans up resources associated with a disconnected peer.
 func (e *Engine) HandlePeerDisconnect(p peer.ID) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -270,7 +286,7 @@ func (e *Engine) broadcastWantlist() {
 	if len(wl) == 0 {
 		return
 	}
-	log.Printf("[Bitswap] Broadcasting wantlist with %d items", len(wl))
+	// log.Printf("[Bitswap] Broadcasting wantlist with %d items", len(wl))
 	for _, p := range e.host.Network().Peers() {
 		go e.sendWantlistToPeer(p, false)
 	}
@@ -346,13 +362,6 @@ func (e *Engine) sendMatchingBlocks(p peer.ID, wl *pb.Message_Wantlist) {
 		}
 	}
 
-	if len(blocksToSend) > 0 {
-		// log.Printf("[Bitswap] Fulfilling want-block request from %s for %d blocks", p, len(blocksToSend))
-	}
-	if len(presencesToSend) > 0 {
-		log.Printf("[Bitswap] Responding to want-have request from %s with %d presences", p, len(presencesToSend))
-	}
-
 	if len(blocksToSend) > 0 || len(presencesToSend) > 0 {
 		msg := &pb.Message{Blocks: blocksToSend, BlockPresences: presencesToSend}
 		e.sendMessage(p, msg)
@@ -367,86 +376,157 @@ func (e *Engine) sendMessage(p peer.ID, msg *pb.Message) {
 	}
 }
 
-// --- Session Management ---
-type Session struct {
-	id                  string
-	wants               map[hasher.Hash]pb.Message_Wantlist_Entry_WantType
-	blockChannel        chan block.Block
-	peerHasBlockChannel chan peer.ID
-	hashToGetChannel    chan hasher.Hash
-	done                chan struct{}
-	mu                  sync.RWMutex
+// --- Download Manager and Session ---
+type DownloadManager struct {
+	sessions map[string]*DownloadSession
+	mu       sync.RWMutex
 }
 
-func (e *Engine) newSession(ctx context.Context) *Session {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	session := &Session{
-		id:                  uuid.New().String(),
-		wants:               make(map[hasher.Hash]pb.Message_Wantlist_Entry_WantType),
-		blockChannel:        make(chan block.Block, 1),
-		peerHasBlockChannel: make(chan peer.ID, 1),
-		hashToGetChannel:    make(chan hasher.Hash, 1),
-		done:                make(chan struct{}),
-	}
-	e.sessions[session.id] = session
-	return session
-}
-
-func (e *Engine) closeSession(id string) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if session, ok := e.sessions[id]; ok {
-		close(session.done)
-		delete(e.sessions, id)
+func NewDownloadManager() *DownloadManager {
+	return &DownloadManager{
+		sessions: make(map[string]*DownloadSession),
 	}
 }
 
-func (s *Session) AddWant(h hasher.Hash, wantType pb.Message_Wantlist_Entry_WantType) {
+func (dm *DownloadManager) NewSession(ctx context.Context, hashes []hasher.Hash) *DownloadSession {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+
+	sessCtx, cancel := context.WithCancel(ctx)
+	s := &DownloadSession{
+		id:          uuid.New().String(),
+		ctx:         sessCtx,
+		cancel:      cancel,
+		wants:       make(chan hasher.Hash, len(hashes)),
+		providers:   make(map[hasher.Hash]map[peer.ID]struct{}),
+		provChans:   make(map[hasher.Hash]chan peer.ID),
+		output:      make(chan block.Block, len(hashes)),
+		doneBlocks:  make(map[hasher.Hash]struct{}),
+	}
+
+	for _, h := range hashes {
+		s.wants <- h
+		s.provChans[h] = make(chan peer.ID, 1)
+	}
+
+	dm.sessions[s.id] = s
+	return s
+}
+
+func (dm *DownloadManager) CloseSession(id string) {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	if s, ok := dm.sessions[id]; ok {
+		s.cancel()
+		delete(dm.sessions, id)
+	}
+}
+
+func (dm *DownloadManager) DistributeBlock(b block.Block) {
+	dm.mu.RLock()
+	defer dm.mu.RUnlock()
+	for _, s := range dm.sessions {
+		s.handleBlock(b)
+	}
+}
+
+func (dm *DownloadManager) DistributeHave(h hasher.Hash, p peer.ID) {
+	dm.mu.RLock()
+	defer dm.mu.RUnlock()
+	for _, s := range dm.sessions {
+		s.addProvider(h, p)
+	}
+}
+
+type DownloadSession struct {
+	id          string
+	ctx         context.Context
+	cancel      context.CancelFunc
+	wants       chan hasher.Hash
+	providers   map[hasher.Hash]map[peer.ID]struct{}
+	provChans   map[hasher.Hash]chan peer.ID
+	output      chan block.Block
+	doneBlocks  map[hasher.Hash]struct{}
+	mu          sync.RWMutex
+}
+
+func (s *DownloadSession) NextWant() (hasher.Hash, bool) {
+	select {
+	case h := <-s.wants:
+		return h, true
+	case <-s.ctx.Done():
+		return hasher.Hash{}, false
+	}
+}
+
+func (s *DownloadSession) RequeueWant(h hasher.Hash) {
+	select {
+	case s.wants <- h:
+	default:
+	}
+}
+
+func (s *DownloadSession) MarkAsDone(h hasher.Hash) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.wants[h] = wantType
+	s.doneBlocks[h] = struct{}{}
 }
 
-func (e *Engine) distributeBlock(b block.Block) {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	for _, session := range e.sessions {
+func (s *DownloadSession) addProvider(h hasher.Hash, p peer.ID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.providers[h]; !ok {
+		s.providers[h] = make(map[peer.ID]struct{})
+	}
+	s.providers[h][p] = struct{}{}
+
+	if ch, ok := s.provChans[h]; ok {
 		select {
-		case <-session.done:
-			continue
+		case ch <- p:
 		default:
-			session.mu.RLock()
-			_, wanted := session.wants[b.Hash()]
-			session.mu.RUnlock()
-			if wanted {
-				session.blockChannel <- b
-				session.mu.Lock()
-				delete(session.wants, b.Hash())
-				session.mu.Unlock()
-			}
 		}
 	}
 }
 
-func (e *Engine) distributeHave(h hasher.Hash, p peer.ID) {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	for _, session := range e.sessions {
+func (s *DownloadSession) WaitForProvider(ctx context.Context, h hasher.Hash) (peer.ID, error) {
+	s.mu.RLock()
+	// Check if we already have a provider
+	if provs, ok := s.providers[h]; ok {
+		for p := range provs {
+			s.mu.RUnlock()
+			return p, nil
+		}
+	}
+	// Wait for a new provider
+	ch, ok := s.provChans[h]
+	s.mu.RUnlock()
+	if !ok {
+		return "", fmt.Errorf("no provider channel for hash %s", h)
+	}
+
+	select {
+	case p := <-ch:
+		return p, nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+func (s *DownloadSession) handleBlock(b block.Block) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.doneBlocks[b.Hash()]; ok {
+		return // Already handled this block
+	}
+
+	// Check if the block is part of this session by checking the provider chans map
+	if _, ok := s.provChans[b.Hash()]; ok {
+		s.doneBlocks[b.Hash()] = struct{}{}
 		select {
-		case <-session.done:
-			continue
-		default:
-			session.mu.RLock()
-			wantType, wanted := session.wants[h]
-			session.mu.RUnlock()
-			if wanted && wantType == pb.Message_Wantlist_Entry_Have {
-				session.peerHasBlockChannel <- p
-				session.hashToGetChannel <- h
-				session.mu.Lock()
-				session.wants[h] = pb.Message_Wantlist_Entry_Block
-				session.mu.Unlock()
-			}
+		case s.output <- b:
+		case <-s.ctx.Done():
 		}
 	}
 }
@@ -522,26 +602,25 @@ func (pl *peerLedger) sender(ctx context.Context, h host.Host) {
 		case msg := <-pl.outgoing:
 			var err error
 			if stream == nil {
+				log.Printf("[Bitswap Sender] Opening new stream to peer %s", pl.peer)
 				stream, err = h.NewStream(ctx, pl.peer, ProtocolBitswap)
 
 				if err != nil {
-					log.Printf("[Bitswap] Failed to open stream to %s: %v", pl.peer, err)
-					// Don't return, just continue. The ledger can try again on the next message.
+					log.Printf("[Bitswap Sender] Failed to open stream to %s: %v", pl.peer, err)
 					continue
 				}
+				log.Printf("[Bitswap Sender] Successfully opened new stream to %s (remote addr: %s)", pl.peer, stream.Conn().RemoteMultiaddr())
 				writer = bufio.NewWriter(stream)
 			}
 
 			data, err := proto.Marshal(msg)
 			if err != nil {
-				log.Printf("[Bitswap] Failed to marshal message for %s: %v", pl.peer, err)
+				log.Printf("[Bitswap Sender] Failed to marshal message for %s: %v", pl.peer, err)
 				continue
 			}
 
 			lenBuf := make([]byte, binary.MaxVarintLen64)
 			n := binary.PutUvarint(lenBuf, uint64(len(data)))
-
-			
 
 			_, err = writer.Write(lenBuf[:n])
 			if err == nil {
@@ -552,7 +631,7 @@ func (pl *peerLedger) sender(ctx context.Context, h host.Host) {
 			}
 
 			if err != nil {
-				log.Printf("[Bitswap] Failed to send message to %s: %v", pl.peer, err)
+				log.Printf("[Bitswap Sender] Failed to send message to %s: %v", pl.peer, err)
 				stream.Reset()
 				stream = nil
 				writer = nil

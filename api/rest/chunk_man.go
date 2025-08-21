@@ -18,6 +18,12 @@ import (
 // streamChunksOptimized provides optimized chunk streaming with prefetching
 func (s *Server) streamChunksOptimized(w http.ResponseWriter, r *http.Request, metadata *blockstore.ContentMetadata) {
 	ctx := r.Context()
+
+	if metadata.IsErasureCoded {
+		s.streamErasureCodedContent(w, r, metadata)
+		return
+	}
+
 	flusher, hasFlusher := w.(http.Flusher)
 
 	// Set common headers
@@ -57,6 +63,86 @@ func (s *Server) streamChunksOptimized(w http.ResponseWriter, r *http.Request, m
 		if hasFlusher {
 			flusher.Flush()
 		}
+	}
+}
+
+func (s *Server) streamErasureCodedContent(w http.ResponseWriter, r *http.Request, metadata *blockstore.ContentMetadata) {
+	log.Printf("Streaming erasure-coded content %s", metadata.Hash)
+
+	// 1. Collect all shard hashes
+	shardHashes := make([]hasher.Hash, len(metadata.Chunks))
+	for i, shardInfo := range metadata.Chunks {
+		shardHashes[i] = shardInfo.Hash
+	}
+
+	// 2. Fetch enough shards to reconstruct
+	shardsToFetch := metadata.DataShards
+	bitswapNode, ok := s.node.(interface{ GetBitswap() *bitswap.Engine })
+	if !ok {
+		s.writeError(w, http.StatusInternalServerError, "Node does not support bitswap", nil)
+		return
+	}
+
+	blockChannel, err := bitswapNode.GetBitswap().GetBlocks(r.Context(), shardHashes)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "Failed to start bitswap session for shards", err)
+		return
+	}
+
+	// 3. Collect shards
+	availableShards := make([][]byte, len(shardHashes))
+	shardMap := make(map[hasher.Hash]int)
+	for i, h := range shardHashes {
+		shardMap[h] = i
+	}
+
+	receivedCount := 0
+	for blk := range blockChannel {
+		if idx, ok := shardMap[blk.Hash()]; ok {
+			availableShards[idx] = blk.RawData()
+			receivedCount++
+			if receivedCount >= shardsToFetch {
+				go func() {
+					for range blockChannel {}
+				}()
+				break
+			}
+		}
+	}
+
+	if receivedCount < shardsToFetch {
+		s.writeError(w, http.StatusNotFound, "Could not retrieve enough shards to reconstruct file", nil)
+		return
+	}
+
+	// 4. Reconstruct the data
+	reconstructedData, err := s.sharder.Reconstruct(availableShards)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "Failed to reconstruct file from shards", err)
+		return
+	}
+
+	// Trim padding to original file size
+	if int64(len(reconstructedData)) > metadata.Size {
+		reconstructedData = reconstructedData[:metadata.Size]
+	}
+
+	// 5. Handle range request and stream
+	rangeHeader := r.Header.Get("Range")
+	if rangeHeader != "" {
+		start, end, err := parseRangeHeader(rangeHeader, metadata.Size)
+		if err != nil {
+		s.writeError(w, http.StatusBadRequest, "Invalid range header", err)
+			return
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, metadata.Size))
+		w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(reconstructedData[start : end+1])
+	} else {
+		w.Header().Set("Content-Length", strconv.FormatInt(metadata.Size, 10))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(reconstructedData)
 	}
 }
 

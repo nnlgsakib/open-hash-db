@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"openhashdb/core/block"
@@ -36,6 +37,18 @@ var (
 			Help: "Available blockstore space in bytes",
 		},
 	)
+	blockstoreGcTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "openhashdb_blockstore_gc_total",
+			Help: "Total number of garbage collection runs.",
+		},
+	)
+	blockstoreGcBlocksDeleted = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "openhashdb_blockstore_gc_blocks_deleted_total",
+			Help: "Total number of blocks deleted by garbage collection.",
+		},
+	)
 )
 
 const (
@@ -45,16 +58,19 @@ const (
 
 // ContentMetadata represents metadata for stored content (DAGs).
 type ContentMetadata struct {
-	Hash        hasher.Hash         `json:"hash"`
-	Filename    string              `json:"filename"`
-	MimeType    string              `json:"mime_type"`
-	Size        int64               `json:"size"`
-	ModTime     time.Time           `json:"mod_time"`
-	IsDirectory bool                `json:"is_directory"`
-	CreatedAt   time.Time           `json:"created_at"`
-	RefCount    int                 `json:"ref_count"`
-	Chunks      []chunker.ChunkInfo `json:"chunks,omitempty"`
-	Links       []merkle.Link       `json:"links,omitempty"`
+	Hash            hasher.Hash         `json:"hash"`
+	Filename        string              `json:"filename"`
+	MimeType        string              `json:"mime_type"`
+	Size            int64               `json:"size"`
+	ModTime         time.Time           `json:"mod_time"`
+	IsDirectory     bool                `json:"is_directory"`
+	CreatedAt       time.Time           `json:"created_at"`
+	RefCount        int                 `json:"ref_count"`
+	IsErasureCoded  bool                `json:"is_erasure_coded,omitempty"`
+	DataShards      int                 `json:"data_shards,omitempty"`
+	ParityShards    int                 `json:"parity_shards,omitempty"`
+	Chunks          []chunker.ChunkInfo `json:"chunks,omitempty"` // For chunked files, these are chunks. For EC files, these are shards.
+	Links           []merkle.Link       `json:"links,omitempty"`
 }
 
 // Blockstore handles persistent storage of blocks.
@@ -260,4 +276,113 @@ func (bs *Blockstore) ListContent() ([]hasher.Hash, error) {
 		return nil, fmt.Errorf("iterator error while listing content: %w", err)
 	}
 	return hashes, nil
+}
+
+// --- Garbage Collection ---
+
+// Delete removes a block from the blockstore.
+func (bs *Blockstore) Delete(h hasher.Hash) error {
+	key := []byte(blockPrefix + h.String())
+	err := bs.db.Delete(key, nil)
+	if err != nil {
+		blockstoreOperationsTotal.WithLabelValues("delete", "error").Inc()
+		return fmt.Errorf("failed to delete block %s: %w", h.String(), err)
+	}
+	blockstoreOperationsTotal.WithLabelValues("delete", "success").Inc()
+	return nil
+}
+
+// GC performs garbage collection on the blockstore, deleting unpinned blocks.
+func (bs *Blockstore) GC(ctx context.Context, rootHashes <-chan hasher.Hash) (int, error) {
+	log.Println("Starting blockstore garbage collection...")
+	blockstoreGcTotal.Inc()
+
+	liveBlocks := &sync.Map{} // Use a sync.Map for concurrent access
+
+	// Mark phase
+	log.Println("GC: Mark phase started.")
+	var markWg sync.WaitGroup
+	for rootHash := range rootHashes {
+		markWg.Add(1)
+		go func(h hasher.Hash) {
+			defer markWg.Done()
+			if err := bs.markLive(ctx, h, liveBlocks); err != nil {
+				log.Printf("GC: Error marking blocks for root %s: %v", h.String(), err)
+			}
+		}(rootHash)
+	}
+	markWg.Wait()
+
+	liveBlockCount := 0
+	liveBlocks.Range(func(_, _ interface{}) bool {
+		liveBlockCount++
+		return true
+	})
+	log.Printf("GC: Mark phase complete. Found %d live blocks.", liveBlockCount)
+
+	// Sweep phase
+	log.Println("GC: Sweep phase started.")
+	allBlocks, err := bs.AllKeysChan(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get all block keys for GC: %w", err)
+	}
+
+	deletedCount := 0
+	for blockHash := range allBlocks {
+		select {
+		case <-ctx.Done():
+			return deletedCount, ctx.Err()
+		default:
+			if _, isLive := liveBlocks.Load(blockHash); !isLive {
+				if err := bs.Delete(blockHash); err != nil {
+					log.Printf("GC: Failed to delete block %s: %v", blockHash.String(), err)
+				} else {
+					deletedCount++
+				}
+			}
+		}
+	}
+	log.Printf("GC: Sweep phase complete. Deleted %d blocks.", deletedCount)
+	blockstoreGcBlocksDeleted.Add(float64(deletedCount))
+
+	if space, err := bs.GetAvailableSpace(); err == nil {
+		blockstoreSpaceAvailable.Set(float64(space))
+	}
+
+	log.Printf("Blockstore garbage collection finished. Deleted %d blocks.", deletedCount)
+	return deletedCount, nil
+}
+
+// markLive recursively traverses a DAG from a root content hash, adding all encountered blocks to the live set.
+func (bs *Blockstore) markLive(ctx context.Context, rootHash hasher.Hash, liveBlocks *sync.Map) error {
+	// Check if this content hash has already been processed.
+	if _, exists := liveBlocks.LoadOrStore(rootHash, struct{}{}); exists {
+		return nil
+	}
+
+	// Get the metadata for the content hash.
+	metadata, err := bs.GetContent(rootHash)
+	if err != nil {
+		// This root hash doesn't correspond to any known content.
+		// It might be a raw block that's pinned. We already marked the hash itself, so it won't be deleted.
+		return nil
+	}
+
+	// Mark all the data chunks of this content as live.
+	for _, chunk := range metadata.Chunks {
+		liveBlocks.Store(chunk.Hash, struct{}{})
+	}
+
+	// Recursively mark all linked content.
+	var linkWg sync.WaitGroup
+	for _, link := range metadata.Links {
+		linkWg.Add(1)
+		go func(linkHash hasher.Hash) {
+			defer linkWg.Done()
+			bs.markLive(ctx, linkHash, liveBlocks)
+		}(link.Hash)
+	}
+	linkWg.Wait()
+
+	return nil
 }

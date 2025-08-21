@@ -18,7 +18,8 @@ func (s *Server) uploadFile(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	hash, size, err := s.storeUploadedFile(header.Filename, file)
+		useEC := r.URL.Query().Get("ec") == "true"
+	hash, size, err := s.storeUploadedFile(header.Filename, file, useEC)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to store file", err)
 		return

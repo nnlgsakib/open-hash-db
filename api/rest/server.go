@@ -9,6 +9,7 @@ import (
 
 	"openhashdb/core/blockstore"
 	"openhashdb/core/chunker"
+	"openhashdb/core/sharder"
 	"openhashdb/network/libp2p"
 	"openhashdb/network/replicator"
 	"openhashdb/network/streammanager"
@@ -26,10 +27,15 @@ const (
 
 // NewServer creates a new REST API server
 func NewServer(bs *blockstore.Blockstore, replicator *replicator.Replicator, node interface{}) *Server {
+	sharder, err := sharder.NewReedSolomon(sharder.DefaultDataShards, sharder.DefaultParityShards)
+	if err != nil {
+		log.Fatalf("Failed to create sharder: %v", err)
+	}
 	s := &Server{
 		storage:    bs,
 		replicator: replicator,
 		chunker:    chunker.NewChunker(),
+		sharder:    sharder,
 		node:       node,
 		router:     mux.NewRouter(),
 		chunkCache: NewChunkCache(chunkCacheSize),

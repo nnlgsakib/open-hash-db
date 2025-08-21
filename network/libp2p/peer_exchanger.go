@@ -75,7 +75,6 @@ func (pe *PeerExchanger) connectToNewPeers(addrInfos []peer.AddrInfo, sourcePeer
 					pe.connectingMu.Lock()
 					delete(pe.connecting, pi.ID)
 					pe.connectingMu.Unlock()
-					log.Printf("[libp2p] Cleaned up peer %s from connecting map after failed attempts.", pi.ID)
 				}
 			}()
 
@@ -84,23 +83,25 @@ func (pe *PeerExchanger) connectToNewPeers(addrInfos []peer.AddrInfo, sourcePeer
 				return
 			}
 
-			log.Printf("[libp2p] Discovered new peer %s from %s, attempting to connect", pi.ID.String(), sourcePeer.String())
+			log.Printf("[PeerExchanger] Discovered new peer %s from %s", pi.ID, sourcePeer)
 
 			if len(pi.Addrs) > 0 {
+				log.Printf("[PeerExchanger] Attempting direct connection to %s with addrs: %v", pi.ID, pi.Addrs)
 				err := pe.node.Host().Connect(pe.ctx, pi)
 				if err == nil {
-					log.Printf("[libp2p] Successfully connected directly to new peer %s", pi.ID.String())
+					log.Printf("[PeerExchanger] Successfully connected directly to new peer %s", pi.ID)
 					connected = true
 					return
 				}
-				log.Printf("[libp2p] Failed to connect directly to %s: %v. Trying via relay.", pi.ID.String(), err)
+				log.Printf("[PeerExchanger] Failed to connect directly to %s: %v. Trying via relay.", pi.ID, err)
 			} else {
-				log.Printf("[libp2p] Peer %s has no public addresses, trying via relay.", pi.ID.String())
+				log.Printf("[PeerExchanger] Peer %s has no public addresses, trying via relay.", pi.ID)
 			}
 
+			log.Printf("[PeerExchanger] Attempting relay connection to %s via %s", pi.ID, sourcePeer)
 			relayAddr, err := multiaddr.NewMultiaddr("/p2p/" + sourcePeer.String() + "/p2p-circuit/p2p/" + pi.ID.String())
 			if err != nil {
-				log.Printf("[libp2p] Error creating relay address for %s via %s: %v", pi.ID, sourcePeer, err)
+				log.Printf("[PeerExchanger] Error creating relay address for %s via %s: %v", pi.ID, sourcePeer, err)
 				return
 			}
 
@@ -110,9 +111,9 @@ func (pe *PeerExchanger) connectToNewPeers(addrInfos []peer.AddrInfo, sourcePeer
 			}
 
 			if err := pe.node.Host().Connect(pe.ctx, relayPeerInfo); err != nil {
-				log.Printf("[libp2p] Failed to connect to %s via relay %s: %v", pi.ID.String(), sourcePeer.String(), err)
+				log.Printf("[PeerExchanger] Failed to connect to %s via relay %s: %v", pi.ID, sourcePeer, err)
 			} else {
-				log.Printf("[libp2p] Successfully connected to %s via relay %s", pi.ID.String(), sourcePeer.String())
+				log.Printf("[PeerExchanger] Successfully connected to %s via relay %s", pi.ID, sourcePeer)
 				connected = true
 			}
 		}(pi)
