@@ -24,6 +24,7 @@ import (
 	"openhashdb/network/bitswap"
 	"openhashdb/network/libp2p"
 	"openhashdb/network/replicator"
+	"openhashdb/version"
 
 	"github.com/spf13/cobra"
 )
@@ -202,6 +203,15 @@ var listCmd = &cobra.Command{
 		return listContent()
 	},
 }
+var versionCmd = &cobra.Command{
+	Use:   "version",
+	Short: "Print the version number of OpenHashDB",
+	Run: func(cmd *cobra.Command, args []string) {
+		fmt.Printf("Version: %s\n", version.Version)
+		fmt.Printf("Author: %s\n", version.Author)
+		fmt.Printf("Branch: %s\n", version.Branch)
+	},
+}
 
 // daemonCmd represents the daemon command
 var daemonCmd = &cobra.Command{
@@ -261,6 +271,7 @@ func init() {
 	rootCmd.AddCommand(viewCmd)
 	rootCmd.AddCommand(daemonCmd)
 	rootCmd.AddCommand(listCmd)
+	rootCmd.AddCommand(versionCmd)
 }
 
 func main() {
