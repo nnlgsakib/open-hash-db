@@ -88,14 +88,18 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 	}
 
 	var nodeDHT *dht.IpfsDHT
-	h, err := libp2p.New(
-		libp2p.Identity(privKey),
-		libp2p.ListenAddrStrings(listenAddrs...),
-		libp2p.EnableRelay(),
-		libp2p.EnableHolePunching(),
-		libp2p.Security(noise.ID, noise.New),
-		libp2p.Transport(tcp.NewTCPTransport),
-		libp2p.Transport(quic.NewTransport),
+    h, err := libp2p.New(
+        libp2p.Identity(privKey),
+        libp2p.ListenAddrStrings(listenAddrs...),
+        libp2p.EnableRelay(),
+        // Help NATed nodes: map ports when possible and advertise observed/relay addrs
+        libp2p.NATPortMap(),
+        libp2p.EnableNATService(),
+        libp2p.EnableAutoRelay(),
+        libp2p.EnableHolePunching(),
+        libp2p.Security(noise.ID, noise.New),
+        libp2p.Transport(tcp.NewTCPTransport),
+        libp2p.Transport(quic.NewTransport),
 		libp2p.Routing(func(h host.Host) (routing.PeerRouting, error) {
 			nodeDHT, err = dht.New(ctx, h,
 				dht.Mode(dht.ModeAutoServer),

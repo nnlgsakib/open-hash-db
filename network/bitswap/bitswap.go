@@ -594,8 +594,8 @@ func newPeerLedger(p peer.ID, ctx context.Context, h host.Host) *peerLedger {
 }
 
 func (pl *peerLedger) sender(ctx context.Context, h host.Host) {
-	var stream network.Stream
-	var writer *bufio.Writer
+    var stream network.Stream
+    var writer *bufio.Writer
 
 	defer func() {
 		if stream != nil {
@@ -605,11 +605,12 @@ func (pl *peerLedger) sender(ctx context.Context, h host.Host) {
 
 	for {
 		select {
-		case msg := <-pl.outgoing:
-			var err error
-			if stream == nil {
-				log.Printf("[Bitswap Sender] Opening new stream to peer %s", pl.peer)
-				stream, err = h.NewStream(ctx, pl.peer, ProtocolBitswap)
+        case msg := <-pl.outgoing:
+            var err error
+            if stream == nil {
+                log.Printf("[Bitswap Sender] Opening new stream to peer %s", pl.peer)
+                // Allow opening a stream over limited connections (e.g. relayed)
+                stream, err = h.NewStream(network.WithAllowLimitedConn(ctx, "bitswap"), pl.peer, ProtocolBitswap)
 
 				if err != nil {
 					log.Printf("[Bitswap Sender] Failed to open stream to %s: %v", pl.peer, err)
@@ -636,14 +637,14 @@ func (pl *peerLedger) sender(ctx context.Context, h host.Host) {
 				err = writer.Flush()
 			}
 
-			if err != nil {
-				log.Printf("[Bitswap Sender] Failed to send message to %s: %v", pl.peer, err)
-				stream.Reset()
-				stream = nil
-				writer = nil
-			} else {
-				pl.BytesSent(uint64(len(data)))
-			}
+            if err != nil {
+                log.Printf("[Bitswap Sender] Failed to send message to %s: %v", pl.peer, err)
+                stream.Reset()
+                stream = nil
+                writer = nil
+            } else {
+                pl.BytesSent(uint64(len(data)))
+            }
 
 		case <-pl.done:
 			return
