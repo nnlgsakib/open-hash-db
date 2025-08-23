@@ -57,9 +57,14 @@ type Node struct {
 	GossipHandler    func(peer.ID, []byte) error
 	peerEvents       []*pb.PeerEvent
 	peerEventsMu     sync.RWMutex
-	// reservedRelays tracks relays (and their addrs) we have active v2 reservations with
-	reservedRelays   map[peer.ID][]multiaddr.Multiaddr
-	reservedRelaysMu sync.RWMutex
+    // reservedRelays tracks relays (and their addrs) we have active v2 reservations with
+    reservedRelays   map[peer.ID]*reservedRelayEntry
+    reservedRelaysMu sync.RWMutex
+}
+
+type reservedRelayEntry struct {
+    addrs      []multiaddr.Multiaddr
+    reservedAt time.Time
 }
 
 // NewNodeWithKeyPath creates a new libp2p node
@@ -105,7 +110,7 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, staticRelays []
 
 	var nodeDHT *dht.IpfsDHT
 	// shared state between AddrsFactory and reservation callbacks
-	reservedRelays := make(map[peer.ID][]multiaddr.Multiaddr)
+    reservedRelays := make(map[peer.ID]*reservedRelayEntry)
 	var reservedRelaysMu sync.RWMutex
 	// Using default connection manager for now (compatible across libp2p versions)
 
@@ -128,18 +133,24 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, staticRelays []
 			out := make([]multiaddr.Multiaddr, 0, len(addrs)+4)
 			out = append(out, addrs...)
 			reservedRelaysMu.RLock()
-			for rid, ras := range reservedRelays {
-				circ, err := multiaddr.NewMultiaddr("/p2p/" + rid.String() + "/p2p-circuit")
-				if err != nil {
-					continue
-				}
-				for _, ra := range ras {
-					out = append(out, ra.Encapsulate(circ))
-				}
-			}
-			reservedRelaysMu.RUnlock()
-			return out
-		}),
+            const relayTTL = 30 * time.Minute
+            now := time.Now()
+            for rid, entry := range reservedRelays {
+                // Drop expired reservations
+                if now.Sub(entry.reservedAt) > relayTTL {
+                    continue
+                }
+                circ, err := multiaddr.NewMultiaddr("/p2p/" + rid.String() + "/p2p-circuit")
+                if err != nil {
+                    continue
+                }
+                for _, ra := range entry.addrs {
+                    out = append(out, ra.Encapsulate(circ))
+                }
+            }
+            reservedRelaysMu.RUnlock()
+            return out
+        }),
 		libp2p.Routing(func(h host.Host) (routing.PeerRouting, error) {
 			nodeDHT, err = dht.New(ctx, h,
 				dht.Mode(dht.ModeAutoServer),
@@ -283,16 +294,16 @@ func (n *networkNotifiee) Connected(net network.Network, conn network.Conn) {
 		}
 
 		log.Printf("[libp2p] Attempting to reserve slot with newly connected relay: %s", p)
-		_, err = relayv2client.Reserve(ctx, n.node.host, pinfo)
-		if err != nil {
-			log.Printf("[libp2p] Failed to reserve slot with %s: %v", p, err)
-		} else {
-			log.Printf("[libp2p] Successfully reserved slot with %s", p)
-			// Track reservation addrs for AddrsFactory to advertise
-			n.node.reservedRelaysMu.Lock()
-			n.node.reservedRelays[p] = pinfo.Addrs
-			n.node.reservedRelaysMu.Unlock()
-		}
+        _, err = relayv2client.Reserve(ctx, n.node.host, pinfo)
+        if err != nil {
+            log.Printf("[libp2p] Failed to reserve slot with %s: %v", p, err)
+        } else {
+            log.Printf("[libp2p] Successfully reserved slot with %s", p)
+            // Track reservation addrs for AddrsFactory to advertise
+            n.node.reservedRelaysMu.Lock()
+            n.node.reservedRelays[p] = &reservedRelayEntry{addrs: pinfo.Addrs, reservedAt: time.Now()}
+            n.node.reservedRelaysMu.Unlock()
+        }
 	}(conn.RemotePeer())
 }
 
@@ -301,11 +312,15 @@ func (n *networkNotifiee) Disconnected(net network.Network, conn network.Conn) {
 	for _, addr := range n.node.host.Peerstore().Addrs(conn.RemotePeer()) {
 		addrs = append(addrs, addr.String())
 	}
-	n.node.logPeerEvent(conn.RemotePeer(), "disconnected", addrs)
-	n.node.heartbeatService.StopMonitoring(conn.RemotePeer())
-	if n.node.bitswap != nil {
-		n.node.bitswap.HandlePeerDisconnect(conn.RemotePeer())
-	}
+    n.node.logPeerEvent(conn.RemotePeer(), "disconnected", addrs)
+    n.node.heartbeatService.StopMonitoring(conn.RemotePeer())
+    // If this peer was a relay we reserved with, stop advertising it
+    n.node.reservedRelaysMu.Lock()
+    delete(n.node.reservedRelays, conn.RemotePeer())
+    n.node.reservedRelaysMu.Unlock()
+    if n.node.bitswap != nil {
+        n.node.bitswap.HandlePeerDisconnect(conn.RemotePeer())
+    }
 }
 
 func (n *networkNotifiee) Listen(net network.Network, addr multiaddr.Multiaddr)      {}
@@ -560,9 +575,9 @@ func (n *Node) connectToBootnodes(bootnodes []string) error {
 					log.Printf("[libp2p] Successfully reserved slot with %s.", pinfo.ID)
 					// Track reservation to advertise relayed addresses
 					n.reservedRelaysMu.Lock()
-					n.reservedRelays[pinfo.ID] = pinfo.Addrs
-					n.reservedRelaysMu.Unlock()
-				}
+                        n.reservedRelays[pinfo.ID] = &reservedRelayEntry{addrs: pinfo.Addrs, reservedAt: time.Now()}
+                        n.reservedRelaysMu.Unlock()
+            		}
 			}
 		}(bootnode)
 	}

@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"sync"
+    "time"
 
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -17,19 +18,25 @@ import (
 
 // PeerExchanger handles exchanging peer lists.
 type PeerExchanger struct {
-	node         *Node
-	ctx          context.Context
-	connecting   map[peer.ID]bool // Keep track of in-flight connections
-	connectingMu sync.Mutex
+    node         *Node
+    ctx          context.Context
+    connecting   map[peer.ID]bool // Keep track of in-flight connections
+    connectingMu sync.Mutex
+    // Backoff for failed targets to avoid repeatedly dialing offline peers
+    failUntil    map[peer.ID]time.Time
+    failCount    map[peer.ID]int
+    failMu       sync.Mutex
 }
 
 // NewPeerExchanger creates a new PeerExchanger.
 func NewPeerExchanger(ctx context.Context, node *Node) *PeerExchanger {
-	return &PeerExchanger{
-		node:       node,
-		ctx:        ctx,
-		connecting: make(map[peer.ID]bool),
-	}
+    return &PeerExchanger{
+        node:       node,
+        ctx:        ctx,
+        connecting: make(map[peer.ID]bool),
+        failUntil:  make(map[peer.ID]time.Time),
+        failCount:  make(map[peer.ID]int),
+    }
 }
 
 func addrInfoToProto(pi peer.AddrInfo) *pb.PeerInfo {
@@ -103,19 +110,27 @@ func (pe *PeerExchanger) getPeerListProto() ([]byte, error) {
 // connectToNewPeers takes a list of AddrInfo, filters out known/current peers,
 // and attempts to connect to the new ones, using the source as a relay if direct connection fails.
 func (pe *PeerExchanger) connectToNewPeers(addrInfos []*pb.PeerInfo, sourcePeer peer.ID) {
-	var wg sync.WaitGroup
+    var wg sync.WaitGroup
 
-	for _, pi := range addrInfos {
-		addrInfo, err := protoToAddrInfo(pi)
-		if err != nil {
-			log.Printf("[PeerExchanger] Error converting proto to addr info: %v", err)
-			continue
-		}
+    for _, pi := range addrInfos {
+        addrInfo, err := protoToAddrInfo(pi)
+        if err != nil {
+            log.Printf("[PeerExchanger] Error converting proto to addr info: %v", err)
+            continue
+        }
 
-		// Don't connect to self or already connected peers
-		if pe.node.IsSelf(addrInfo) || pe.node.Host().Network().Connectedness(addrInfo.ID) == network.Connected {
-			continue
-		}
+        // Don't connect to self or already connected peers
+        if pe.node.IsSelf(addrInfo) || pe.node.Host().Network().Connectedness(addrInfo.ID) == network.Connected {
+            continue
+        }
+
+        // Backoff: skip if we've recently failed this target
+        pe.failMu.Lock()
+        if until, ok := pe.failUntil[addrInfo.ID]; ok && time.Now().Before(until) {
+            pe.failMu.Unlock()
+            continue
+        }
+        pe.failMu.Unlock()
 
 		// Check if a connection is already in progress
 		pe.connectingMu.Lock()
@@ -146,18 +161,18 @@ func (pe *PeerExchanger) connectToNewPeers(addrInfos []*pb.PeerInfo, sourcePeer 
 
 			log.Printf("[PeerExchanger] Discovered new peer %s from %s", pi.ID, sourcePeer)
 
-			if len(pi.Addrs) > 0 {
-				log.Printf("[PeerExchanger] Attempting direct connection to %s with addrs: %v", pi.ID, pi.Addrs)
-				err := pe.node.Host().Connect(pe.ctx, pi)
-				if err == nil {
-					log.Printf("[PeerExchanger] Successfully connected directly to new peer %s", pi.ID)
-					connected = true
-					return
-				}
-				log.Printf("[PeerExchanger] Failed to connect directly to %s: %v. Trying via relay.", pi.ID, err)
-			} else {
-				log.Printf("[PeerExchanger] Peer %s has no public addresses, trying via relay.", pi.ID)
-			}
+            if len(pi.Addrs) > 0 {
+                log.Printf("[PeerExchanger] Attempting direct connection to %s with addrs: %v", pi.ID, pi.Addrs)
+                err := pe.node.Host().Connect(pe.ctx, pi)
+                if err == nil {
+                    log.Printf("[PeerExchanger] Successfully connected directly to new peer %s", pi.ID)
+                    connected = true
+                    return
+                }
+                log.Printf("[PeerExchanger] Failed to connect directly to %s: %v. Trying via relay.", pi.ID, err)
+            } else {
+                log.Printf("[PeerExchanger] Peer %s has no public addresses, trying via relay.", pi.ID)
+            }
 
         // Attempt relay dial via the source peer only if it supports HOP
         protos, _ := pe.node.Host().Peerstore().GetProtocols(sourcePeer)
@@ -186,9 +201,9 @@ func (pe *PeerExchanger) connectToNewPeers(addrInfos []*pb.PeerInfo, sourcePeer 
 
         // Fallback: try via our reserved relays
         pe.node.reservedRelaysMu.RLock()
-        for rid, ras := range pe.node.reservedRelays {
+        for rid, entry := range pe.node.reservedRelays {
             circ, _ := multiaddr.NewMultiaddr("/p2p/" + rid.String() + "/p2p-circuit/p2p/" + pi.ID.String())
-            for _, ra := range ras {
+            for _, ra := range entry.addrs {
                 relayDial := ra.Encapsulate(circ)
                 relayPeerInfo := peer.AddrInfo{ID: pi.ID, Addrs: []multiaddr.Multiaddr{relayDial}}
                 log.Printf("[PeerExchanger] Attempting relay connection to %s via reserved relay %s at %s", pi.ID, rid, relayDial)
@@ -201,6 +216,24 @@ func (pe *PeerExchanger) connectToNewPeers(addrInfos []*pb.PeerInfo, sourcePeer 
             }
         }
         pe.node.reservedRelaysMu.RUnlock()
+
+        // If still not connected, register a backoff for this target
+        if !connected {
+            pe.failMu.Lock()
+            pe.failCount[pi.ID]++
+            c := pe.failCount[pi.ID]
+            if c > 6 {
+                c = 6
+            }
+            // Exponential backoff: 30s * 2^(c-1), max ~32m
+            pe.failUntil[pi.ID] = time.Now().Add(time.Duration(30*(1<<uint(c-1))) * time.Second)
+            pe.failMu.Unlock()
+        } else {
+            pe.failMu.Lock()
+            delete(pe.failCount, pi.ID)
+            delete(pe.failUntil, pi.ID)
+            pe.failMu.Unlock()
+        }
     }(addrInfo)
     }
     wg.Wait()
