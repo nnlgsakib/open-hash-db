@@ -29,6 +29,7 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 	relayv2client "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
 	circuit "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
+	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	quic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
@@ -56,10 +57,13 @@ type Node struct {
 	GossipHandler    func(peer.ID, []byte) error
 	peerEvents       []*pb.PeerEvent
 	peerEventsMu     sync.RWMutex
+	// reservedRelays tracks relays (and their addrs) we have active v2 reservations with
+	reservedRelays   map[peer.ID][]multiaddr.Multiaddr
+	reservedRelaysMu sync.RWMutex
 }
 
 // NewNodeWithKeyPath creates a new libp2p node
-func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string, p2pPort int) (*Node, error) {
+func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, staticRelays []string, keyPath string, p2pPort int) (*Node, error) {
 	var privKey crypto.PrivKey
 	var err error
 
@@ -82,24 +86,60 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 		log.Printf("[libp2p] Warning: failed to parse some bootnode addresses: %v", err)
 	}
 
+    // Prepare static relays for AutoRelay
+    relayInfos, err := convertBootnodesToAddrInfo(staticRelays)
+    if err != nil {
+        log.Printf("[libp2p] Warning: failed to parse some relay addresses: %v", err)
+    }
+    // If no relays provided, fall back to bootnodes as relays
+    if len(relayInfos) == 0 {
+        relayInfos = addrInfos
+    }
+
 	listenAddrs := []string{
 		fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", p2pPort),
 		fmt.Sprintf("/ip4/0.0.0.0/udp/%d/quic-v1", p2pPort),
+		fmt.Sprintf("/ip6/::/tcp/%d", p2pPort),
+		fmt.Sprintf("/ip6/::/udp/%d/quic-v1", p2pPort),
 	}
 
 	var nodeDHT *dht.IpfsDHT
-    h, err := libp2p.New(
-        libp2p.Identity(privKey),
-        libp2p.ListenAddrStrings(listenAddrs...),
-        libp2p.EnableRelay(),
-        // Help NATed nodes: map ports when possible and advertise observed/relay addrs
-        libp2p.NATPortMap(),
-        libp2p.EnableNATService(),
-        libp2p.EnableAutoRelay(),
-        libp2p.EnableHolePunching(),
-        libp2p.Security(noise.ID, noise.New),
-        libp2p.Transport(tcp.NewTCPTransport),
-        libp2p.Transport(quic.NewTransport),
+	// shared state between AddrsFactory and reservation callbacks
+	reservedRelays := make(map[peer.ID][]multiaddr.Multiaddr)
+	var reservedRelaysMu sync.RWMutex
+	// Using default connection manager for now (compatible across libp2p versions)
+
+	// Build options and enable AutoRelay with static relays when available
+	baseOpts := []libp2p.Option{
+		libp2p.Identity(privKey),
+		libp2p.ListenAddrStrings(listenAddrs...),
+		// Allow relayed connections and try NAT traversal features
+		libp2p.EnableRelay(),
+		libp2p.NATPortMap(),
+		libp2p.EnableNATService(),
+        // AutoNAT service is optional and may not be available across versions
+		libp2p.EnableHolePunching(),
+		// Default connection manager
+		libp2p.Security(noise.ID, noise.New),
+		libp2p.Transport(tcp.NewTCPTransport),
+		libp2p.Transport(quic.NewTransport),
+		// Only advertise relayed addresses when we actually hold a reservation
+		libp2p.AddrsFactory(func(addrs []multiaddr.Multiaddr) []multiaddr.Multiaddr {
+			out := make([]multiaddr.Multiaddr, 0, len(addrs)+4)
+			out = append(out, addrs...)
+			reservedRelaysMu.RLock()
+			for rid, ras := range reservedRelays {
+				circ, err := multiaddr.NewMultiaddr("/p2p/" + rid.String() + "/p2p-circuit")
+				if err != nil {
+					continue
+				}
+				for _, ra := range ras {
+					out = append(out, ra.Encapsulate(circ))
+				}
+			}
+			reservedRelaysMu.RUnlock()
+			return out
+		}),
 		libp2p.Routing(func(h host.Host) (routing.PeerRouting, error) {
 			nodeDHT, err = dht.New(ctx, h,
 				dht.Mode(dht.ModeAutoServer),
@@ -111,7 +151,14 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 			}
 			return nodeDHT, nil
 		}),
-	)
+	}
+
+    if len(relayInfos) > 0 {
+        // Enable autorelay with the provided static relays (or bootnodes fallback)
+        baseOpts = append(baseOpts, libp2p.EnableAutoRelayWithStaticRelays(relayInfos))
+    }
+
+	h, err := libp2p.New(baseOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create libp2p host: %w", err)
 	}
@@ -122,11 +169,12 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 
 	nodeCtx, cancel := context.WithCancel(ctx)
 	node := &Node{
-		host:       h,
-		ctx:        nodeCtx,
-		cancel:     cancel,
-		dht:        nodeDHT,
-		peerEvents: make([]*pb.PeerEvent, 0, MaxPeerEventLogs),
+		host:           h,
+		ctx:            nodeCtx,
+		cancel:         cancel,
+		dht:            nodeDHT,
+		peerEvents:     make([]*pb.PeerEvent, 0, MaxPeerEventLogs),
+		reservedRelays: reservedRelays,
 	}
 	node.heartbeatService = NewHeartbeatService(nodeCtx, node)
 
@@ -134,6 +182,8 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 	h.Network().Notify(n)
 
 	h.SetStreamHandler(ProtocolGossip, node.handleGossipStream)
+	// Start a ping service (helpful for keepalive and diagnosing reachability)
+	_ = ping.NewPingService(h)
 
 	if err := node.setupMDNS(); err != nil {
 		log.Printf("[libp2p] Warning: failed to setup mDNS: %v", err)
@@ -238,6 +288,10 @@ func (n *networkNotifiee) Connected(net network.Network, conn network.Conn) {
 			log.Printf("[libp2p] Failed to reserve slot with %s: %v", p, err)
 		} else {
 			log.Printf("[libp2p] Successfully reserved slot with %s", p)
+			// Track reservation addrs for AddrsFactory to advertise
+			n.node.reservedRelaysMu.Lock()
+			n.node.reservedRelays[p] = pinfo.Addrs
+			n.node.reservedRelaysMu.Unlock()
 		}
 	}(conn.RemotePeer())
 }
@@ -348,9 +402,7 @@ func (n *Node) BroadcastGossip(ctx context.Context, data []byte) error {
 func (n *Node) sendData(ctx context.Context, peerID peer.ID, protocolID protocol.ID, data []byte) error {
 	const maxRetries = 5
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		ctx, cancel := context.WithTimeout(ctx, 1*time.Minute)
-		defer cancel()
-
+		// Use provided ctx (long-lived, typically tied to heartbeat/daemon lifecycle)
 		stream, err := n.host.NewStream(network.WithAllowLimitedConn(ctx, "send-data"), peerID, protocolID)
 		if err != nil {
 			log.Printf("[libp2p] Attempt %d/%d: Failed to open stream to %s: %v", attempt, maxRetries, peerID.String(), err)
@@ -506,6 +558,10 @@ func (n *Node) connectToBootnodes(bootnodes []string) error {
 					log.Printf("[libp2p] Failed to reserve slot with %s: %v", pinfo.ID, err)
 				} else {
 					log.Printf("[libp2p] Successfully reserved slot with %s.", pinfo.ID)
+					// Track reservation to advertise relayed addresses
+					n.reservedRelaysMu.Lock()
+					n.reservedRelays[pinfo.ID] = pinfo.Addrs
+					n.reservedRelaysMu.Unlock()
 				}
 			}
 		}(bootnode)
@@ -624,8 +680,8 @@ func (n *Node) GetDHTStats() *pb.DHTStats {
 	}
 	routingTable := n.dht.RoutingTable()
 	return &pb.DHTStats{
-		Enabled:    true,
-		PeerCount:  int32(routingTable.Size()),
+		Enabled:   true,
+		PeerCount: int32(routingTable.Size()),
 	}
 }
 

@@ -213,10 +213,8 @@ func (r *Replicator) handleContentAnnouncement(peerID peer.ID, announcement *pb.
 func (r *Replicator) FetchAndStore(hash hasher.Hash) error {
 	log.Printf("[Replicator] Fetching content %s...", hash.String())
 
-	ctx, cancel := context.WithTimeout(r.ctx, 2*time.Minute)
-	defer cancel()
-
-	rootBlock, err := r.bitswap.GetBlock(ctx, hash)
+    // Use long-lived context; cancellation is governed by heartbeat/connection liveness
+    rootBlock, err := r.bitswap.GetBlock(r.ctx, hash)
 	if err != nil {
 		log.Printf("[Replicator] Failed to fetch root block %s: %v", hash.String(), err)
 		replicationFailuresTotal.Inc()
@@ -260,7 +258,7 @@ func (r *Replicator) FetchAndStore(hash hasher.Hash) error {
 		}
 
 		if len(blockHashes) > 0 {
-			blockChannel, err := r.bitswap.GetBlocks(ctx, blockHashes)
+            blockChannel, err := r.bitswap.GetBlocks(r.ctx, blockHashes)
 			if err != nil {
 				log.Printf("[Replicator] Failed to start bitswap session for chunks of %s: %v", hash.String(), err)
 				replicationFailuresTotal.Inc()

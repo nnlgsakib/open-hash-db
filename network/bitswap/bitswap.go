@@ -156,9 +156,8 @@ func (e *Engine) downloadWorker(session *DownloadSession, wg *sync.WaitGroup) {
 			return // No more blocks to download
 		}
 
-		providerCtx, cancel := context.WithTimeout(session.ctx, providerSearchTimeout)
-		peer, err := session.WaitForProvider(providerCtx, hash)
-		cancel()
+        // Wait for providers as long as the session is alive; heartbeat governs liveness
+        peer, err := session.WaitForProvider(session.ctx, hash)
 
 		if err != nil {
 			log.Printf("[Bitswap Worker] Could not find provider for block %s: %v", hash, err)

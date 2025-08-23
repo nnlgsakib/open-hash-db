@@ -40,6 +40,7 @@ var (
 	p2pPort   int
 	verbose   bool
 	bootnodes string
+	relays    string
 	apiURL    string
 
 	// Global instances
@@ -262,6 +263,7 @@ func init() {
 	rootCmd.PersistentFlags().IntVar(&p2pPort, "p2p-port", 0, "P2P port (0 for random)")
 	rootCmd.PersistentFlags().BoolVar(&verbose, "verbose", false, "Verbose output")
 	rootCmd.PersistentFlags().StringVar(&bootnodes, "bootnode", "", "Comma-separated list of bootnode addresses (e.g., /ip4/1.2.3.4/tcp/4001/p2p/Qm...)")
+	rootCmd.PersistentFlags().StringVar(&relays, "relays", "", "Comma-separated list of static relay addresses (hop relays) for AutoRelay")
 	rootCmd.PersistentFlags().StringVar(&apiURL, "api", "", "REST API URL for remote operations (e.g., http://localhost:8080)")
 
 	// Command-specific flags
@@ -310,6 +312,15 @@ func initAll() error {
 		}
 	}
 
+	// Parse relay addresses
+	var relayAddrs []string
+	if relays != "" {
+		relayAddrs = strings.Split(relays, ",")
+		for i, addr := range relayAddrs {
+			relayAddrs[i] = strings.TrimSpace(addr)
+		}
+	}
+
 	// Determine key path
 	actualKeyPath := keyPath
 	if actualKeyPath == "" {
@@ -319,7 +330,7 @@ func initAll() error {
 	// Initialize libp2p node
 	ctx := context.Background()
 	var err error
-	node, err = libp2p.NewNodeWithKeyPath(ctx, bootnodeAddrs, actualKeyPath, p2pPort)
+	node, err = libp2p.NewNodeWithKeyPath(ctx, bootnodeAddrs, relayAddrs, actualKeyPath, p2pPort)
 	if err != nil {
 		return fmt.Errorf("failed to initialize libp2p node: %w", err)
 	}
