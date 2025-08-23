@@ -1,13 +1,12 @@
 package libp2p
 
 import (
-	"context"
-	"log"
-	"math/rand"
-	"fmt"
-	"strings"
-	"sync"
-	"time"
+    "context"
+    "log"
+    "math/rand"
+    "strings"
+    "sync"
+    "time"
 
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -121,15 +120,19 @@ func (hs *HeartbeatService) monitor(ctx context.Context, peerID peer.ID) {
         if err := hs.sendHeartbeat(peerID); err != nil {
             log.Printf("[libp2p] Heartbeat to %s failed: %v", peerID.String(), err)
             heartbeatFailureTotal.Inc()
-            if isProtocolUnsupported(err) {
-                log.Printf("[libp2p] Peer %s does not support heartbeat; stopping monitor without closing.", peerID.String())
-                return
-            }
             hs.stateMu.Lock()
             hs.failures[peerID]++
             fails := hs.failures[peerID]
             hs.stateMu.Unlock()
-            if fails >= failureThreshold {
+            if isProtocolUnsupported(err) {
+                // If the peer doesn't support the protocol, don't close the connection.
+                // Stop monitoring after a few attempts to avoid log spam.
+                if fails >= failureThreshold {
+                    log.Printf("[libp2p] Peer %s appears not to support heartbeat after %d attempts; stopping monitor (connection remains).", peerID.String(), fails)
+                    return
+                }
+            } else if fails >= failureThreshold {
+                // For other errors, reset the peer after repeated failures.
                 hs.node.host.Network().ClosePeer(peerID)
                 connectionResetTotal.Inc()
                 log.Printf("[libp2p] Connection to %s reset after %d heartbeat failures", peerID.String(), fails)
@@ -163,21 +166,8 @@ func (hs *HeartbeatService) sendHeartbeat(peerID peer.ID) error {
     ctx, cancel := context.WithTimeout(hs.ctx, HeartbeatTimeout)
     defer cancel()
 
-    // If the peer doesn't advertise our heartbeat protocol, skip attempting a stream.
-    // Many peers (including IPFS nodes) won't implement our custom protocol.
-    if protos, err := hs.node.host.Peerstore().GetProtocols(peerID); err == nil {
-        supported := false
-        for _, p := range protos {
-            if p == "/openhashdb/heartbeat/1.0.0" {
-                supported = true
-                break
-            }
-        }
-        if !supported {
-            return fmt.Errorf("protocol not supported")
-        }
-    }
-
+    // Try to open a heartbeat stream; if the peer doesn't support it, we'll get
+    // a negotiation failure/reset which we classify and handle in the caller.
     stream, err := hs.node.host.NewStream(network.WithAllowLimitedConn(ctx, "heartbeat"), peerID, ProtocolHeartbeat)
     if err != nil {
         log.Printf("[libp2p] Failed to open heartbeat stream to %s: %v", peerID.String(), err)
