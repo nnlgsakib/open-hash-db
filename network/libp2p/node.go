@@ -6,10 +6,8 @@ import (
 	"encoding/base64"
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sync"
 	"time"
 
@@ -315,26 +313,6 @@ func (n *networkNotifiee) ListenClose(net network.Network, addr multiaddr.Multia
 
 // setupMDNS sets up mDNS discovery
 func (n *Node) setupMDNS() error {
-    // mDNS is best-effort; on some platforms (notably Windows) or environments
-    // without a multicast-capable interface, it can error noisily. Skip there.
-    if runtime.GOOS == "windows" {
-        log.Printf("[libp2p] Skipping mDNS on Windows (multicast issues)")
-        return nil
-    }
-
-    ifaces, _ := net.Interfaces()
-    hasMulticast := false
-    for _, iface := range ifaces {
-        if (iface.Flags&net.FlagUp) != 0 && (iface.Flags&net.FlagMulticast) != 0 && (iface.Flags&net.FlagLoopback) == 0 {
-            hasMulticast = true
-            break
-        }
-    }
-    if !hasMulticast {
-        log.Printf("[libp2p] No multicast-capable network interface found; skipping mDNS")
-        return nil
-    }
-
 	mdnsService := mdns.NewMdnsService(n.host, ServiceTag, &discoveryNotifee{node: n})
 	if err := mdnsService.Start(); err != nil {
 		return fmt.Errorf("[libp2p] failed to start mDNS: %w", err)
