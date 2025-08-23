@@ -64,18 +64,40 @@ func protoToAddrInfo(pi *pb.PeerInfo) (peer.AddrInfo, error) {
 
 // getPeerListProto gets the list of connected peers as a proto byte slice.
 func (pe *PeerExchanger) getPeerListProto() ([]byte, error) {
-	peers := pe.node.Host().Peerstore().Peers()
-	var addrInfos []*pb.PeerInfo
-	for _, p := range peers {
-		if p == pe.node.Host().ID() {
-			continue
-		}
-		// We only want to share peers we are connected to.
-		if pe.node.Host().Network().Connectedness(p) == network.Connected {
-			addrInfos = append(addrInfos, addrInfoToProto(pe.node.Host().Peerstore().PeerInfo(p)))
-		}
-	}
-	return proto.Marshal(&pb.PeerInfoList{Peers: addrInfos})
+    // Prefer connected peers, then fill with known peers that have addresses.
+    peers := pe.node.Host().Peerstore().Peers()
+    var connected []*pb.PeerInfo
+    var known []*pb.PeerInfo
+    self := pe.node.Host().ID()
+    for _, p := range peers {
+        if p == self {
+            continue
+        }
+        addrs := pe.node.Host().Peerstore().Addrs(p)
+        if len(addrs) == 0 {
+            continue
+        }
+        pi := addrInfoToProto(pe.node.Host().Peerstore().PeerInfo(p))
+        if pe.node.Host().Network().Connectedness(p) == network.Connected {
+            connected = append(connected, pi)
+        } else {
+            known = append(known, pi)
+        }
+    }
+    // Cap the list to avoid flooding
+    const maxPeers = 64
+    out := make([]*pb.PeerInfo, 0, maxPeers)
+    out = append(out, connected...)
+    if len(out) > maxPeers {
+        out = out[:maxPeers]
+    } else if len(out) < maxPeers {
+        rem := maxPeers - len(out)
+        if rem > len(known) {
+            rem = len(known)
+        }
+        out = append(out, known[:rem]...)
+    }
+    return proto.Marshal(&pb.PeerInfoList{Peers: out})
 }
 
 // connectToNewPeers takes a list of AddrInfo, filters out known/current peers,
@@ -137,27 +159,51 @@ func (pe *PeerExchanger) connectToNewPeers(addrInfos []*pb.PeerInfo, sourcePeer 
 				log.Printf("[PeerExchanger] Peer %s has no public addresses, trying via relay.", pi.ID)
 			}
 
-			log.Printf("[PeerExchanger] Attempting relay connection to %s via %s", pi.ID, sourcePeer)
-			relayAddr, err := multiaddr.NewMultiaddr("/p2p/" + sourcePeer.String() + "/p2p-circuit/p2p/" + pi.ID.String())
-			if err != nil {
-				log.Printf("[PeerExchanger] Error creating relay address for %s via %s: %v", pi.ID, sourcePeer, err)
-				return
-			}
+        // Attempt relay dial via the source peer only if it supports HOP
+        protos, _ := pe.node.Host().Peerstore().GetProtocols(sourcePeer)
+        supportsHop := false
+        for _, pr := range protos {
+            if pr == "/libp2p/circuit/relay/0.2.0/hop" {
+                supportsHop = true
+                break
+            }
+        }
+        if supportsHop {
+            // Use all known transport addrs of the source relay to build full relayed addrs
+            relayBaseAddrs := pe.node.Host().Peerstore().Addrs(sourcePeer)
+            circ, _ := multiaddr.NewMultiaddr("/p2p/" + sourcePeer.String() + "/p2p-circuit/p2p/" + pi.ID.String())
+            for _, ra := range relayBaseAddrs {
+                relayDial := ra.Encapsulate(circ)
+                relayPeerInfo := peer.AddrInfo{ID: pi.ID, Addrs: []multiaddr.Multiaddr{relayDial}}
+                log.Printf("[PeerExchanger] Attempting relay connection to %s via %s at %s", pi.ID, sourcePeer, relayDial)
+                if err := pe.node.Host().Connect(pe.ctx, relayPeerInfo); err == nil {
+                    log.Printf("[PeerExchanger] Successfully connected to %s via relay %s", pi.ID, sourcePeer)
+                    connected = true
+                    return
+                }
+            }
+        }
 
-			relayPeerInfo := peer.AddrInfo{
-				ID:    pi.ID,
-				Addrs: []multiaddr.Multiaddr{relayAddr},
-			}
-
-			if err := pe.node.Host().Connect(pe.ctx, relayPeerInfo); err != nil {
-				log.Printf("[PeerExchanger] Failed to connect to %s via relay %s: %v", pi.ID, sourcePeer, err)
-			} else {
-				log.Printf("[PeerExchanger] Successfully connected to %s via relay %s", pi.ID, sourcePeer)
-				connected = true
-			}
-		}(addrInfo)
-	}
-	wg.Wait()
+        // Fallback: try via our reserved relays
+        pe.node.reservedRelaysMu.RLock()
+        for rid, ras := range pe.node.reservedRelays {
+            circ, _ := multiaddr.NewMultiaddr("/p2p/" + rid.String() + "/p2p-circuit/p2p/" + pi.ID.String())
+            for _, ra := range ras {
+                relayDial := ra.Encapsulate(circ)
+                relayPeerInfo := peer.AddrInfo{ID: pi.ID, Addrs: []multiaddr.Multiaddr{relayDial}}
+                log.Printf("[PeerExchanger] Attempting relay connection to %s via reserved relay %s at %s", pi.ID, rid, relayDial)
+                if err := pe.node.Host().Connect(pe.ctx, relayPeerInfo); err == nil {
+                    log.Printf("[PeerExchanger] Successfully connected to %s via reserved relay %s", pi.ID, rid)
+                    pe.node.reservedRelaysMu.RUnlock()
+                    connected = true
+                    return
+                }
+            }
+        }
+        pe.node.reservedRelaysMu.RUnlock()
+    }(addrInfo)
+    }
+    wg.Wait()
 }
 
 // handleExchange handles the peer exchange on an incoming stream.
