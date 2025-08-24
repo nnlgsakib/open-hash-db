@@ -12,8 +12,14 @@ message ContentAnnouncement {
 }
 
 message PeerInfo {
+    enum ConnectionType {
+        UNKNOWN = 0;
+        DIRECT = 1;
+        RELAYED = 2;
+    }
     string id = 1;
     repeated string addrs = 2;
+    ConnectionType conn_type = 3;
 }
 
 message PeerInfoList {

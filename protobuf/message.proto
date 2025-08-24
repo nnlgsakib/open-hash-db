@@ -34,4 +34,12 @@ message Message {
     Wantlist wantlist = 1;
     repeated Block blocks = 2;
     repeated BlockPresence block_presences = 3;
+
+    // A request for a peer to fetch a block from another peer and forward it.
+    message DelegatedFetchRequest {
+        bytes hash = 1;
+        string target_peer_id = 2; // The peer ID to fetch the block from.
+        string requestor_peer_id = 3; // The original peer who wants the block.
+    }
+    repeated DelegatedFetchRequest delegated_requests = 4; // New field
 }

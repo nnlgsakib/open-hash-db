@@ -2,7 +2,7 @@
 // versions:
 // 	protoc-gen-go v1.36.7
 // 	protoc        v6.32.0
-// source: protobuf/message.proto
+// source: message.proto
 
 package pb
 
@@ -51,11 +51,11 @@ func (x Message_Wantlist_Entry_WantType) String() string {
 }
 
 func (Message_Wantlist_Entry_WantType) Descriptor() protoreflect.EnumDescriptor {
-	return file_protobuf_message_proto_enumTypes[0].Descriptor()
+	return file_message_proto_enumTypes[0].Descriptor()
 }
 
 func (Message_Wantlist_Entry_WantType) Type() protoreflect.EnumType {
-	return &file_protobuf_message_proto_enumTypes[0]
+	return &file_message_proto_enumTypes[0]
 }
 
 func (x Message_Wantlist_Entry_WantType) Number() protoreflect.EnumNumber {
@@ -64,7 +64,7 @@ func (x Message_Wantlist_Entry_WantType) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use Message_Wantlist_Entry_WantType.Descriptor instead.
 func (Message_Wantlist_Entry_WantType) EnumDescriptor() ([]byte, []int) {
-	return file_protobuf_message_proto_rawDescGZIP(), []int{0, 0, 0, 0}
+	return file_message_proto_rawDescGZIP(), []int{0, 0, 0, 0}
 }
 
 type Message_BlockPresence_PresenceType int32
@@ -97,11 +97,11 @@ func (x Message_BlockPresence_PresenceType) String() string {
 }
 
 func (Message_BlockPresence_PresenceType) Descriptor() protoreflect.EnumDescriptor {
-	return file_protobuf_message_proto_enumTypes[1].Descriptor()
+	return file_message_proto_enumTypes[1].Descriptor()
 }
 
 func (Message_BlockPresence_PresenceType) Type() protoreflect.EnumType {
-	return &file_protobuf_message_proto_enumTypes[1]
+	return &file_message_proto_enumTypes[1]
 }
 
 func (x Message_BlockPresence_PresenceType) Number() protoreflect.EnumNumber {
@@ -110,21 +110,22 @@ func (x Message_BlockPresence_PresenceType) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use Message_BlockPresence_PresenceType.Descriptor instead.
 func (Message_BlockPresence_PresenceType) EnumDescriptor() ([]byte, []int) {
-	return file_protobuf_message_proto_rawDescGZIP(), []int{0, 2, 0}
+	return file_message_proto_rawDescGZIP(), []int{0, 2, 0}
 }
 
 type Message struct {
-	state          protoimpl.MessageState   `protogen:"open.v1"`
-	Wantlist       *Message_Wantlist        `protobuf:"bytes,1,opt,name=wantlist,proto3" json:"wantlist,omitempty"`
-	Blocks         []*Message_Block         `protobuf:"bytes,2,rep,name=blocks,proto3" json:"blocks,omitempty"`
-	BlockPresences []*Message_BlockPresence `protobuf:"bytes,3,rep,name=block_presences,json=blockPresences,proto3" json:"block_presences,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	state             protoimpl.MessageState           `protogen:"open.v1"`
+	Wantlist          *Message_Wantlist                `protobuf:"bytes,1,opt,name=wantlist,proto3" json:"wantlist,omitempty"`
+	Blocks            []*Message_Block                 `protobuf:"bytes,2,rep,name=blocks,proto3" json:"blocks,omitempty"`
+	BlockPresences    []*Message_BlockPresence         `protobuf:"bytes,3,rep,name=block_presences,json=blockPresences,proto3" json:"block_presences,omitempty"`
+	DelegatedRequests []*Message_DelegatedFetchRequest `protobuf:"bytes,4,rep,name=delegated_requests,json=delegatedRequests,proto3" json:"delegated_requests,omitempty"` // New field
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *Message) Reset() {
 	*x = Message{}
-	mi := &file_protobuf_message_proto_msgTypes[0]
+	mi := &file_message_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -136,7 +137,7 @@ func (x *Message) String() string {
 func (*Message) ProtoMessage() {}
 
 func (x *Message) ProtoReflect() protoreflect.Message {
-	mi := &file_protobuf_message_proto_msgTypes[0]
+	mi := &file_message_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -149,7 +150,7 @@ func (x *Message) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Message.ProtoReflect.Descriptor instead.
 func (*Message) Descriptor() ([]byte, []int) {
-	return file_protobuf_message_proto_rawDescGZIP(), []int{0}
+	return file_message_proto_rawDescGZIP(), []int{0}
 }
 
 func (x *Message) GetWantlist() *Message_Wantlist {
@@ -173,6 +174,13 @@ func (x *Message) GetBlockPresences() []*Message_BlockPresence {
 	return nil
 }
 
+func (x *Message) GetDelegatedRequests() []*Message_DelegatedFetchRequest {
+	if x != nil {
+		return x.DelegatedRequests
+	}
+	return nil
+}
+
 type Message_Wantlist struct {
 	state         protoimpl.MessageState    `protogen:"open.v1"`
 	Entries       []*Message_Wantlist_Entry `protobuf:"bytes,1,rep,name=entries,proto3" json:"entries,omitempty"`
@@ -183,7 +191,7 @@ type Message_Wantlist struct {
 
 func (x *Message_Wantlist) Reset() {
 	*x = Message_Wantlist{}
-	mi := &file_protobuf_message_proto_msgTypes[1]
+	mi := &file_message_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -195,7 +203,7 @@ func (x *Message_Wantlist) String() string {
 func (*Message_Wantlist) ProtoMessage() {}
 
 func (x *Message_Wantlist) ProtoReflect() protoreflect.Message {
-	mi := &file_protobuf_message_proto_msgTypes[1]
+	mi := &file_message_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -208,7 +216,7 @@ func (x *Message_Wantlist) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Message_Wantlist.ProtoReflect.Descriptor instead.
 func (*Message_Wantlist) Descriptor() ([]byte, []int) {
-	return file_protobuf_message_proto_rawDescGZIP(), []int{0, 0}
+	return file_message_proto_rawDescGZIP(), []int{0, 0}
 }
 
 func (x *Message_Wantlist) GetEntries() []*Message_Wantlist_Entry {
@@ -235,7 +243,7 @@ type Message_Block struct {
 
 func (x *Message_Block) Reset() {
 	*x = Message_Block{}
-	mi := &file_protobuf_message_proto_msgTypes[2]
+	mi := &file_message_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -247,7 +255,7 @@ func (x *Message_Block) String() string {
 func (*Message_Block) ProtoMessage() {}
 
 func (x *Message_Block) ProtoReflect() protoreflect.Message {
-	mi := &file_protobuf_message_proto_msgTypes[2]
+	mi := &file_message_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -260,7 +268,7 @@ func (x *Message_Block) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Message_Block.ProtoReflect.Descriptor instead.
 func (*Message_Block) Descriptor() ([]byte, []int) {
-	return file_protobuf_message_proto_rawDescGZIP(), []int{0, 1}
+	return file_message_proto_rawDescGZIP(), []int{0, 1}
 }
 
 func (x *Message_Block) GetHash() []byte {
@@ -287,7 +295,7 @@ type Message_BlockPresence struct {
 
 func (x *Message_BlockPresence) Reset() {
 	*x = Message_BlockPresence{}
-	mi := &file_protobuf_message_proto_msgTypes[3]
+	mi := &file_message_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -299,7 +307,7 @@ func (x *Message_BlockPresence) String() string {
 func (*Message_BlockPresence) ProtoMessage() {}
 
 func (x *Message_BlockPresence) ProtoReflect() protoreflect.Message {
-	mi := &file_protobuf_message_proto_msgTypes[3]
+	mi := &file_message_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -312,7 +320,7 @@ func (x *Message_BlockPresence) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Message_BlockPresence.ProtoReflect.Descriptor instead.
 func (*Message_BlockPresence) Descriptor() ([]byte, []int) {
-	return file_protobuf_message_proto_rawDescGZIP(), []int{0, 2}
+	return file_message_proto_rawDescGZIP(), []int{0, 2}
 }
 
 func (x *Message_BlockPresence) GetHash() []byte {
@@ -329,6 +337,67 @@ func (x *Message_BlockPresence) GetType() Message_BlockPresence_PresenceType {
 	return Message_BlockPresence_Have
 }
 
+// A request for a peer to fetch a block from another peer and forward it.
+type Message_DelegatedFetchRequest struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	Hash            []byte                 `protobuf:"bytes,1,opt,name=hash,proto3" json:"hash,omitempty"`
+	TargetPeerId    string                 `protobuf:"bytes,2,opt,name=target_peer_id,json=targetPeerId,proto3" json:"target_peer_id,omitempty"`          // The peer ID to fetch the block from.
+	RequestorPeerId string                 `protobuf:"bytes,3,opt,name=requestor_peer_id,json=requestorPeerId,proto3" json:"requestor_peer_id,omitempty"` // The original peer who wants the block.
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *Message_DelegatedFetchRequest) Reset() {
+	*x = Message_DelegatedFetchRequest{}
+	mi := &file_message_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Message_DelegatedFetchRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Message_DelegatedFetchRequest) ProtoMessage() {}
+
+func (x *Message_DelegatedFetchRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_message_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Message_DelegatedFetchRequest.ProtoReflect.Descriptor instead.
+func (*Message_DelegatedFetchRequest) Descriptor() ([]byte, []int) {
+	return file_message_proto_rawDescGZIP(), []int{0, 3}
+}
+
+func (x *Message_DelegatedFetchRequest) GetHash() []byte {
+	if x != nil {
+		return x.Hash
+	}
+	return nil
+}
+
+func (x *Message_DelegatedFetchRequest) GetTargetPeerId() string {
+	if x != nil {
+		return x.TargetPeerId
+	}
+	return ""
+}
+
+func (x *Message_DelegatedFetchRequest) GetRequestorPeerId() string {
+	if x != nil {
+		return x.RequestorPeerId
+	}
+	return ""
+}
+
 type Message_Wantlist_Entry struct {
 	state         protoimpl.MessageState          `protogen:"open.v1"`
 	Hash          []byte                          `protobuf:"bytes,1,opt,name=hash,proto3" json:"hash,omitempty"`                                                                          // The hash of the block
@@ -340,7 +409,7 @@ type Message_Wantlist_Entry struct {
 
 func (x *Message_Wantlist_Entry) Reset() {
 	*x = Message_Wantlist_Entry{}
-	mi := &file_protobuf_message_proto_msgTypes[4]
+	mi := &file_message_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -352,7 +421,7 @@ func (x *Message_Wantlist_Entry) String() string {
 func (*Message_Wantlist_Entry) ProtoMessage() {}
 
 func (x *Message_Wantlist_Entry) ProtoReflect() protoreflect.Message {
-	mi := &file_protobuf_message_proto_msgTypes[4]
+	mi := &file_message_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -365,7 +434,7 @@ func (x *Message_Wantlist_Entry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Message_Wantlist_Entry.ProtoReflect.Descriptor instead.
 func (*Message_Wantlist_Entry) Descriptor() ([]byte, []int) {
-	return file_protobuf_message_proto_rawDescGZIP(), []int{0, 0, 0}
+	return file_message_proto_rawDescGZIP(), []int{0, 0, 0}
 }
 
 func (x *Message_Wantlist_Entry) GetHash() []byte {
@@ -389,16 +458,17 @@ func (x *Message_Wantlist_Entry) GetWantType() Message_Wantlist_Entry_WantType {
 	return Message_Wantlist_Entry_Have
 }
 
-var File_protobuf_message_proto protoreflect.FileDescriptor
+var File_message_proto protoreflect.FileDescriptor
 
-const file_protobuf_message_proto_rawDesc = "" +
+const file_message_proto_rawDesc = "" +
 	"\n" +
-	"\x16protobuf/message.proto\x12\n" +
-	"bitswap.pb\"\x89\x05\n" +
+	"\rmessage.proto\x12\n" +
+	"bitswap.pb\"\xe2\x06\n" +
 	"\aMessage\x128\n" +
 	"\bwantlist\x18\x01 \x01(\v2\x1c.bitswap.pb.Message.WantlistR\bwantlist\x121\n" +
 	"\x06blocks\x18\x02 \x03(\v2\x19.bitswap.pb.Message.BlockR\x06blocks\x12J\n" +
-	"\x0fblock_presences\x18\x03 \x03(\v2!.bitswap.pb.Message.BlockPresenceR\x0eblockPresences\x1a\x81\x02\n" +
+	"\x0fblock_presences\x18\x03 \x03(\v2!.bitswap.pb.Message.BlockPresenceR\x0eblockPresences\x12X\n" +
+	"\x12delegated_requests\x18\x04 \x03(\v2).bitswap.pb.Message.DelegatedFetchRequestR\x11delegatedRequests\x1a\x81\x02\n" +
 	"\bWantlist\x12<\n" +
 	"\aentries\x18\x01 \x03(\v2\".bitswap.pb.Message.Wantlist.EntryR\aentries\x12\x12\n" +
 	"\x04full\x18\x02 \x01(\bR\x04full\x1a\xa2\x01\n" +
@@ -417,66 +487,72 @@ const file_protobuf_message_proto_rawDesc = "" +
 	"\x04type\x18\x02 \x01(\x0e2..bitswap.pb.Message.BlockPresence.PresenceTypeR\x04type\"&\n" +
 	"\fPresenceType\x12\b\n" +
 	"\x04Have\x10\x00\x12\f\n" +
-	"\bDontHave\x10\x01B\x18Z\x16openhashdb/protobuf/pbb\x06proto3"
+	"\bDontHave\x10\x01\x1a}\n" +
+	"\x15DelegatedFetchRequest\x12\x12\n" +
+	"\x04hash\x18\x01 \x01(\fR\x04hash\x12$\n" +
+	"\x0etarget_peer_id\x18\x02 \x01(\tR\ftargetPeerId\x12*\n" +
+	"\x11requestor_peer_id\x18\x03 \x01(\tR\x0frequestorPeerIdB\x18Z\x16openhashdb/protobuf/pbb\x06proto3"
 
 var (
-	file_protobuf_message_proto_rawDescOnce sync.Once
-	file_protobuf_message_proto_rawDescData []byte
+	file_message_proto_rawDescOnce sync.Once
+	file_message_proto_rawDescData []byte
 )
 
-func file_protobuf_message_proto_rawDescGZIP() []byte {
-	file_protobuf_message_proto_rawDescOnce.Do(func() {
-		file_protobuf_message_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_protobuf_message_proto_rawDesc), len(file_protobuf_message_proto_rawDesc)))
+func file_message_proto_rawDescGZIP() []byte {
+	file_message_proto_rawDescOnce.Do(func() {
+		file_message_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_message_proto_rawDesc), len(file_message_proto_rawDesc)))
 	})
-	return file_protobuf_message_proto_rawDescData
+	return file_message_proto_rawDescData
 }
 
-var file_protobuf_message_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_protobuf_message_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
-var file_protobuf_message_proto_goTypes = []any{
+var file_message_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_message_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
+var file_message_proto_goTypes = []any{
 	(Message_Wantlist_Entry_WantType)(0),    // 0: bitswap.pb.Message.Wantlist.Entry.WantType
 	(Message_BlockPresence_PresenceType)(0), // 1: bitswap.pb.Message.BlockPresence.PresenceType
 	(*Message)(nil),                         // 2: bitswap.pb.Message
 	(*Message_Wantlist)(nil),                // 3: bitswap.pb.Message.Wantlist
 	(*Message_Block)(nil),                   // 4: bitswap.pb.Message.Block
 	(*Message_BlockPresence)(nil),           // 5: bitswap.pb.Message.BlockPresence
-	(*Message_Wantlist_Entry)(nil),          // 6: bitswap.pb.Message.Wantlist.Entry
+	(*Message_DelegatedFetchRequest)(nil),   // 6: bitswap.pb.Message.DelegatedFetchRequest
+	(*Message_Wantlist_Entry)(nil),          // 7: bitswap.pb.Message.Wantlist.Entry
 }
-var file_protobuf_message_proto_depIdxs = []int32{
+var file_message_proto_depIdxs = []int32{
 	3, // 0: bitswap.pb.Message.wantlist:type_name -> bitswap.pb.Message.Wantlist
 	4, // 1: bitswap.pb.Message.blocks:type_name -> bitswap.pb.Message.Block
 	5, // 2: bitswap.pb.Message.block_presences:type_name -> bitswap.pb.Message.BlockPresence
-	6, // 3: bitswap.pb.Message.Wantlist.entries:type_name -> bitswap.pb.Message.Wantlist.Entry
-	1, // 4: bitswap.pb.Message.BlockPresence.type:type_name -> bitswap.pb.Message.BlockPresence.PresenceType
-	0, // 5: bitswap.pb.Message.Wantlist.Entry.want_type:type_name -> bitswap.pb.Message.Wantlist.Entry.WantType
-	6, // [6:6] is the sub-list for method output_type
-	6, // [6:6] is the sub-list for method input_type
-	6, // [6:6] is the sub-list for extension type_name
-	6, // [6:6] is the sub-list for extension extendee
-	0, // [0:6] is the sub-list for field type_name
+	6, // 3: bitswap.pb.Message.delegated_requests:type_name -> bitswap.pb.Message.DelegatedFetchRequest
+	7, // 4: bitswap.pb.Message.Wantlist.entries:type_name -> bitswap.pb.Message.Wantlist.Entry
+	1, // 5: bitswap.pb.Message.BlockPresence.type:type_name -> bitswap.pb.Message.BlockPresence.PresenceType
+	0, // 6: bitswap.pb.Message.Wantlist.Entry.want_type:type_name -> bitswap.pb.Message.Wantlist.Entry.WantType
+	7, // [7:7] is the sub-list for method output_type
+	7, // [7:7] is the sub-list for method input_type
+	7, // [7:7] is the sub-list for extension type_name
+	7, // [7:7] is the sub-list for extension extendee
+	0, // [0:7] is the sub-list for field type_name
 }
 
-func init() { file_protobuf_message_proto_init() }
-func file_protobuf_message_proto_init() {
-	if File_protobuf_message_proto != nil {
+func init() { file_message_proto_init() }
+func file_message_proto_init() {
+	if File_message_proto != nil {
 		return
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_protobuf_message_proto_rawDesc), len(file_protobuf_message_proto_rawDesc)),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_message_proto_rawDesc), len(file_message_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   5,
+			NumMessages:   6,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
-		GoTypes:           file_protobuf_message_proto_goTypes,
-		DependencyIndexes: file_protobuf_message_proto_depIdxs,
-		EnumInfos:         file_protobuf_message_proto_enumTypes,
-		MessageInfos:      file_protobuf_message_proto_msgTypes,
+		GoTypes:           file_message_proto_goTypes,
+		DependencyIndexes: file_message_proto_depIdxs,
+		EnumInfos:         file_message_proto_enumTypes,
+		MessageInfos:      file_message_proto_msgTypes,
 	}.Build()
-	File_protobuf_message_proto = out.File
-	file_protobuf_message_proto_goTypes = nil
-	file_protobuf_message_proto_depIdxs = nil
+	File_message_proto = out.File
+	file_message_proto_goTypes = nil
+	file_message_proto_depIdxs = nil
 }

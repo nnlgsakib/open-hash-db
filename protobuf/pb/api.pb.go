@@ -2,7 +2,7 @@
 // versions:
 // 	protoc-gen-go v1.36.7
 // 	protoc        v6.32.0
-// source: protobuf/api.proto
+// source: api.proto
 
 package pb
 
@@ -34,7 +34,7 @@ type UploadResponse struct {
 
 func (x *UploadResponse) Reset() {
 	*x = UploadResponse{}
-	mi := &file_protobuf_api_proto_msgTypes[0]
+	mi := &file_api_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -46,7 +46,7 @@ func (x *UploadResponse) String() string {
 func (*UploadResponse) ProtoMessage() {}
 
 func (x *UploadResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_protobuf_api_proto_msgTypes[0]
+	mi := &file_api_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -59,7 +59,7 @@ func (x *UploadResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UploadResponse.ProtoReflect.Descriptor instead.
 func (*UploadResponse) Descriptor() ([]byte, []int) {
-	return file_protobuf_api_proto_rawDescGZIP(), []int{0}
+	return file_api_proto_rawDescGZIP(), []int{0}
 }
 
 func (x *UploadResponse) GetHash() string {
@@ -101,7 +101,7 @@ type ErrorResponse struct {
 
 func (x *ErrorResponse) Reset() {
 	*x = ErrorResponse{}
-	mi := &file_protobuf_api_proto_msgTypes[1]
+	mi := &file_api_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -113,7 +113,7 @@ func (x *ErrorResponse) String() string {
 func (*ErrorResponse) ProtoMessage() {}
 
 func (x *ErrorResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_protobuf_api_proto_msgTypes[1]
+	mi := &file_api_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -126,7 +126,7 @@ func (x *ErrorResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ErrorResponse.ProtoReflect.Descriptor instead.
 func (*ErrorResponse) Descriptor() ([]byte, []int) {
-	return file_protobuf_api_proto_rawDescGZIP(), []int{1}
+	return file_api_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *ErrorResponse) GetError() string {
@@ -169,7 +169,7 @@ type ContentInfo struct {
 
 func (x *ContentInfo) Reset() {
 	*x = ContentInfo{}
-	mi := &file_protobuf_api_proto_msgTypes[2]
+	mi := &file_api_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -181,7 +181,7 @@ func (x *ContentInfo) String() string {
 func (*ContentInfo) ProtoMessage() {}
 
 func (x *ContentInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_protobuf_api_proto_msgTypes[2]
+	mi := &file_api_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -194,7 +194,7 @@ func (x *ContentInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ContentInfo.ProtoReflect.Descriptor instead.
 func (*ContentInfo) Descriptor() ([]byte, []int) {
-	return file_protobuf_api_proto_rawDescGZIP(), []int{2}
+	return file_api_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *ContentInfo) GetHash() []byte {
@@ -283,7 +283,7 @@ type ContentInfoList struct {
 
 func (x *ContentInfoList) Reset() {
 	*x = ContentInfoList{}
-	mi := &file_protobuf_api_proto_msgTypes[3]
+	mi := &file_api_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -295,7 +295,7 @@ func (x *ContentInfoList) String() string {
 func (*ContentInfoList) ProtoMessage() {}
 
 func (x *ContentInfoList) ProtoReflect() protoreflect.Message {
-	mi := &file_protobuf_api_proto_msgTypes[3]
+	mi := &file_api_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -308,7 +308,7 @@ func (x *ContentInfoList) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ContentInfoList.ProtoReflect.Descriptor instead.
 func (*ContentInfoList) Descriptor() ([]byte, []int) {
-	return file_protobuf_api_proto_rawDescGZIP(), []int{3}
+	return file_api_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *ContentInfoList) GetInfos() []*ContentInfo {
@@ -329,7 +329,7 @@ type HealthResponse struct {
 
 func (x *HealthResponse) Reset() {
 	*x = HealthResponse{}
-	mi := &file_protobuf_api_proto_msgTypes[4]
+	mi := &file_api_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -341,7 +341,7 @@ func (x *HealthResponse) String() string {
 func (*HealthResponse) ProtoMessage() {}
 
 func (x *HealthResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_protobuf_api_proto_msgTypes[4]
+	mi := &file_api_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -354,7 +354,7 @@ func (x *HealthResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthResponse.ProtoReflect.Descriptor instead.
 func (*HealthResponse) Descriptor() ([]byte, []int) {
-	return file_protobuf_api_proto_rawDescGZIP(), []int{4}
+	return file_api_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *HealthResponse) GetStatus() string {
@@ -387,7 +387,7 @@ type StorageStats struct {
 
 func (x *StorageStats) Reset() {
 	*x = StorageStats{}
-	mi := &file_protobuf_api_proto_msgTypes[5]
+	mi := &file_api_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -399,7 +399,7 @@ func (x *StorageStats) String() string {
 func (*StorageStats) ProtoMessage() {}
 
 func (x *StorageStats) ProtoReflect() protoreflect.Message {
-	mi := &file_protobuf_api_proto_msgTypes[5]
+	mi := &file_api_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -412,7 +412,7 @@ func (x *StorageStats) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StorageStats.ProtoReflect.Descriptor instead.
 func (*StorageStats) Descriptor() ([]byte, []int) {
-	return file_protobuf_api_proto_rawDescGZIP(), []int{5}
+	return file_api_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *StorageStats) GetContentCount() int64 {
@@ -433,7 +433,7 @@ type ReplicationStats struct {
 
 func (x *ReplicationStats) Reset() {
 	*x = ReplicationStats{}
-	mi := &file_protobuf_api_proto_msgTypes[6]
+	mi := &file_api_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -445,7 +445,7 @@ func (x *ReplicationStats) String() string {
 func (*ReplicationStats) ProtoMessage() {}
 
 func (x *ReplicationStats) ProtoReflect() protoreflect.Message {
-	mi := &file_protobuf_api_proto_msgTypes[6]
+	mi := &file_api_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -458,7 +458,7 @@ func (x *ReplicationStats) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReplicationStats.ProtoReflect.Descriptor instead.
 func (*ReplicationStats) Descriptor() ([]byte, []int) {
-	return file_protobuf_api_proto_rawDescGZIP(), []int{6}
+	return file_api_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *ReplicationStats) GetReplicationFactor() int32 {
@@ -493,7 +493,7 @@ type StatsResponse struct {
 
 func (x *StatsResponse) Reset() {
 	*x = StatsResponse{}
-	mi := &file_protobuf_api_proto_msgTypes[7]
+	mi := &file_api_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -505,7 +505,7 @@ func (x *StatsResponse) String() string {
 func (*StatsResponse) ProtoMessage() {}
 
 func (x *StatsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_protobuf_api_proto_msgTypes[7]
+	mi := &file_api_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -518,7 +518,7 @@ func (x *StatsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StatsResponse.ProtoReflect.Descriptor instead.
 func (*StatsResponse) Descriptor() ([]byte, []int) {
-	return file_protobuf_api_proto_rawDescGZIP(), []int{7}
+	return file_api_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *StatsResponse) GetStorage() *StorageStats {
@@ -552,7 +552,7 @@ type PinResponse struct {
 
 func (x *PinResponse) Reset() {
 	*x = PinResponse{}
-	mi := &file_protobuf_api_proto_msgTypes[8]
+	mi := &file_api_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -564,7 +564,7 @@ func (x *PinResponse) String() string {
 func (*PinResponse) ProtoMessage() {}
 
 func (x *PinResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_protobuf_api_proto_msgTypes[8]
+	mi := &file_api_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -577,7 +577,7 @@ func (x *PinResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PinResponse.ProtoReflect.Descriptor instead.
 func (*PinResponse) Descriptor() ([]byte, []int) {
-	return file_protobuf_api_proto_rawDescGZIP(), []int{8}
+	return file_api_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *PinResponse) GetHash() string {
@@ -603,7 +603,7 @@ type PinListResponse struct {
 
 func (x *PinListResponse) Reset() {
 	*x = PinListResponse{}
-	mi := &file_protobuf_api_proto_msgTypes[9]
+	mi := &file_api_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -615,7 +615,7 @@ func (x *PinListResponse) String() string {
 func (*PinListResponse) ProtoMessage() {}
 
 func (x *PinListResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_protobuf_api_proto_msgTypes[9]
+	mi := &file_api_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -628,7 +628,7 @@ func (x *PinListResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PinListResponse.ProtoReflect.Descriptor instead.
 func (*PinListResponse) Descriptor() ([]byte, []int) {
-	return file_protobuf_api_proto_rawDescGZIP(), []int{9}
+	return file_api_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *PinListResponse) GetHashes() []string {
@@ -650,7 +650,7 @@ type PeerEvent struct {
 
 func (x *PeerEvent) Reset() {
 	*x = PeerEvent{}
-	mi := &file_protobuf_api_proto_msgTypes[10]
+	mi := &file_api_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -662,7 +662,7 @@ func (x *PeerEvent) String() string {
 func (*PeerEvent) ProtoMessage() {}
 
 func (x *PeerEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_protobuf_api_proto_msgTypes[10]
+	mi := &file_api_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -675,7 +675,7 @@ func (x *PeerEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PeerEvent.ProtoReflect.Descriptor instead.
 func (*PeerEvent) Descriptor() ([]byte, []int) {
-	return file_protobuf_api_proto_rawDescGZIP(), []int{10}
+	return file_api_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *PeerEvent) GetPeerId() string {
@@ -716,7 +716,7 @@ type DHTStats struct {
 
 func (x *DHTStats) Reset() {
 	*x = DHTStats{}
-	mi := &file_protobuf_api_proto_msgTypes[11]
+	mi := &file_api_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -728,7 +728,7 @@ func (x *DHTStats) String() string {
 func (*DHTStats) ProtoMessage() {}
 
 func (x *DHTStats) ProtoReflect() protoreflect.Message {
-	mi := &file_protobuf_api_proto_msgTypes[11]
+	mi := &file_api_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -741,7 +741,7 @@ func (x *DHTStats) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DHTStats.ProtoReflect.Descriptor instead.
 func (*DHTStats) Descriptor() ([]byte, []int) {
-	return file_protobuf_api_proto_rawDescGZIP(), []int{11}
+	return file_api_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *DHTStats) GetEnabled() bool {
@@ -772,7 +772,7 @@ type NetworkStatsResponse struct {
 
 func (x *NetworkStatsResponse) Reset() {
 	*x = NetworkStatsResponse{}
-	mi := &file_protobuf_api_proto_msgTypes[12]
+	mi := &file_api_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -784,7 +784,7 @@ func (x *NetworkStatsResponse) String() string {
 func (*NetworkStatsResponse) ProtoMessage() {}
 
 func (x *NetworkStatsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_protobuf_api_proto_msgTypes[12]
+	mi := &file_api_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -797,7 +797,7 @@ func (x *NetworkStatsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NetworkStatsResponse.ProtoReflect.Descriptor instead.
 func (*NetworkStatsResponse) Descriptor() ([]byte, []int) {
-	return file_protobuf_api_proto_rawDescGZIP(), []int{12}
+	return file_api_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *NetworkStatsResponse) GetPeerId() string {
@@ -842,11 +842,12 @@ func (x *NetworkStatsResponse) GetPeerEvents() []*PeerEvent {
 	return nil
 }
 
-var File_protobuf_api_proto protoreflect.FileDescriptor
+var File_api_proto protoreflect.FileDescriptor
 
-const file_protobuf_api_proto_rawDesc = "" +
+const file_api_proto_rawDesc = "" +
 	"\n" +
-	"\x12protobuf/api.proto\x12\x06api.pb\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x13protobuf/core.proto\"n\n" +
+	"\tapi.proto\x12\x06api.pb\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\n" +
+	"core.proto\"n\n" +
 	"\x0eUploadResponse\x12\x12\n" +
 	"\x04hash\x18\x01 \x01(\tR\x04hash\x12\x12\n" +
 	"\x04size\x18\x02 \x01(\x03R\x04size\x12\x1a\n" +
@@ -910,19 +911,19 @@ const file_protobuf_api_proto_rawDesc = "" +
 	"peerEventsB\x18Z\x16openhashdb/protobuf/pbb\x06proto3"
 
 var (
-	file_protobuf_api_proto_rawDescOnce sync.Once
-	file_protobuf_api_proto_rawDescData []byte
+	file_api_proto_rawDescOnce sync.Once
+	file_api_proto_rawDescData []byte
 )
 
-func file_protobuf_api_proto_rawDescGZIP() []byte {
-	file_protobuf_api_proto_rawDescOnce.Do(func() {
-		file_protobuf_api_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_protobuf_api_proto_rawDesc), len(file_protobuf_api_proto_rawDesc)))
+func file_api_proto_rawDescGZIP() []byte {
+	file_api_proto_rawDescOnce.Do(func() {
+		file_api_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_api_proto_rawDesc), len(file_api_proto_rawDesc)))
 	})
-	return file_protobuf_api_proto_rawDescData
+	return file_api_proto_rawDescData
 }
 
-var file_protobuf_api_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
-var file_protobuf_api_proto_goTypes = []any{
+var file_api_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
+var file_api_proto_goTypes = []any{
 	(*UploadResponse)(nil),        // 0: api.pb.UploadResponse
 	(*ErrorResponse)(nil),         // 1: api.pb.ErrorResponse
 	(*ContentInfo)(nil),           // 2: api.pb.ContentInfo
@@ -940,7 +941,7 @@ var file_protobuf_api_proto_goTypes = []any{
 	(*ChunkInfo)(nil),             // 14: core.pb.ChunkInfo
 	(*Link)(nil),                  // 15: core.pb.Link
 }
-var file_protobuf_api_proto_depIdxs = []int32{
+var file_api_proto_depIdxs = []int32{
 	13, // 0: api.pb.ContentInfo.mod_time:type_name -> google.protobuf.Timestamp
 	13, // 1: api.pb.ContentInfo.created_at:type_name -> google.protobuf.Timestamp
 	14, // 2: api.pb.ContentInfo.chunks:type_name -> core.pb.ChunkInfo
@@ -960,27 +961,27 @@ var file_protobuf_api_proto_depIdxs = []int32{
 	0,  // [0:12] is the sub-list for field type_name
 }
 
-func init() { file_protobuf_api_proto_init() }
-func file_protobuf_api_proto_init() {
-	if File_protobuf_api_proto != nil {
+func init() { file_api_proto_init() }
+func file_api_proto_init() {
+	if File_api_proto != nil {
 		return
 	}
-	file_protobuf_core_proto_init()
+	file_core_proto_init()
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_protobuf_api_proto_rawDesc), len(file_protobuf_api_proto_rawDesc)),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_proto_rawDesc), len(file_api_proto_rawDesc)),
 			NumEnums:      0,
 			NumMessages:   13,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
-		GoTypes:           file_protobuf_api_proto_goTypes,
-		DependencyIndexes: file_protobuf_api_proto_depIdxs,
-		MessageInfos:      file_protobuf_api_proto_msgTypes,
+		GoTypes:           file_api_proto_goTypes,
+		DependencyIndexes: file_api_proto_depIdxs,
+		MessageInfos:      file_api_proto_msgTypes,
 	}.Build()
-	File_protobuf_api_proto = out.File
-	file_protobuf_api_proto_goTypes = nil
-	file_protobuf_api_proto_depIdxs = nil
+	File_api_proto = out.File
+	file_api_proto_goTypes = nil
+	file_api_proto_depIdxs = nil
 }

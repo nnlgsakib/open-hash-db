@@ -7,12 +7,13 @@ import (
 	"io"
 	"log"
 	"sync"
-    "time"
+	"time"
 
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
 	"google.golang.org/protobuf/proto"
+	"openhashdb/network/types"
 	"openhashdb/protobuf/pb"
 )
 
@@ -85,6 +86,18 @@ func (pe *PeerExchanger) getPeerListProto() ([]byte, error) {
             continue
         }
         pi := addrInfoToProto(pe.node.Host().Peerstore().PeerInfo(p))
+
+        // Add connection type information
+        connType := pe.node.GetPeerConnectionType(p)
+        switch connType {
+        case types.ConnectionTypeDirect:
+            pi.ConnType = pb.PeerInfo_DIRECT
+        case types.ConnectionTypeRelayed:
+            pi.ConnType = pb.PeerInfo_RELAYED
+        default:
+            pi.ConnType = pb.PeerInfo_UNKNOWN
+        }
+
         if pe.node.Host().Network().Connectedness(p) == network.Connected {
             connected = append(connected, pi)
         } else {

@@ -2,7 +2,7 @@
 // versions:
 // 	protoc-gen-go v1.36.7
 // 	protoc        v6.32.0
-// source: protobuf/core.proto
+// source: core.proto
 
 package pb
 
@@ -32,7 +32,7 @@ type Block struct {
 
 func (x *Block) Reset() {
 	*x = Block{}
-	mi := &file_protobuf_core_proto_msgTypes[0]
+	mi := &file_core_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -44,7 +44,7 @@ func (x *Block) String() string {
 func (*Block) ProtoMessage() {}
 
 func (x *Block) ProtoReflect() protoreflect.Message {
-	mi := &file_protobuf_core_proto_msgTypes[0]
+	mi := &file_core_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -57,7 +57,7 @@ func (x *Block) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Block.ProtoReflect.Descriptor instead.
 func (*Block) Descriptor() ([]byte, []int) {
-	return file_protobuf_core_proto_rawDescGZIP(), []int{0}
+	return file_core_proto_rawDescGZIP(), []int{0}
 }
 
 func (x *Block) GetHash() []byte {
@@ -84,7 +84,7 @@ type ChunkInfo struct {
 
 func (x *ChunkInfo) Reset() {
 	*x = ChunkInfo{}
-	mi := &file_protobuf_core_proto_msgTypes[1]
+	mi := &file_core_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -96,7 +96,7 @@ func (x *ChunkInfo) String() string {
 func (*ChunkInfo) ProtoMessage() {}
 
 func (x *ChunkInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_protobuf_core_proto_msgTypes[1]
+	mi := &file_core_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -109,7 +109,7 @@ func (x *ChunkInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChunkInfo.ProtoReflect.Descriptor instead.
 func (*ChunkInfo) Descriptor() ([]byte, []int) {
-	return file_protobuf_core_proto_rawDescGZIP(), []int{1}
+	return file_core_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *ChunkInfo) GetHash() []byte {
@@ -138,7 +138,7 @@ type Link struct {
 
 func (x *Link) Reset() {
 	*x = Link{}
-	mi := &file_protobuf_core_proto_msgTypes[2]
+	mi := &file_core_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -150,7 +150,7 @@ func (x *Link) String() string {
 func (*Link) ProtoMessage() {}
 
 func (x *Link) ProtoReflect() protoreflect.Message {
-	mi := &file_protobuf_core_proto_msgTypes[2]
+	mi := &file_core_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -163,7 +163,7 @@ func (x *Link) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Link.ProtoReflect.Descriptor instead.
 func (*Link) Descriptor() ([]byte, []int) {
-	return file_protobuf_core_proto_rawDescGZIP(), []int{2}
+	return file_core_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *Link) GetName() string {
@@ -203,7 +203,7 @@ type Directory struct {
 
 func (x *Directory) Reset() {
 	*x = Directory{}
-	mi := &file_protobuf_core_proto_msgTypes[3]
+	mi := &file_core_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -215,7 +215,7 @@ func (x *Directory) String() string {
 func (*Directory) ProtoMessage() {}
 
 func (x *Directory) ProtoReflect() protoreflect.Message {
-	mi := &file_protobuf_core_proto_msgTypes[3]
+	mi := &file_core_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -228,7 +228,7 @@ func (x *Directory) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Directory.ProtoReflect.Descriptor instead.
 func (*Directory) Descriptor() ([]byte, []int) {
-	return file_protobuf_core_proto_rawDescGZIP(), []int{3}
+	return file_core_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *Directory) GetLinks() []*Link {
@@ -259,7 +259,7 @@ type ContentMetadata struct {
 
 func (x *ContentMetadata) Reset() {
 	*x = ContentMetadata{}
-	mi := &file_protobuf_core_proto_msgTypes[4]
+	mi := &file_core_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -271,7 +271,7 @@ func (x *ContentMetadata) String() string {
 func (*ContentMetadata) ProtoMessage() {}
 
 func (x *ContentMetadata) ProtoReflect() protoreflect.Message {
-	mi := &file_protobuf_core_proto_msgTypes[4]
+	mi := &file_core_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -284,7 +284,7 @@ func (x *ContentMetadata) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ContentMetadata.ProtoReflect.Descriptor instead.
 func (*ContentMetadata) Descriptor() ([]byte, []int) {
-	return file_protobuf_core_proto_rawDescGZIP(), []int{4}
+	return file_core_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *ContentMetadata) GetHash() []byte {
@@ -378,11 +378,12 @@ func (x *ContentMetadata) GetLinks() []*Link {
 	return nil
 }
 
-var File_protobuf_core_proto protoreflect.FileDescriptor
+var File_core_proto protoreflect.FileDescriptor
 
-const file_protobuf_core_proto_rawDesc = "" +
+const file_core_proto_rawDesc = "" +
 	"\n" +
-	"\x13protobuf/core.proto\x12\acore.pb\x1a\x1fgoogle/protobuf/timestamp.proto\"/\n" +
+	"\n" +
+	"core.proto\x12\acore.pb\x1a\x1fgoogle/protobuf/timestamp.proto\"/\n" +
 	"\x05Block\x12\x12\n" +
 	"\x04hash\x18\x01 \x01(\fR\x04hash\x12\x12\n" +
 	"\x04data\x18\x02 \x01(\fR\x04data\"3\n" +
@@ -415,19 +416,19 @@ const file_protobuf_core_proto_rawDesc = "" +
 	"\x05links\x18\r \x03(\v2\r.core.pb.LinkR\x05linksB\x18Z\x16openhashdb/protobuf/pbb\x06proto3"
 
 var (
-	file_protobuf_core_proto_rawDescOnce sync.Once
-	file_protobuf_core_proto_rawDescData []byte
+	file_core_proto_rawDescOnce sync.Once
+	file_core_proto_rawDescData []byte
 )
 
-func file_protobuf_core_proto_rawDescGZIP() []byte {
-	file_protobuf_core_proto_rawDescOnce.Do(func() {
-		file_protobuf_core_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_protobuf_core_proto_rawDesc), len(file_protobuf_core_proto_rawDesc)))
+func file_core_proto_rawDescGZIP() []byte {
+	file_core_proto_rawDescOnce.Do(func() {
+		file_core_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_core_proto_rawDesc), len(file_core_proto_rawDesc)))
 	})
-	return file_protobuf_core_proto_rawDescData
+	return file_core_proto_rawDescData
 }
 
-var file_protobuf_core_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
-var file_protobuf_core_proto_goTypes = []any{
+var file_core_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
+var file_core_proto_goTypes = []any{
 	(*Block)(nil),                 // 0: core.pb.Block
 	(*ChunkInfo)(nil),             // 1: core.pb.ChunkInfo
 	(*Link)(nil),                  // 2: core.pb.Link
@@ -435,7 +436,7 @@ var file_protobuf_core_proto_goTypes = []any{
 	(*ContentMetadata)(nil),       // 4: core.pb.ContentMetadata
 	(*timestamppb.Timestamp)(nil), // 5: google.protobuf.Timestamp
 }
-var file_protobuf_core_proto_depIdxs = []int32{
+var file_core_proto_depIdxs = []int32{
 	2, // 0: core.pb.Directory.links:type_name -> core.pb.Link
 	5, // 1: core.pb.ContentMetadata.mod_time:type_name -> google.protobuf.Timestamp
 	5, // 2: core.pb.ContentMetadata.created_at:type_name -> google.protobuf.Timestamp
@@ -448,26 +449,26 @@ var file_protobuf_core_proto_depIdxs = []int32{
 	0, // [0:5] is the sub-list for field type_name
 }
 
-func init() { file_protobuf_core_proto_init() }
-func file_protobuf_core_proto_init() {
-	if File_protobuf_core_proto != nil {
+func init() { file_core_proto_init() }
+func file_core_proto_init() {
+	if File_core_proto != nil {
 		return
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_protobuf_core_proto_rawDesc), len(file_protobuf_core_proto_rawDesc)),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_core_proto_rawDesc), len(file_core_proto_rawDesc)),
 			NumEnums:      0,
 			NumMessages:   5,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
-		GoTypes:           file_protobuf_core_proto_goTypes,
-		DependencyIndexes: file_protobuf_core_proto_depIdxs,
-		MessageInfos:      file_protobuf_core_proto_msgTypes,
+		GoTypes:           file_core_proto_goTypes,
+		DependencyIndexes: file_core_proto_depIdxs,
+		MessageInfos:      file_core_proto_msgTypes,
 	}.Build()
-	File_protobuf_core_proto = out.File
-	file_protobuf_core_proto_goTypes = nil
-	file_protobuf_core_proto_depIdxs = nil
+	File_core_proto = out.File
+	file_core_proto_goTypes = nil
+	file_core_proto_depIdxs = nil
 }

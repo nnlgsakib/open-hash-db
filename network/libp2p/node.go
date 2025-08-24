@@ -8,12 +8,14 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"openhashdb/core/blockstore"
 	"openhashdb/core/hasher"
 	"openhashdb/network/bitswap"
+	"openhashdb/network/types"
 	"openhashdb/protobuf/pb"
 
 	"github.com/ipfs/go-cid"
@@ -60,6 +62,25 @@ type Node struct {
     // reservedRelays tracks relays (and their addrs) we have active v2 reservations with
     reservedRelays   map[peer.ID]*reservedRelayEntry
     reservedRelaysMu sync.RWMutex
+}
+
+// GetPeerConnectionType determines if the connection to a peer is direct or relayed.
+func (n *Node) GetPeerConnectionType(p peer.ID) types.ConnectionType {
+	conns := n.host.Network().ConnsToPeer(p)
+	if len(conns) == 0 {
+		return types.ConnectionTypeUnknown
+	}
+
+	// Check for any direct connection. If one exists, we classify the peer as directly connected.
+	for _, conn := range conns {
+		// A relayed connection will have a 'p2p-circuit' component in its multiaddress.
+		if !strings.Contains(conn.RemoteMultiaddr().String(), "p2p-circuit") {
+			return types.ConnectionTypeDirect
+		}
+	}
+
+	// If we have connections, but all of them are relayed.
+	return types.ConnectionTypeRelayed
 }
 
 type reservedRelayEntry struct {

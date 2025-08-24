@@ -2,7 +2,7 @@
 // versions:
 // 	protoc-gen-go v1.36.7
 // 	protoc        v6.32.0
-// source: protobuf/network.proto
+// source: network.proto
 
 package pb
 
@@ -22,6 +22,55 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+type PeerInfo_ConnectionType int32
+
+const (
+	PeerInfo_UNKNOWN PeerInfo_ConnectionType = 0
+	PeerInfo_DIRECT  PeerInfo_ConnectionType = 1
+	PeerInfo_RELAYED PeerInfo_ConnectionType = 2
+)
+
+// Enum value maps for PeerInfo_ConnectionType.
+var (
+	PeerInfo_ConnectionType_name = map[int32]string{
+		0: "UNKNOWN",
+		1: "DIRECT",
+		2: "RELAYED",
+	}
+	PeerInfo_ConnectionType_value = map[string]int32{
+		"UNKNOWN": 0,
+		"DIRECT":  1,
+		"RELAYED": 2,
+	}
+)
+
+func (x PeerInfo_ConnectionType) Enum() *PeerInfo_ConnectionType {
+	p := new(PeerInfo_ConnectionType)
+	*p = x
+	return p
+}
+
+func (x PeerInfo_ConnectionType) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (PeerInfo_ConnectionType) Descriptor() protoreflect.EnumDescriptor {
+	return file_network_proto_enumTypes[0].Descriptor()
+}
+
+func (PeerInfo_ConnectionType) Type() protoreflect.EnumType {
+	return &file_network_proto_enumTypes[0]
+}
+
+func (x PeerInfo_ConnectionType) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use PeerInfo_ConnectionType.Descriptor instead.
+func (PeerInfo_ConnectionType) EnumDescriptor() ([]byte, []int) {
+	return file_network_proto_rawDescGZIP(), []int{1, 0}
+}
+
 type ContentAnnouncement struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Hash          []byte                 `protobuf:"bytes,1,opt,name=hash,proto3" json:"hash,omitempty"`
@@ -34,7 +83,7 @@ type ContentAnnouncement struct {
 
 func (x *ContentAnnouncement) Reset() {
 	*x = ContentAnnouncement{}
-	mi := &file_protobuf_network_proto_msgTypes[0]
+	mi := &file_network_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -46,7 +95,7 @@ func (x *ContentAnnouncement) String() string {
 func (*ContentAnnouncement) ProtoMessage() {}
 
 func (x *ContentAnnouncement) ProtoReflect() protoreflect.Message {
-	mi := &file_protobuf_network_proto_msgTypes[0]
+	mi := &file_network_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -59,7 +108,7 @@ func (x *ContentAnnouncement) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ContentAnnouncement.ProtoReflect.Descriptor instead.
 func (*ContentAnnouncement) Descriptor() ([]byte, []int) {
-	return file_protobuf_network_proto_rawDescGZIP(), []int{0}
+	return file_network_proto_rawDescGZIP(), []int{0}
 }
 
 func (x *ContentAnnouncement) GetHash() []byte {
@@ -91,16 +140,17 @@ func (x *ContentAnnouncement) GetPeerId() string {
 }
 
 type PeerInfo struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
-	Addrs         []string               `protobuf:"bytes,2,rep,name=addrs,proto3" json:"addrs,omitempty"`
+	state         protoimpl.MessageState  `protogen:"open.v1"`
+	Id            string                  `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	Addrs         []string                `protobuf:"bytes,2,rep,name=addrs,proto3" json:"addrs,omitempty"`
+	ConnType      PeerInfo_ConnectionType `protobuf:"varint,3,opt,name=conn_type,json=connType,proto3,enum=network.pb.PeerInfo_ConnectionType" json:"conn_type,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *PeerInfo) Reset() {
 	*x = PeerInfo{}
-	mi := &file_protobuf_network_proto_msgTypes[1]
+	mi := &file_network_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -112,7 +162,7 @@ func (x *PeerInfo) String() string {
 func (*PeerInfo) ProtoMessage() {}
 
 func (x *PeerInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_protobuf_network_proto_msgTypes[1]
+	mi := &file_network_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -125,7 +175,7 @@ func (x *PeerInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PeerInfo.ProtoReflect.Descriptor instead.
 func (*PeerInfo) Descriptor() ([]byte, []int) {
-	return file_protobuf_network_proto_rawDescGZIP(), []int{1}
+	return file_network_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *PeerInfo) GetId() string {
@@ -142,6 +192,13 @@ func (x *PeerInfo) GetAddrs() []string {
 	return nil
 }
 
+func (x *PeerInfo) GetConnType() PeerInfo_ConnectionType {
+	if x != nil {
+		return x.ConnType
+	}
+	return PeerInfo_UNKNOWN
+}
+
 type PeerInfoList struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Peers         []*PeerInfo            `protobuf:"bytes,1,rep,name=peers,proto3" json:"peers,omitempty"`
@@ -151,7 +208,7 @@ type PeerInfoList struct {
 
 func (x *PeerInfoList) Reset() {
 	*x = PeerInfoList{}
-	mi := &file_protobuf_network_proto_msgTypes[2]
+	mi := &file_network_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -163,7 +220,7 @@ func (x *PeerInfoList) String() string {
 func (*PeerInfoList) ProtoMessage() {}
 
 func (x *PeerInfoList) ProtoReflect() protoreflect.Message {
-	mi := &file_protobuf_network_proto_msgTypes[2]
+	mi := &file_network_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -176,7 +233,7 @@ func (x *PeerInfoList) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PeerInfoList.ProtoReflect.Descriptor instead.
 func (*PeerInfoList) Descriptor() ([]byte, []int) {
-	return file_protobuf_network_proto_rawDescGZIP(), []int{2}
+	return file_network_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *PeerInfoList) GetPeers() []*PeerInfo {
@@ -186,72 +243,82 @@ func (x *PeerInfoList) GetPeers() []*PeerInfo {
 	return nil
 }
 
-var File_protobuf_network_proto protoreflect.FileDescriptor
+var File_network_proto protoreflect.FileDescriptor
 
-const file_protobuf_network_proto_rawDesc = "" +
+const file_network_proto_rawDesc = "" +
 	"\n" +
-	"\x16protobuf/network.proto\x12\n" +
+	"\rnetwork.proto\x12\n" +
 	"network.pb\x1a\x1fgoogle/protobuf/timestamp.proto\"\x90\x01\n" +
 	"\x13ContentAnnouncement\x12\x12\n" +
 	"\x04hash\x18\x01 \x01(\fR\x04hash\x12\x12\n" +
 	"\x04size\x18\x02 \x01(\x03R\x04size\x128\n" +
 	"\ttimestamp\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12\x17\n" +
-	"\apeer_id\x18\x04 \x01(\tR\x06peerId\"0\n" +
+	"\apeer_id\x18\x04 \x01(\tR\x06peerId\"\xaa\x01\n" +
 	"\bPeerInfo\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x14\n" +
-	"\x05addrs\x18\x02 \x03(\tR\x05addrs\":\n" +
+	"\x05addrs\x18\x02 \x03(\tR\x05addrs\x12@\n" +
+	"\tconn_type\x18\x03 \x01(\x0e2#.network.pb.PeerInfo.ConnectionTypeR\bconnType\"6\n" +
+	"\x0eConnectionType\x12\v\n" +
+	"\aUNKNOWN\x10\x00\x12\n" +
+	"\n" +
+	"\x06DIRECT\x10\x01\x12\v\n" +
+	"\aRELAYED\x10\x02\":\n" +
 	"\fPeerInfoList\x12*\n" +
 	"\x05peers\x18\x01 \x03(\v2\x14.network.pb.PeerInfoR\x05peersB\x18Z\x16openhashdb/protobuf/pbb\x06proto3"
 
 var (
-	file_protobuf_network_proto_rawDescOnce sync.Once
-	file_protobuf_network_proto_rawDescData []byte
+	file_network_proto_rawDescOnce sync.Once
+	file_network_proto_rawDescData []byte
 )
 
-func file_protobuf_network_proto_rawDescGZIP() []byte {
-	file_protobuf_network_proto_rawDescOnce.Do(func() {
-		file_protobuf_network_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_protobuf_network_proto_rawDesc), len(file_protobuf_network_proto_rawDesc)))
+func file_network_proto_rawDescGZIP() []byte {
+	file_network_proto_rawDescOnce.Do(func() {
+		file_network_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_network_proto_rawDesc), len(file_network_proto_rawDesc)))
 	})
-	return file_protobuf_network_proto_rawDescData
+	return file_network_proto_rawDescData
 }
 
-var file_protobuf_network_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
-var file_protobuf_network_proto_goTypes = []any{
-	(*ContentAnnouncement)(nil),   // 0: network.pb.ContentAnnouncement
-	(*PeerInfo)(nil),              // 1: network.pb.PeerInfo
-	(*PeerInfoList)(nil),          // 2: network.pb.PeerInfoList
-	(*timestamppb.Timestamp)(nil), // 3: google.protobuf.Timestamp
+var file_network_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
+var file_network_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
+var file_network_proto_goTypes = []any{
+	(PeerInfo_ConnectionType)(0),  // 0: network.pb.PeerInfo.ConnectionType
+	(*ContentAnnouncement)(nil),   // 1: network.pb.ContentAnnouncement
+	(*PeerInfo)(nil),              // 2: network.pb.PeerInfo
+	(*PeerInfoList)(nil),          // 3: network.pb.PeerInfoList
+	(*timestamppb.Timestamp)(nil), // 4: google.protobuf.Timestamp
 }
-var file_protobuf_network_proto_depIdxs = []int32{
-	3, // 0: network.pb.ContentAnnouncement.timestamp:type_name -> google.protobuf.Timestamp
-	1, // 1: network.pb.PeerInfoList.peers:type_name -> network.pb.PeerInfo
-	2, // [2:2] is the sub-list for method output_type
-	2, // [2:2] is the sub-list for method input_type
-	2, // [2:2] is the sub-list for extension type_name
-	2, // [2:2] is the sub-list for extension extendee
-	0, // [0:2] is the sub-list for field type_name
+var file_network_proto_depIdxs = []int32{
+	4, // 0: network.pb.ContentAnnouncement.timestamp:type_name -> google.protobuf.Timestamp
+	0, // 1: network.pb.PeerInfo.conn_type:type_name -> network.pb.PeerInfo.ConnectionType
+	2, // 2: network.pb.PeerInfoList.peers:type_name -> network.pb.PeerInfo
+	3, // [3:3] is the sub-list for method output_type
+	3, // [3:3] is the sub-list for method input_type
+	3, // [3:3] is the sub-list for extension type_name
+	3, // [3:3] is the sub-list for extension extendee
+	0, // [0:3] is the sub-list for field type_name
 }
 
-func init() { file_protobuf_network_proto_init() }
-func file_protobuf_network_proto_init() {
-	if File_protobuf_network_proto != nil {
+func init() { file_network_proto_init() }
+func file_network_proto_init() {
+	if File_network_proto != nil {
 		return
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_protobuf_network_proto_rawDesc), len(file_protobuf_network_proto_rawDesc)),
-			NumEnums:      0,
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_network_proto_rawDesc), len(file_network_proto_rawDesc)),
+			NumEnums:      1,
 			NumMessages:   3,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
-		GoTypes:           file_protobuf_network_proto_goTypes,
-		DependencyIndexes: file_protobuf_network_proto_depIdxs,
-		MessageInfos:      file_protobuf_network_proto_msgTypes,
+		GoTypes:           file_network_proto_goTypes,
+		DependencyIndexes: file_network_proto_depIdxs,
+		EnumInfos:         file_network_proto_enumTypes,
+		MessageInfos:      file_network_proto_msgTypes,
 	}.Build()
-	File_protobuf_network_proto = out.File
-	file_protobuf_network_proto_goTypes = nil
-	file_protobuf_network_proto_depIdxs = nil
+	File_network_proto = out.File
+	file_network_proto_goTypes = nil
+	file_network_proto_depIdxs = nil
 }

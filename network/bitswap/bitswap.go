@@ -13,6 +13,7 @@ import (
 	"openhashdb/core/block"
 	"openhashdb/core/blockstore"
 	"openhashdb/core/hasher"
+	"openhashdb/network/types"
 	"openhashdb/protobuf/pb"
 
 	"github.com/google/uuid"
@@ -33,28 +34,34 @@ const (
 
 // Engine is the main bitswap engine.
 type Engine struct {
-	host        host.Host
-	blockstore  *blockstore.Blockstore
-	wantlist    *WantlistManager
-	peers       map[peer.ID]*peerLedger
-	downloadMgr *DownloadManager
-	mu          sync.RWMutex
-	ctx         context.Context
-	cancel      context.CancelFunc
+	host               host.Host
+	node               types.NodeConnector // Reference to the libp2p node for connection info
+	blockstore         *blockstore.Blockstore
+	wantlist           *WantlistManager
+	peers              map[peer.ID]*peerLedger
+	downloadMgr        *DownloadManager
+	delegatedFetches   map[hasher.Hash]peer.ID
+	delegatedFetchesMu sync.Mutex
+	mu                 sync.RWMutex
+	ctx                context.Context
+	cancel             context.CancelFunc
 }
 
 // NewEngine creates a new bitswap engine.
-func NewEngine(ctx context.Context, h host.Host, bs *blockstore.Blockstore) *Engine {
+func NewEngine(ctx context.Context, h host.Host, node types.NodeConnector, bs *blockstore.Blockstore) *Engine {
 	ctx, cancel := context.WithCancel(ctx)
 	e := &Engine{
-		host:        h,
-		blockstore:  bs,
-		wantlist:    NewWantlistManager(),
-		peers:       make(map[peer.ID]*peerLedger),
-		downloadMgr: NewDownloadManager(),
-		ctx:         ctx,
-		cancel:      cancel,
+		host:             h,
+		node:             node,
+		blockstore:       bs,
+		wantlist:         NewWantlistManager(),
+		peers:            make(map[peer.ID]*peerLedger),
+		downloadMgr:      NewDownloadManager(),
+		delegatedFetches: make(map[hasher.Hash]peer.ID),
+		ctx:              ctx,
+		cancel:           cancel,
 	}
+	e.downloadMgr.engine = e // Give download manager a reference to the engine
 	h.SetStreamHandler(ProtocolBitswap, e.handleNewStream)
 	go e.periodicWantlistBroadcast()
 	return e
@@ -156,19 +163,149 @@ func (e *Engine) downloadWorker(session *DownloadSession, wg *sync.WaitGroup) {
 			return // No more blocks to download
 		}
 
-        // Wait for providers as long as the session is alive; heartbeat governs liveness
-        peer, err := session.WaitForProvider(session.ctx, hash)
+		// This loop will implement the strategy for a single hash
+		fetchAttemptCtx, cancelAttempt := context.WithTimeout(session.ctx, providerSearchTimeout)
 
+		_, err := e.fetchBlockWithStrategy(fetchAttemptCtx, hash, session)
 		if err != nil {
-			log.Printf("[Bitswap Worker] Could not find provider for block %s: %v", hash, err)
-			session.RequeueWant(hash) // Re-queue to try again later
-			time.Sleep(1 * time.Second)
+			log.Printf("[Bitswap Worker] Failed to fetch block %s with strategy: %v. Re-queuing.", hash, err)
+			session.RequeueWant(hash)
+			time.Sleep(2 * time.Second) // Backoff before retrying
+			cancelAttempt()
 			continue
 		}
+		cancelAttempt()
 
-		// log.Printf("[Bitswap Worker] Requesting block %s from peer %s", hash, peer)
-		e.sendWantBlockToPeer(peer, hash)
+		// If successful, the block is already in the blockstore and distributed to the session
+		// via handleBlock, so we don't need to do anything else here.
 	}
+}
+
+// fetchBlockWithStrategy implements the core logic for finding and fetching a block.
+func (e *Engine) fetchBlockWithStrategy(ctx context.Context, hash hasher.Hash, session *DownloadSession) (block.Block, error) {
+	// 1. Find providers
+	providers := e.findProvidersForHash(ctx, hash, session)
+	if len(providers) == 0 {
+		return nil, fmt.Errorf("no providers found for %s", hash)
+	}
+
+	// 2. Categorize providers
+	directPeers, relayedPeers := e.categorizeProviders(providers)
+	allConnectedDirectPeers := e.getDirectlyConnectedPeers(e.node.ConnectedPeers())
+
+	// STRATEGY 1: DIRECT FETCH
+	log.Printf("[Bitswap Strategy] %s: Trying %d direct peers.", hash, len(directPeers))
+	if len(directPeers) > 0 {
+		for _, p := range directPeers {
+			e.sendWantBlockToPeer(p, hash)
+		}
+		// Wait for a bit to see if the block arrives
+		if blk, err := session.WaitForBlock(ctx, hash, 5*time.Second); err == nil {
+			log.Printf("[Bitswap Strategy] %s: Success from direct peer.", hash)
+			return blk, nil
+		}
+	}
+
+	// STRATEGY 2: DELEGATED FETCH
+	log.Printf("[Bitswap Strategy] %s: Trying delegated fetch via %d direct peers to %d relayed peers.", hash, len(allConnectedDirectPeers), len(relayedPeers))
+	if len(relayedPeers) > 0 && len(allConnectedDirectPeers) > 0 {
+		// Simple delegation: ask the first available direct peer to fetch from the first available relayed provider.
+		delegate := allConnectedDirectPeers[0]
+		target := relayedPeers[0]
+		log.Printf("[Bitswap Strategy] %s: Delegating fetch to %s to get from %s", hash, delegate, target)
+		e.sendDelegatedFetchRequestToPeer(delegate, target, hash)
+
+		// Wait a bit longer for delegated fetch
+		if blk, err := session.WaitForBlock(ctx, hash, 15*time.Second); err == nil {
+			log.Printf("[Bitswap Strategy] %s: Success from delegated fetch.", hash)
+			return blk, nil
+		}
+	}
+
+	// STRATEGY 3: RELAYED FETCH (FALLBACK)
+	log.Printf("[Bitswap Strategy] %s: Trying %d relayed peers as a fallback.", hash, len(relayedPeers))
+	if len(relayedPeers) > 0 {
+		for _, p := range relayedPeers {
+			e.sendWantBlockToPeer(p, hash)
+		}
+		// Wait even longer for relayed fetch
+		if blk, err := session.WaitForBlock(ctx, hash, 30*time.Second); err == nil {
+			log.Printf("[Bitswap Strategy] %s: Success from relayed peer.", hash)
+			return blk, nil
+		}
+	}
+
+	return nil, fmt.Errorf("all fetch strategies failed for %s", hash)
+}
+
+func (e *Engine) findProvidersForHash(ctx context.Context, h hasher.Hash, session *DownloadSession) []peer.ID {
+	var providers []peer.ID
+	provChan := make(chan peer.ID, 10)
+	var wg sync.WaitGroup
+
+	// Goroutine to gather providers from the session
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			// Use a non-blocking read on the provider channel for this hash
+			select {
+			case p, ok := <-session.provChans[h]:
+				if !ok {
+					return
+				}
+				provChan <- p
+			case <-ctx.Done():
+				return
+			default:
+				// If no provider is immediately available, exit the loop.
+				// New providers will trigger the have/want logic again.
+				return
+			}
+		}
+	}()
+
+	// Wait for the initial set of providers to be gathered
+	wg.Wait()
+	close(provChan)
+
+	for p := range provChan {
+		providers = append(providers, p)
+	}
+	return providers
+}
+
+func (e *Engine) categorizeProviders(providers []peer.ID) (direct, relayed []peer.ID) {
+	for _, p := range providers {
+		if e.node.GetPeerConnectionType(p) == types.ConnectionTypeDirect {
+			direct = append(direct, p)
+		} else {
+			relayed = append(relayed, p)
+		}
+	}
+	return
+}
+
+func (e *Engine) getDirectlyConnectedPeers(peers []peer.ID) []peer.ID {
+	var directPeers []peer.ID
+	for _, p := range peers {
+		if e.node.GetPeerConnectionType(p) == types.ConnectionTypeDirect {
+			directPeers = append(directPeers, p)
+		}
+	}
+	return directPeers
+}
+
+func (e *Engine) sendDelegatedFetchRequestToPeer(delegate peer.ID, target peer.ID, h hasher.Hash) {
+	req := &pb.Message_DelegatedFetchRequest{
+		Hash:            h[:],
+		TargetPeerId:    target.String(),
+		RequestorPeerId: e.host.ID().String(),
+	}
+	msg := &pb.Message{
+		DelegatedRequests: []*pb.Message_DelegatedFetchRequest{req},
+	}
+	e.sendMessage(delegate, msg)
 }
 
 // handleNewStream handles incoming bitswap streams.
@@ -212,6 +349,44 @@ func (e *Engine) handleNewStream(s network.Stream) {
 		if len(msg.BlockPresences) > 0 {
 			go e.handleIncomingPresences(msg.BlockPresences, remotePeer)
 		}
+		if len(msg.DelegatedRequests) > 0 {
+			go e.handleDelegatedFetchRequests(remotePeer, msg.DelegatedRequests)
+		}
+	}
+}
+
+func (e *Engine) handleDelegatedFetchRequests(requestor peer.ID, reqs []*pb.Message_DelegatedFetchRequest) {
+	for _, req := range reqs {
+		targetPeerID, err := peer.Decode(req.TargetPeerId)
+		if err != nil {
+			log.Printf("[Bitswap] Invalid target peer ID in delegated request from %s: %v", requestor, err)
+			continue
+		}
+		hash, err := hasher.HashFromBytes(req.Hash)
+		if err != nil {
+			log.Printf("[Bitswap] Invalid hash in delegated request from %s: %v", requestor, err)
+			continue
+		}
+
+		log.Printf("[Bitswap] Received delegated fetch request from %s to get block %s from %s", requestor, hash, targetPeerID)
+
+		// Track that this hash is for the original requestor.
+		e.delegatedFetchesMu.Lock()
+		e.delegatedFetches[hash] = requestor
+		e.delegatedFetchesMu.Unlock()
+
+		// Set a timeout to clean up the entry if the block never arrives.
+		time.AfterFunc(2*time.Minute, func() {
+			e.delegatedFetchesMu.Lock()
+			// Check if it's still the same requestor before deleting
+			if p, ok := e.delegatedFetches[hash]; ok && p == requestor {
+				delete(e.delegatedFetches, hash)
+			}
+			e.delegatedFetchesMu.Unlock()
+		})
+
+		// This node now acts as a client to get the block from the target.
+		e.sendWantBlockToPeer(targetPeerID, hash)
 	}
 }
 
@@ -222,6 +397,24 @@ func (e *Engine) handleIncomingBlocks(blocks []*pb.Message_Block, remotePeer pee
 			continue
 		}
 		newBlock := block.NewBlockWithHash(hash, b.Data)
+
+		// Check if this is for a delegated fetch
+		e.delegatedFetchesMu.Lock()
+		requestor, isDelegated := e.delegatedFetches[newBlock.Hash()]
+		if isDelegated {
+			delete(e.delegatedFetches, newBlock.Hash())
+		}
+		e.delegatedFetchesMu.Unlock()
+
+		if isDelegated {
+			log.Printf("[Bitswap] Forwarding delegated block %s to original requestor %s", newBlock.Hash(), requestor)
+			// Send the block to the original requestor
+			msg := &pb.Message{
+				Blocks: []*pb.Message_Block{b},
+			}
+			e.sendMessage(requestor, msg)
+		}
+
 		log.Printf("[Bitswap] Received block %s from %s", newBlock.Hash().String(), remotePeer.String())
 		e.blockstore.Put(newBlock)
 		e.wantlist.Remove(newBlock.Hash())
@@ -385,6 +578,7 @@ func (e *Engine) sendMessage(p peer.ID, msg *pb.Message) {
 type DownloadManager struct {
 	sessions map[string]*DownloadSession
 	mu       sync.RWMutex
+	engine   *Engine // Reference back to the engine
 }
 
 func NewDownloadManager() *DownloadManager {
@@ -399,19 +593,21 @@ func (dm *DownloadManager) NewSession(ctx context.Context, hashes []hasher.Hash)
 
 	sessCtx, cancel := context.WithCancel(ctx)
 	s := &DownloadSession{
-		id:         uuid.New().String(),
-		ctx:        sessCtx,
-		cancel:     cancel,
-		wants:      make(chan hasher.Hash, len(hashes)),
-		providers:  make(map[hasher.Hash]map[peer.ID]struct{}),
-		provChans:  make(map[hasher.Hash]chan peer.ID),
-		output:     make(chan block.Block, len(hashes)),
-		doneBlocks: make(map[hasher.Hash]struct{}),
+		id:             uuid.New().String(),
+		ctx:            sessCtx,
+		cancel:         cancel,
+		wants:          make(chan hasher.Hash, len(hashes)),
+		providers:      make(map[hasher.Hash]map[peer.ID]struct{}),
+		provChans:      make(map[hasher.Hash]chan peer.ID, len(hashes)),
+		output:         make(chan block.Block, len(hashes)),
+		doneBlocks:     make(map[hasher.Hash]struct{}),
+		receivedBlocks: make(map[hasher.Hash]block.Block),
+		blockChans:     make(map[hasher.Hash]chan block.Block),
 	}
 
 	for _, h := range hashes {
 		s.wants <- h
-		s.provChans[h] = make(chan peer.ID, 1)
+		s.provChans[h] = make(chan peer.ID, 10) // Increased buffer to hold more providers
 	}
 
 	dm.sessions[s.id] = s
@@ -444,15 +640,17 @@ func (dm *DownloadManager) DistributeHave(h hasher.Hash, p peer.ID) {
 }
 
 type DownloadSession struct {
-	id         string
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wants      chan hasher.Hash
-	providers  map[hasher.Hash]map[peer.ID]struct{}
-	provChans  map[hasher.Hash]chan peer.ID
-	output     chan block.Block
-	doneBlocks map[hasher.Hash]struct{}
-	mu         sync.RWMutex
+	id             string
+	ctx            context.Context
+	cancel         context.CancelFunc
+	wants          chan hasher.Hash
+	providers      map[hasher.Hash]map[peer.ID]struct{}
+	provChans      map[hasher.Hash]chan peer.ID
+	output         chan block.Block
+	doneBlocks     map[hasher.Hash]struct{}
+	receivedBlocks map[hasher.Hash]block.Block      // Cache for received blocks
+	blockChans     map[hasher.Hash]chan block.Block // For specific block waiters
+	mu             sync.RWMutex
 }
 
 func (s *DownloadSession) NextWant() (hasher.Hash, bool) {
@@ -518,6 +716,42 @@ func (s *DownloadSession) WaitForProvider(ctx context.Context, h hasher.Hash) (p
 	}
 }
 
+// WaitForBlock waits for a specific block to be received in the session.
+func (s *DownloadSession) WaitForBlock(ctx context.Context, h hasher.Hash, timeout time.Duration) (block.Block, error) {
+	s.mu.RLock()
+	if blk, ok := s.receivedBlocks[h]; ok {
+		s.mu.RUnlock()
+		return blk, nil
+	}
+	s.mu.RUnlock()
+
+	// If not found, create a channel and wait.
+	ch := make(chan block.Block, 1)
+	s.mu.Lock()
+	// Re-check just in case it arrived between RUnlock and Lock
+	if blk, ok := s.receivedBlocks[h]; ok {
+		s.mu.Unlock()
+		return blk, nil
+	}
+	s.blockChans[h] = ch
+	s.mu.Unlock()
+
+	defer func() {
+		s.mu.Lock()
+		delete(s.blockChans, h)
+		s.mu.Unlock()
+	}()
+
+	select {
+	case blk := <-ch:
+		return blk, nil
+	case <-time.After(timeout):
+		return nil, fmt.Errorf("timeout waiting for block %s", h)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 func (s *DownloadSession) handleBlock(b block.Block) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -526,13 +760,27 @@ func (s *DownloadSession) handleBlock(b block.Block) {
 		return // Already handled this block
 	}
 
-	// Check if the block is part of this session by checking the provider chans map
-	if _, ok := s.provChans[b.Hash()]; ok {
-		s.doneBlocks[b.Hash()] = struct{}{}
+	// Check if the block is wanted by this session
+	if _, ok := s.provChans[b.Hash()]; !ok {
+		return
+	}
+
+	s.receivedBlocks[b.Hash()] = b
+	s.doneBlocks[b.Hash()] = struct{}{}
+
+	// Notify any specific waiters
+	if ch, ok := s.blockChans[b.Hash()]; ok {
 		select {
-		case s.output <- b:
-		case <-s.ctx.Done():
+		case ch <- b:
+		default:
 		}
+		// The waiter is responsible for removing the channel from the map.
+	}
+
+	// Send to general output channel
+	select {
+	case s.output <- b:
+	case <-s.ctx.Done():
 	}
 }
 
@@ -593,8 +841,8 @@ func newPeerLedger(p peer.ID, ctx context.Context, h host.Host) *peerLedger {
 }
 
 func (pl *peerLedger) sender(ctx context.Context, h host.Host) {
-    var stream network.Stream
-    var writer *bufio.Writer
+	var stream network.Stream
+	var writer *bufio.Writer
 
 	defer func() {
 		if stream != nil {
@@ -604,12 +852,12 @@ func (pl *peerLedger) sender(ctx context.Context, h host.Host) {
 
 	for {
 		select {
-        case msg := <-pl.outgoing:
-            var err error
-            if stream == nil {
-                log.Printf("[Bitswap Sender] Opening new stream to peer %s", pl.peer)
-                // Allow opening a stream over limited connections (e.g. relayed)
-                stream, err = h.NewStream(network.WithAllowLimitedConn(ctx, "bitswap"), pl.peer, ProtocolBitswap)
+		case msg := <-pl.outgoing:
+			var err error
+			if stream == nil {
+				log.Printf("[Bitswap Sender] Opening new stream to peer %s", pl.peer)
+				// Allow opening a stream over limited connections (e.g. relayed)
+				stream, err = h.NewStream(network.WithAllowLimitedConn(ctx, "bitswap"), pl.peer, ProtocolBitswap)
 
 				if err != nil {
 					log.Printf("[Bitswap Sender] Failed to open stream to %s: %v", pl.peer, err)
@@ -636,14 +884,14 @@ func (pl *peerLedger) sender(ctx context.Context, h host.Host) {
 				err = writer.Flush()
 			}
 
-            if err != nil {
-                log.Printf("[Bitswap Sender] Failed to send message to %s: %v", pl.peer, err)
-                stream.Reset()
-                stream = nil
-                writer = nil
-            } else {
-                pl.BytesSent(uint64(len(data)))
-            }
+			if err != nil {
+				log.Printf("[Bitswap Sender] Failed to send message to %s: %v", pl.peer, err)
+				stream.Reset()
+				stream = nil
+				writer = nil
+			} else {
+				pl.BytesSent(uint64(len(data)))
+			}
 
 		case <-pl.done:
 			return

@@ -337,7 +337,7 @@ func initAll() error {
 	node.SetBlockstore(bs) // Set the blockstore on the node
 
 	// Initialize Bitswap Engine
-	bitswapEngine := bitswap.NewEngine(ctx, node.Host(), bs)
+	bitswapEngine := bitswap.NewEngine(ctx, node.Host(), node, bs)
 	node.SetBitswap(bitswapEngine)
 
 	// Initialize replicator
