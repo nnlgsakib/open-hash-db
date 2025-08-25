@@ -177,6 +177,12 @@ func (r *Replicator) handleContentAnnouncement(peerID peer.ID, announcement *pb.
 		return nil
 	}
 
+	// Don't process our own announcements that are echoed back to us
+	announcerID, err := peer.Decode(announcement.PeerId)
+	if err == nil && announcerID == r.node.ID() {
+		return nil
+	}
+
 	r.mu.Lock()
 	if _, ongoing := r.replicatingNow[h.String()]; ongoing {
 		r.mu.Unlock()
@@ -200,7 +206,15 @@ func (r *Replicator) handleContentAnnouncement(peerID peer.ID, announcement *pb.
 		return nil
 	}
 
-	if len(providers) >= int(r.replicationFactor) {
+	// Filter out self from providers list before checking replication factor
+	var externalProviders []peer.AddrInfo
+	for _, p := range providers {
+		if p.ID != r.node.ID() {
+			externalProviders = append(externalProviders, p)
+		}
+	}
+
+	if len(externalProviders) >= int(r.replicationFactor) {
 		return nil
 	}
 

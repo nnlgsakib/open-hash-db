@@ -216,16 +216,19 @@ func (e *Engine) fetchBlockWithStrategy(ctx context.Context, hash hasher.Hash, s
 	// STRATEGY 2: DELEGATED FETCH
 	log.Printf("[Bitswap Strategy] %s: Trying delegated fetch via %d direct peers to %d relayed peers.", hash, len(allConnectedDirectPeers), len(relayedPeers))
 	if len(relayedPeers) > 0 && len(allConnectedDirectPeers) > 0 {
-		// Simple delegation: ask the first available direct peer to fetch from the first available relayed provider.
-		delegate := allConnectedDirectPeers[0]
-		target := relayedPeers[0]
-		log.Printf("[Bitswap Strategy] %s: Delegating fetch to %s to get from %s", hash, delegate, target)
-		e.sendDelegatedFetchRequestToPeer(delegate, target, hash)
+		// Iterate through all connected direct peers as potential delegates
+		for _, delegate := range allConnectedDirectPeers {
+			// A more advanced strategy could iterate targets too, but for now, ask each delegate to fetch from the first target.
+			target := relayedPeers[0]
+			log.Printf("[Bitswap Strategy] %s: Delegating fetch to %s to get from %s", hash, delegate, target)
+			e.sendDelegatedFetchRequestToPeer(delegate, target, hash)
 
-		// Wait a bit longer for delegated fetch
-		if blk, err := session.WaitForBlock(ctx, hash, 15*time.Second); err == nil {
-			log.Printf("[Bitswap Strategy] %s: Success from delegated fetch.", hash)
-			return blk, nil
+			// Wait for a short time to see if this delegate succeeds
+			if blk, err := session.WaitForBlock(ctx, hash, 10*time.Second); err == nil {
+				log.Printf("[Bitswap Strategy] %s: Success from delegated fetch via %s.", hash, delegate)
+				return blk, nil
+			}
+			log.Printf("[Bitswap Strategy] %s: Delegate %s did not return block in time, trying next.", hash, delegate)
 		}
 	}
 
@@ -425,7 +428,7 @@ func (e *Engine) handleIncomingBlocks(blocks []*pb.Message_Block, remotePeer pee
 		log.Printf("[Bitswap] Received block %s from %s", newBlock.Hash().String(), remotePeer.String())
 		e.blockstore.Put(newBlock)
 		e.wantlist.Remove(newBlock.Hash())
-		e.downloadMgr.DistributeBlock(newBlock)
+		e.downloadMgr.DistributeBlock(newBlock, remotePeer)
 	}
 }
 
@@ -630,11 +633,11 @@ func (dm *DownloadManager) CloseSession(id string) {
 	}
 }
 
-func (dm *DownloadManager) DistributeBlock(b block.Block) {
+func (dm *DownloadManager) DistributeBlock(b block.Block, p peer.ID) {
 	dm.mu.RLock()
 	defer dm.mu.RUnlock()
 	for _, s := range dm.sessions {
-		s.handleBlock(b)
+		s.handleBlock(b, p)
 	}
 }
 
@@ -759,7 +762,7 @@ func (s *DownloadSession) WaitForBlock(ctx context.Context, h hasher.Hash, timeo
 	}
 }
 
-func (s *DownloadSession) handleBlock(b block.Block) {
+func (s *DownloadSession) handleBlock(b block.Block, p peer.ID) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -774,6 +777,17 @@ func (s *DownloadSession) handleBlock(b block.Block) {
 
 	s.receivedBlocks[b.Hash()] = b
 	s.doneBlocks[b.Hash()] = struct{}{}
+
+	// Assume this provider has the other blocks in the session too.
+	// This avoids needing to broadcast for every block.
+	for h, ch := range s.provChans {
+		if _, done := s.doneBlocks[h]; !done {
+			select {
+			case ch <- p: // Add provider hint
+			default:
+			}
+		}
+	}
 
 	// Notify any specific waiters
 	if ch, ok := s.blockChans[b.Hash()]; ok {
