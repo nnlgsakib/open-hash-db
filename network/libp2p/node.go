@@ -673,13 +673,10 @@ func (n *Node) AnnounceContent(contentHashStr string) error {
 }
 
 // FindContentProviders finds content providers
-func (n *Node) FindContentProviders(contentHash string) ([]peer.AddrInfo, error) {
+func (n *Node) FindContentProviders(ctx context.Context, contentHash string) ([]peer.AddrInfo, error) {
 	if n.dht == nil {
 		return nil, fmt.Errorf("[libp2p] DHT not initialized")
 	}
-
-	ctx, cancel := context.WithTimeout(n.ctx, 2*time.Minute)
-	defer cancel()
 
 	hash, err := multihash.FromHexString(contentHash)
 	if err != nil {

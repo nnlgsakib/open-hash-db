@@ -282,6 +282,26 @@ func (e *Engine) findProvidersForHash(ctx context.Context, h hasher.Hash, sessio
 	for p := range provChan {
 		providers = append(providers, p)
 	}
+
+	// If no providers found from session, query the DHT
+	if len(providers) == 0 {
+		log.Printf("[Bitswap] No providers found in session for %s, querying DHT.", h)
+		dhtProviders, err := e.node.FindContentProviders(ctx, h.String())
+		if err != nil {
+			log.Printf("[Bitswap] Error finding providers from DHT for %s: %v", h, err)
+			// Return empty list, the worker will re-queue
+		} else {
+			log.Printf("[Bitswap] Found %d providers from DHT for %s.", len(dhtProviders), h)
+			for _, p := range dhtProviders {
+				// Don't add self to the list of providers to fetch from,
+				// as GetBlock should have already checked the local blockstore.
+				if p.ID != e.host.ID() {
+					providers = append(providers, p.ID)
+				}
+			}
+		}
+	}
+
 	return providers
 }
 

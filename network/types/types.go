@@ -1,6 +1,9 @@
 package types
 
-import "github.com/libp2p/go-libp2p/core/peer"
+import (
+	"context"
+	"github.com/libp2p/go-libp2p/core/peer"
+)
 
 // ConnectionType classifies how a peer is connected.
 type ConnectionType int
@@ -9,7 +12,7 @@ const (
 	// ConnectionTypeUnknown means the connection type is undetermined.
 	ConnectionTypeUnknown ConnectionType = 0
 	// ConnectionTypeDirect means a direct TCP or QUIC connection.
-	ConnectionTypeDirect  ConnectionType = 1
+	ConnectionTypeDirect ConnectionType = 1
 	// ConnectionTypeRelayed means the connection is routed through a circuit relay.
 	ConnectionTypeRelayed ConnectionType = 2
 )
@@ -19,4 +22,6 @@ const (
 type NodeConnector interface {
 	GetPeerConnectionType(p peer.ID) ConnectionType
 	ConnectedPeers() []peer.ID
+	FindContentProviders(ctx context.Context, contentID string) ([]peer.AddrInfo, error)
+	ID() peer.ID
 }

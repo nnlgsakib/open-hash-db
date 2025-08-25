@@ -201,7 +201,7 @@ func (r *Replicator) handleContentAnnouncement(peerID peer.ID, announcement *pb.
 		return nil
 	}
 
-	providers, err := r.node.FindContentProviders(h.String())
+	providers, err := r.node.FindContentProviders(r.ctx, h.String())
 	if err != nil {
 		return nil
 	}
