@@ -163,6 +163,13 @@ func (e *Engine) downloadWorker(session *DownloadSession, wg *sync.WaitGroup) {
 			return // No more blocks to download
 		}
 
+		// Check if block is already in the blockstore before attempting to fetch.
+		// This can happen if the block is received while the want is in the queue.
+		if has, _ := e.blockstore.Has(hash); has {
+			session.MarkAsDone(hash) // Ensure session knows it's done
+			continue
+		}
+
 		// This loop will implement the strategy for a single hash
 		fetchAttemptCtx, cancelAttempt := context.WithTimeout(session.ctx, providerSearchTimeout)
 
