@@ -1,19 +1,21 @@
 package bitswap
 
 import (
-	"bufio"
-	"context"
-	"encoding/binary"
-	"fmt"
-	"io"
-	"log"
-	"sync"
-	"time"
+    "bufio"
+    "context"
+    "encoding/binary"
+    "fmt"
+    "io"
+    "log"
+    "sync"
+    "time"
 
-	"openhashdb/core/block"
-	"openhashdb/core/blockstore"
-	"openhashdb/core/hasher"
-	"openhashdb/protobuf/pb"
+    "openhashdb/core/block"
+    "openhashdb/core/blockstore"
+    "openhashdb/core/hasher"
+    pr "openhashdb/network/peer_registry"
+    "openhashdb/network/delegation"
+    "openhashdb/protobuf/pb"
 
 	"github.com/google/uuid"
 	"github.com/libp2p/go-libp2p/core/host"
@@ -33,14 +35,16 @@ const (
 
 // Engine is the main bitswap engine.
 type Engine struct {
-	host        host.Host
-	blockstore  *blockstore.Blockstore
-	wantlist    *WantlistManager
-	peers       map[peer.ID]*peerLedger
-	downloadMgr *DownloadManager
-	mu          sync.RWMutex
-	ctx         context.Context
-	cancel      context.CancelFunc
+    host        host.Host
+    blockstore  *blockstore.Blockstore
+    wantlist    *WantlistManager
+    peers       map[peer.ID]*peerLedger
+    downloadMgr *DownloadManager
+    mu          sync.RWMutex
+    ctx         context.Context
+    cancel      context.CancelFunc
+    peerReg     *pr.Registry
+    deleg       *delegation.Service
 }
 
 // NewEngine creates a new bitswap engine.
@@ -57,8 +61,16 @@ func NewEngine(ctx context.Context, h host.Host, bs *blockstore.Blockstore) *Eng
 	}
 	h.SetStreamHandler(ProtocolBitswap, e.handleNewStream)
 	go e.periodicWantlistBroadcast()
-	return e
+    return e
 }
+
+// SetPeerRegistry attaches a registry for advanced provider discovery and scoring.
+func (e *Engine) SetPeerRegistry(reg *pr.Registry) {
+    e.peerReg = reg
+}
+
+// SetDelegation attaches delegation service for tier-2 fetching.
+func (e *Engine) SetDelegation(d *delegation.Service) { e.deleg = d }
 
 // GetBlock fetches a single block, waiting for it to become available from the network.
 func (e *Engine) GetBlock(ctx context.Context, h hasher.Hash) (block.Block, error) {
@@ -156,6 +168,32 @@ func (e *Engine) downloadWorker(session *DownloadSession, wg *sync.WaitGroup) {
 			return // No more blocks to download
 		}
 
+        // Proactively target direct peers with known content first, if available.
+        if e.peerReg != nil {
+            providers := e.peerReg.GetPeersForContent(hash.String(), true /*onlyDirect*/)
+            // Target up to 4 best direct providers
+            maxTargets := 4
+            for i := 0; i < len(providers) && i < maxTargets; i++ {
+                p := providers[i]
+                session.addProvider(hash, p.ID)
+                e.sendWantBlockToPeer(p.ID, hash)
+            }
+            // If no direct providers, consider tier-2: ask direct peers to fetch on our behalf.
+            if len(providers) == 0 && e.deleg != nil {
+                // Collect direct peers we know about and send a delegated fetch request
+                snap := e.peerReg.Snapshot()
+                var directPeers []peer.ID
+                for _, s := range snap {
+                    if s.Conn == "direct" {
+                        if pid, err := peer.Decode(s.ID); err == nil {
+                            directPeers = append(directPeers, pid)
+                        }
+                    }
+                }
+                e.deleg.RequestDelegatedFetchToPeers(directPeers, []string{hash.String()})
+            }
+        }
+
         // Wait for providers as long as the session is alive; heartbeat governs liveness
         peer, err := session.WaitForProvider(session.ctx, hash)
 
@@ -166,9 +204,9 @@ func (e *Engine) downloadWorker(session *DownloadSession, wg *sync.WaitGroup) {
 			continue
 		}
 
-		// log.Printf("[Bitswap Worker] Requesting block %s from peer %s", hash, peer)
-		e.sendWantBlockToPeer(peer, hash)
-	}
+        // log.Printf("[Bitswap Worker] Requesting block %s from peer %s", hash, peer)
+        e.sendWantBlockToPeer(peer, hash)
+    }
 }
 
 // handleNewStream handles incoming bitswap streams.
@@ -216,29 +254,36 @@ func (e *Engine) handleNewStream(s network.Stream) {
 }
 
 func (e *Engine) handleIncomingBlocks(blocks []*pb.Message_Block, remotePeer peer.ID) {
-	for _, b := range blocks {
-		hash, err := hasher.HashFromBytes(b.Hash)
-		if err != nil {
-			continue
-		}
-		newBlock := block.NewBlockWithHash(hash, b.Data)
-		log.Printf("[Bitswap] Received block %s from %s", newBlock.Hash().String(), remotePeer.String())
-		e.blockstore.Put(newBlock)
-		e.wantlist.Remove(newBlock.Hash())
-		e.downloadMgr.DistributeBlock(newBlock)
-	}
+    for _, b := range blocks {
+        hash, err := hasher.HashFromBytes(b.Hash)
+        if err != nil {
+            continue
+        }
+        newBlock := block.NewBlockWithHash(hash, b.Data)
+        log.Printf("[Bitswap] Received block %s from %s", newBlock.Hash().String(), remotePeer.String())
+        e.blockstore.Put(newBlock)
+        e.wantlist.Remove(newBlock.Hash())
+        e.downloadMgr.DistributeBlock(newBlock)
+        if e.peerReg != nil {
+            // We do not track precise per-request latency here; pass 0.
+            e.peerReg.RecordBlockSuccess(remotePeer, 0)
+        }
+    }
 }
 
 func (e *Engine) handleIncomingPresences(presences []*pb.Message_BlockPresence, remotePeer peer.ID) {
-	for _, pres := range presences {
-		hash, err := hasher.HashFromBytes(pres.Hash)
-		if err != nil {
-			continue
-		}
-		if pres.Type == pb.Message_BlockPresence_Have {
-			e.downloadMgr.DistributeHave(hash, remotePeer)
-		}
-	}
+    for _, pres := range presences {
+        hash, err := hasher.HashFromBytes(pres.Hash)
+        if err != nil {
+            continue
+        }
+        if pres.Type == pb.Message_BlockPresence_Have {
+            e.downloadMgr.DistributeHave(hash, remotePeer)
+            if e.peerReg != nil {
+                e.peerReg.RecordHave(remotePeer, hash.String())
+            }
+        }
+    }
 }
 
 func (e *Engine) getOrCreateLedger(p peer.ID) *peerLedger {

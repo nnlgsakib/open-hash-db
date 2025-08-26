@@ -1,0 +1,41 @@
+syntax = "proto3";
+package openhash.bitswap.v2;
+option go_package = "openhashdb/protobuf/pb";
+
+// Tiered request that can carry preferences and priorities
+message HierarchicalContentRequest {
+  repeated string hashes = 1;
+  bool prefer_direct = 2;
+  bool allow_delegation = 3;
+  bool allow_relay = 4;
+}
+
+// Aggregated response status for multi-peer, multi-tier fetches
+message MultiTierResponse {
+  message BlockStatus {
+    string hash = 1;
+    string status = 2; // fetched, partial, missing, error
+    string provider = 3; // peer id
+    uint32 tier = 4; // 1, 2, or 3
+    string message = 5;
+  }
+  repeated BlockStatus blocks = 1;
+}
+
+// Delegated fetch coordination
+message DelegatedFetchCoordination {
+  string request_id = 1;
+  repeated string assigned_peers = 2;
+}
+
+// Relay routing and forwarding control
+message RelayRouting {
+  repeated string candidate_relays = 1;
+}
+
+// Generic error and status reporting for network operations
+message OperationStatus {
+  string code = 1;
+  string message = 2;
+}
+

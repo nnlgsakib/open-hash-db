@@ -1,20 +1,21 @@
 package libp2p
 
 import (
-	"context"
-	"crypto/rand"
-	"encoding/base64"
-	"fmt"
-	"log"
+    "context"
+    "crypto/rand"
+    "encoding/base64"
+    "fmt"
+    "log"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
 
-	"openhashdb/core/blockstore"
-	"openhashdb/core/hasher"
-	"openhashdb/network/bitswap"
-	"openhashdb/protobuf/pb"
+    "openhashdb/core/blockstore"
+    "openhashdb/core/hasher"
+    "openhashdb/network/bitswap"
+    pr "openhashdb/network/peer_registry"
+    "openhashdb/protobuf/pb"
 
 	"github.com/ipfs/go-cid"
 	"github.com/libp2p/go-libp2p"
@@ -46,20 +47,22 @@ const (
 
 // Node represents a libp2p node
 type Node struct {
-	host             host.Host
-	ctx              context.Context
-	cancel           context.CancelFunc
-	mdns             mdns.Service
-	dht              *dht.IpfsDHT
-	heartbeatService *HeartbeatService
-	blockstore       *blockstore.Blockstore
-	bitswap          *bitswap.Engine
-	GossipHandler    func(peer.ID, []byte) error
-	peerEvents       []*pb.PeerEvent
-	peerEventsMu     sync.RWMutex
+    host             host.Host
+    ctx              context.Context
+    cancel           context.CancelFunc
+    mdns             mdns.Service
+    dht              *dht.IpfsDHT
+    heartbeatService *HeartbeatService
+    blockstore       *blockstore.Blockstore
+    bitswap          *bitswap.Engine
+    GossipHandler    func(peer.ID, []byte) error
+    peerEvents       []*pb.PeerEvent
+    peerEventsMu     sync.RWMutex
     // reservedRelays tracks relays (and their addrs) we have active v2 reservations with
     reservedRelays   map[peer.ID]*reservedRelayEntry
     reservedRelaysMu sync.RWMutex
+    // peerReg optionally captures peer/content metadata and connection state
+    peerReg          *pr.Registry
 }
 
 type reservedRelayEntry struct {
@@ -239,7 +242,7 @@ func (n *Node) SetBlockstore(bs *blockstore.Blockstore) {
 }
 
 func (n *Node) SetBitswap(b *bitswap.Engine) {
-	n.bitswap = b
+    n.bitswap = b
 }
 
 func (n *Node) GetBitswap() *bitswap.Engine {
@@ -247,8 +250,16 @@ func (n *Node) GetBitswap() *bitswap.Engine {
 }
 
 func (n *Node) Host() host.Host {
-	return n.host
+    return n.host
 }
+
+// SetPeerRegistry attaches a peer/content registry for advanced discovery and tracking.
+func (n *Node) SetPeerRegistry(reg *pr.Registry) {
+    n.peerReg = reg
+}
+
+// PeerRegistry returns the attached registry (if any).
+func (n *Node) PeerRegistry() *pr.Registry { return n.peerReg }
 
 // networkNotifiee handles connection events
 type networkNotifiee struct {
@@ -256,15 +267,21 @@ type networkNotifiee struct {
 }
 
 func (n *networkNotifiee) Connected(net network.Network, conn network.Conn) {
-	addrs := make([]string, 0, len(n.node.host.Peerstore().Addrs(conn.RemotePeer())))
-	for _, addr := range n.node.host.Peerstore().Addrs(conn.RemotePeer()) {
-		addrs = append(addrs, addr.String())
-	}
-	n.node.logPeerEvent(conn.RemotePeer(), "connected", addrs)
-	n.node.heartbeatService.MonitorConnection(conn.RemotePeer())
-	if n.node.bitswap != nil {
-		n.node.bitswap.HandleNewPeer(conn.RemotePeer())
-	}
+    addrs := make([]string, 0, len(n.node.host.Peerstore().Addrs(conn.RemotePeer())))
+    for _, addr := range n.node.host.Peerstore().Addrs(conn.RemotePeer()) {
+        addrs = append(addrs, addr.String())
+    }
+    n.node.logPeerEvent(conn.RemotePeer(), "connected", addrs)
+    n.node.heartbeatService.MonitorConnection(conn.RemotePeer())
+    if n.node.bitswap != nil {
+        n.node.bitswap.HandleNewPeer(conn.RemotePeer())
+    }
+
+    // Classify connection type using the remote multiaddr of the connection
+    if n.node.peerReg != nil {
+        connType := pr.InferConnTypeFromAddr(conn.RemoteMultiaddr().String())
+        n.node.peerReg.OnConnected(conn.RemotePeer(), addrs, connType)
+    }
 
 	// Try to make a reservation with the peer if it supports relaying
 	go func(p peer.ID) {
@@ -320,6 +337,9 @@ func (n *networkNotifiee) Disconnected(net network.Network, conn network.Conn) {
     n.node.reservedRelaysMu.Unlock()
     if n.node.bitswap != nil {
         n.node.bitswap.HandlePeerDisconnect(conn.RemotePeer())
+    }
+    if n.node.peerReg != nil {
+        n.node.peerReg.OnDisconnected(conn.RemotePeer())
     }
 }
 

@@ -24,6 +24,8 @@ import (
 	"openhashdb/core/utils"
 	"openhashdb/network/bitswap"
 	"openhashdb/network/libp2p"
+	"openhashdb/network/peer_registry"
+	"openhashdb/network/delegation"
 	"openhashdb/network/replicator"
 	"openhashdb/protobuf/pb"
 	"openhashdb/version"
@@ -336,9 +338,18 @@ func initAll() error {
 	}
 	node.SetBlockstore(bs) // Set the blockstore on the node
 
-	// Initialize Bitswap Engine
-	bitswapEngine := bitswap.NewEngine(ctx, node.Host(), bs)
-	node.SetBitswap(bitswapEngine)
+    // Initialize Bitswap Engine
+    bitswapEngine := bitswap.NewEngine(ctx, node.Host(), bs)
+    node.SetBitswap(bitswapEngine)
+
+    // Initialize peer registry and wire into node/bitswap
+    registry := peer_registry.New()
+    node.SetPeerRegistry(registry)
+    bitswapEngine.SetPeerRegistry(registry)
+
+    // Initialize delegation service and wire into bitswap
+    delegSvc := delegation.NewService(ctx, node.Host(), bitswapEngine)
+    bitswapEngine.SetDelegation(delegSvc)
 
 	// Initialize replicator
 	repl = replicator.NewReplicator(bs, node, bitswapEngine, replicator.DefaultReplicationFactor)

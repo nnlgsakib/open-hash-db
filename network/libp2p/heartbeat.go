@@ -168,19 +168,28 @@ func (hs *HeartbeatService) sendHeartbeat(peerID peer.ID) error {
 
     // Try to open a heartbeat stream; if the peer doesn't support it, we'll get
     // a negotiation failure/reset which we classify and handle in the caller.
+    started := time.Now()
     stream, err := hs.node.host.NewStream(network.WithAllowLimitedConn(ctx, "heartbeat"), peerID, ProtocolHeartbeat)
     if err != nil {
         log.Printf("[libp2p] Failed to open heartbeat stream to %s: %v", peerID.String(), err)
+        if hs.node.peerReg != nil {
+            hs.node.peerReg.RecordHeartbeat(peerID, false, 0)
+        }
         return err
     }
 
 	// The actual exchange logic is handled by the PeerExchanger
 	// It will close the stream
-	if err := hs.peerExchanger.initiateExchange(stream); err != nil {
-		log.Printf("Peer exchange with %s failed: %v", peerID.String(), err)
-		return err
-	}
-
+    if err := hs.peerExchanger.initiateExchange(stream); err != nil {
+        log.Printf("Peer exchange with %s failed: %v", peerID.String(), err)
+        if hs.node.peerReg != nil {
+            hs.node.peerReg.RecordHeartbeat(peerID, false, 0)
+        }
+        return err
+    }
+    if hs.node.peerReg != nil {
+        hs.node.peerReg.RecordHeartbeat(peerID, true, time.Since(started))
+    }
     return nil
 }
 

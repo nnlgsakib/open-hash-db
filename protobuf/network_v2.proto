@@ -1,0 +1,61 @@
+syntax = "proto3";
+package openhash.network.v2;
+option go_package = "openhashdb/protobuf/pb";
+
+import "google/protobuf/timestamp.proto";
+
+enum ConnectionType {
+  CONNECTION_UNKNOWN = 0;
+  CONNECTION_DIRECT = 1;
+  CONNECTION_RELAYED = 2;
+}
+
+message PeerQuality {
+  uint64 success_blocks = 1;
+  uint64 failed_blocks = 2;
+  uint64 heartbeats_ok = 3;
+  uint64 heartbeats_err = 4;
+  double latency_ema = 5; // seconds
+  double score = 6;       // convenience
+}
+
+message PeerMetadata {
+  string peer_id = 1;
+  repeated string addrs = 2;
+  ConnectionType connection_type = 3;
+  PeerQuality quality = 4;
+  google.protobuf.Timestamp last_seen = 5;
+}
+
+message PeerMetadataList {
+  repeated PeerMetadata peers = 1;
+}
+
+message ContentBlockRef {
+  string hash = 1; // hex or base32
+  int64  size = 2; // optional
+}
+
+message ContentRegistryEntry {
+  ContentBlockRef content = 1;
+  repeated string providers = 2; // peer ids
+}
+
+message ContentRegistrySnapshot {
+  repeated ContentRegistryEntry entries = 1;
+}
+
+// Delegated fetch messages
+message DelegatedFetchRequest {
+  string request_id = 1;
+  repeated string hashes = 2;
+}
+
+message DelegatedFetchResponse {
+  string request_id = 1;
+  bool   accepted = 2;
+  string message = 3;
+}
+
+// Relay communication placeholders for future extensions
+message RelayRouteHint { repeated string relay_addrs = 1; }

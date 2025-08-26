@@ -20,6 +20,9 @@ func (s *Server) setupRoutes() {
 	s.router.HandleFunc("/list", s.listContent).Methods("GET", "OPTIONS")
 	s.router.HandleFunc("/stats", s.getStats).Methods("GET", "OPTIONS")
 	s.router.HandleFunc("/network", s.getNetworkStats).Methods("GET", "OPTIONS")
+    // Network registry inspection
+    s.router.HandleFunc("/network/peers", s.getPeersSnapshot).Methods("GET", "OPTIONS")
+    s.router.HandleFunc("/network/providers/{hash}", s.getProvidersForHash).Methods("GET", "OPTIONS")
 
 	// Pin endpoints
 	s.router.HandleFunc("/pin/{hash}", s.pinContent).Methods("POST", "OPTIONS")
