@@ -58,3 +58,9 @@ else
 	@if [ -d "$(BUILD_DIR)" ]; then $(RM_DIR) "$(BUILD_DIR)"; fi
 endif
 	@echo Clean complete.
+
+.PHONY: proto
+proto:
+	@echo Generating protobuf Go files into protobuf/pb
+	cd protobuf && protoc -I=. --go_out=paths=source_relative:pb *.proto
+	@echo Proto generation complete.

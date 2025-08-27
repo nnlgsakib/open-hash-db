@@ -1,0 +1,25 @@
+syntax = "proto3";
+package graphsync.pb;
+option go_package = "openhashdb/protobuf/pb";
+
+// Minimal GraphSync-style protocol for traversals
+
+message Request {
+  uint64 id = 1;                 // request identifier
+  bytes root_cid = 2;            // CID bytes (multibase string discouraged on-wire)
+  bytes selector = 3;            // IPLD selector (dag-cbor bytes)
+  map<string, bytes> extensions = 4; // optional extensions
+}
+
+message GSBlock {
+  bytes link = 1;  // CID bytes (child link)
+  bytes data = 2;  // raw block bytes
+}
+
+message Response {
+  uint64 id = 1;                 // mirrors Request.id
+  repeated GSBlock blocks = 2;   // streamed blocks
+  string status = 3;             // OK, PARTIAL, ERROR, COMPLETE
+  string error_message = 4;      // optional error info
+  map<string, bytes> extensions = 5; // optional extensions
+}

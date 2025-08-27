@@ -1,12 +1,14 @@
 package rest
 
 import (
-	"fmt"
-	"log"
-	"net/http"
-	"strconv"
+    "fmt"
+    "log"
+    "net/http"
+    "strconv"
 
-	"openhashdb/core/hasher"
+    "openhashdb/core/hasher"
+    cid "github.com/ipfs/go-cid"
+    "openhashdb/core/cidutil"
 
 	"github.com/gorilla/mux"
 )
@@ -48,4 +50,22 @@ func (s *Server) downloadContent(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Length", strconv.FormatInt(metadata.Size, 10))
 
 	s.streamChunksOptimized(w, r, metadata)
+}
+
+// downloadContentByCID resolves CID to hash and uses the same logic as downloadContent.
+func (s *Server) downloadContentByCID(w http.ResponseWriter, r *http.Request) {
+    vars := mux.Vars(r)
+    cidStr := vars["cid"]
+    c, err := cid.Parse(cidStr)
+    if err != nil {
+        s.writeError(w, http.StatusBadRequest, "Invalid cid", err)
+        return
+    }
+    h, err := cidutil.ToHash(c)
+    if err != nil {
+        s.writeError(w, http.StatusBadRequest, "Unsupported cid multihash", err)
+        return
+    }
+    r = mux.SetURLVars(r, map[string]string{"hash": h.String()})
+    s.downloadContent(w, r)
 }

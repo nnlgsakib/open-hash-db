@@ -30,12 +30,13 @@ type Server struct {
 
 // JSONContentInfo is a struct for JSON responses
 type JSONContentInfo struct {
-	Hash        string           `json:"hash"`
-	Filename    string           `json:"filename"`
-	MimeType    string           `json:"mime_type"`
-	Size        int64            `json:"size"`
-	ModTime     time.Time        `json:"mod_time"`
-	IsDirectory bool             `json:"is_directory"`
+    Hash        string           `json:"hash"`
+    CID         string           `json:"cid,omitempty"`
+    Filename    string           `json:"filename"`
+    MimeType    string           `json:"mime_type"`
+    Size        int64            `json:"size"`
+    ModTime     time.Time        `json:"mod_time"`
+    IsDirectory bool             `json:"is_directory"`
 	CreatedAt   time.Time        `json:"created_at"`
 	RefCount    int32            `json:"ref_count"`
 	Chunks      []*JSONChunkInfo `json:"chunks,omitempty"`

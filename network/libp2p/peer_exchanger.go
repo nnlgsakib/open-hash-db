@@ -71,38 +71,22 @@ func protoToAddrInfo(pi *pb.PeerInfo) (peer.AddrInfo, error) {
 
 // getPeerListProto gets the list of connected peers as a proto byte slice.
 func (pe *PeerExchanger) getPeerListProto() ([]byte, error) {
-    // Prefer connected peers, then fill with known peers that have addresses.
-    peers := pe.node.Host().Peerstore().Peers()
-    var connected []*pb.PeerInfo
-    var known []*pb.PeerInfo
+    // Only share currently connected peers to avoid advertising offline nodes.
+    peers := pe.node.Host().Network().Peers()
     self := pe.node.Host().ID()
-    for _, p := range peers {
-        if p == self {
-            continue
-        }
-        addrs := pe.node.Host().Peerstore().Addrs(p)
-        if len(addrs) == 0 {
-            continue
-        }
-        pi := addrInfoToProto(pe.node.Host().Peerstore().PeerInfo(p))
-        if pe.node.Host().Network().Connectedness(p) == network.Connected {
-            connected = append(connected, pi)
-        } else {
-            known = append(known, pi)
-        }
-    }
     // Cap the list to avoid flooding
     const maxPeers = 64
     out := make([]*pb.PeerInfo, 0, maxPeers)
-    out = append(out, connected...)
-    if len(out) > maxPeers {
-        out = out[:maxPeers]
-    } else if len(out) < maxPeers {
-        rem := maxPeers - len(out)
-        if rem > len(known) {
-            rem = len(known)
-        }
-        out = append(out, known[:rem]...)
+    for _, p := range peers {
+        if p == self { continue }
+        if pe.node.Host().Network().Connectedness(p) != network.Connected { continue }
+        addrs := pe.node.Host().Peerstore().Addrs(p)
+        if len(addrs) == 0 { continue }
+        // Exclude relayed-only addresses if the connection is not direct and we don't have base addrs
+        // but still include since we are connected (useful for NATed setups)
+        pi := addrInfoToProto(pe.node.Host().Peerstore().PeerInfo(p))
+        out = append(out, pi)
+        if len(out) >= maxPeers { break }
     }
     return proto.Marshal(&pb.PeerInfoList{Peers: out})
 }
@@ -138,21 +122,20 @@ func (pe *PeerExchanger) connectToNewPeers(addrInfos []*pb.PeerInfo, sourcePeer 
 			pe.connectingMu.Unlock()
 			continue
 		}
-		pe.connecting[addrInfo.ID] = true
-		pe.connectingMu.Unlock()
+        pe.connecting[addrInfo.ID] = true
+        pe.connectingMu.Unlock()
 
-		wg.Add(1)
-		go func(pi peer.AddrInfo) {
-			defer wg.Done()
-			var connected bool
+        wg.Add(1)
+        go func(pi peer.AddrInfo) {
+            defer wg.Done()
+            var connected bool
 
-			defer func() {
-				if !connected {
-					pe.connectingMu.Lock()
-					delete(pe.connecting, pi.ID)
-					pe.connectingMu.Unlock()
-				}
-			}()
+            // Always clear in-flight state at the end to allow future attempts
+            defer func() {
+                pe.connectingMu.Lock()
+                delete(pe.connecting, pi.ID)
+                pe.connectingMu.Unlock()
+            }()
 
 			if pe.node.Host().Network().Connectedness(pi.ID) == network.Connected {
 				connected = true
@@ -174,8 +157,9 @@ func (pe *PeerExchanger) connectToNewPeers(addrInfos []*pb.PeerInfo, sourcePeer 
                 log.Printf("[PeerExchanger] Peer %s has no public addresses, trying via relay.", pi.ID)
             }
 
-        // Attempt relay dial via the source peer only if it supports HOP
-        protos, _ := pe.node.Host().Peerstore().GetProtocols(sourcePeer)
+        // Attempt relay dial via the source peer only if we are connected to it and it supports HOP
+        if pe.node.Host().Network().Connectedness(sourcePeer) == network.Connected {
+            protos, _ := pe.node.Host().Peerstore().GetProtocols(sourcePeer)
         supportsHop := false
         for _, pr := range protos {
             if pr == "/libp2p/circuit/relay/0.2.0/hop" {
@@ -197,6 +181,7 @@ func (pe *PeerExchanger) connectToNewPeers(addrInfos []*pb.PeerInfo, sourcePeer 
                     return
                 }
             }
+        }
         }
 
         // Fallback: try via our reserved relays

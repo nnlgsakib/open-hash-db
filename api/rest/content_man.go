@@ -1,30 +1,31 @@
 package rest
 
 import (
-	"context"
-	"encoding/hex"
-	"fmt"
-	"log"
-	"net/http"
+    "context"
+    "encoding/hex"
+    "fmt"
+    "log"
+    "net/http"
 
-	"openhashdb/core/hasher"
-	"openhashdb/network/libp2p"
-	"openhashdb/protobuf/pb"
+    "openhashdb/core/hasher"
+    "openhashdb/core/cidutil"
+    "openhashdb/network/libp2p"
+    "openhashdb/protobuf/pb"
 
-	"github.com/gorilla/mux"
-	"google.golang.org/protobuf/proto"
+    "github.com/gorilla/mux"
+    "google.golang.org/protobuf/proto"
 )
 
 // getContentInfo returns information about content
 func (s *Server) getContentInfo(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	hashStr := vars["hash"]
+    vars := mux.Vars(r)
+    hashStr := vars["hash"]
 
-	hash, err := hasher.HashFromString(hashStr)
-	if err != nil {
-		s.writeError(w, http.StatusBadRequest, "Invalid hash", err)
-		return
-	}
+    hash, err := hasher.HashFromString(hashStr)
+    if err != nil {
+        s.writeError(w, http.StatusBadRequest, "Invalid hash", err)
+        return
+    }
 
 	// Try to get content from local storage first
 	metadata, err := s.storage.GetContent(hash)
@@ -48,13 +49,16 @@ func (s *Server) getContentInfo(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		info := &JSONContentInfo{
-			Hash:        hex.EncodeToString(metadata.Hash),
-			Filename:    metadata.Filename,
-			MimeType:    metadata.MimeType,
-			Size:        metadata.Size,
-			ModTime:     metadata.ModTime.AsTime(),
-			IsDirectory: metadata.IsDirectory,
+        // compute CID for response
+        c, _ := cidutil.FromHash(hash, cidutil.Raw)
+        info := &JSONContentInfo{
+            Hash:        hex.EncodeToString(metadata.Hash),
+            CID:         c.String(),
+            Filename:    metadata.Filename,
+            MimeType:    metadata.MimeType,
+            Size:        metadata.Size,
+            ModTime:     metadata.ModTime.AsTime(),
+            IsDirectory: metadata.IsDirectory,
 			CreatedAt:   metadata.CreatedAt.AsTime(),
 			RefCount:    metadata.RefCount,
 			Chunks:      chunks,
@@ -65,12 +69,12 @@ func (s *Server) getContentInfo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Content not found locally, try to fetch metadata via delegation
-	log.Printf("Content %s not found locally, checking network for metadata...", hashStr)
-	fetchedMetadata, err := s.fetchMetadata(r.Context(), hash)
-	if err != nil {
-		s.writeError(w, http.StatusNotFound, "Content not found on the network", err)
-		return
-	}
+    log.Printf("Content %s not found locally, checking network for metadata...", hashStr)
+    fetchedMetadata, err := s.fetchMetadata(r.Context(), hash)
+    if err != nil {
+        s.writeError(w, http.StatusNotFound, "Content not found on the network", err)
+        return
+    }
 	log.Printf("Metadata for %s found on network", hashStr)
 
 	// Store content metadata to make it available for future local lookups
@@ -106,21 +110,89 @@ func (s *Server) getContentInfo(w http.ResponseWriter, r *http.Request) {
 			Type: l.Type,
 		}
 	}
-	info := &JSONContentInfo{
-		Hash:        hex.EncodeToString(fetchedMetadata.Hash),
-		Filename:    fetchedMetadata.Filename,
-		MimeType:    fetchedMetadata.MimeType,
-		Size:        fetchedMetadata.Size,
-		ModTime:     fetchedMetadata.ModTime.AsTime(),
-		IsDirectory: fetchedMetadata.IsDirectory,
-		CreatedAt:   fetchedMetadata.CreatedAt.AsTime(),
-		RefCount:    fetchedMetadata.RefCount,
-		Chunks:      chunks,
-		Links:       links,
-		Message:     "Not found locally. Found on network, replicating in background.",
-	}
+    c, _ := cidutil.FromHash(hash, cidutil.Raw)
+    info := &JSONContentInfo{
+        Hash:        hex.EncodeToString(fetchedMetadata.Hash),
+        CID:         c.String(),
+        Filename:    fetchedMetadata.Filename,
+        MimeType:    fetchedMetadata.MimeType,
+        Size:        fetchedMetadata.Size,
+        ModTime:     fetchedMetadata.ModTime.AsTime(),
+        IsDirectory: fetchedMetadata.IsDirectory,
+        CreatedAt:   fetchedMetadata.CreatedAt.AsTime(),
+        RefCount:    fetchedMetadata.RefCount,
+        Chunks:      chunks,
+        Links:       links,
+        Message:     "Not found locally. Found on network, replicating in background.",
+    }
 
-	s.writeJSON(w, http.StatusOK, info)
+    s.writeJSON(w, http.StatusOK, info)
+}
+
+// getContentInfoByCID resolves CID to hash and serves the same payload with cid included.
+func (s *Server) getContentInfoByCID(w http.ResponseWriter, r *http.Request) {
+    h, cidStr, err := parseHashOrCID(r)
+    if err != nil {
+        s.writeError(w, http.StatusBadRequest, "Invalid identifier", err)
+        return
+    }
+    // Reuse fetch path by forging mux vars for hash
+    r = mux.SetURLVars(r, map[string]string{"hash": h.String()})
+    // Call underlying handler but ensure CID is included by letting getContentInfo compute it.
+    // For clarity, just inline the logic here to attach exact CID
+    if metadata, err := s.storage.GetContent(h); err == nil {
+        chunks := make([]*JSONChunkInfo, len(metadata.Chunks))
+        for i, c := range metadata.Chunks {
+            chunks[i] = &JSONChunkInfo{Hash: hex.EncodeToString(c.Hash), Size: c.Size}
+        }
+        links := make([]*JSONLink, len(metadata.Links))
+        for i, l := range metadata.Links {
+            links[i] = &JSONLink{Name: l.Name, Hash: hex.EncodeToString(l.Hash), Size: l.Size, Type: l.Type}
+        }
+        info := &JSONContentInfo{
+            Hash:        h.String(),
+            CID:         cidStr,
+            Filename:    metadata.Filename,
+            MimeType:    metadata.MimeType,
+            Size:        metadata.Size,
+            ModTime:     metadata.ModTime.AsTime(),
+            IsDirectory: metadata.IsDirectory,
+            CreatedAt:   metadata.CreatedAt.AsTime(),
+            RefCount:    metadata.RefCount,
+            Chunks:      chunks,
+            Links:       links,
+        }
+        s.writeJSON(w, http.StatusOK, info)
+        return
+    }
+    fetchedMetadata, err := s.fetchMetadata(r.Context(), h)
+    if err != nil {
+        s.writeError(w, http.StatusNotFound, "Content not found on the network", err)
+        return
+    }
+    chunks := make([]*JSONChunkInfo, len(fetchedMetadata.Chunks))
+    for i, c := range fetchedMetadata.Chunks {
+        chunks[i] = &JSONChunkInfo{Hash: hex.EncodeToString(c.Hash), Size: c.Size}
+    }
+    links := make([]*JSONLink, len(fetchedMetadata.Links))
+    for i, l := range fetchedMetadata.Links {
+        links[i] = &JSONLink{Name: l.Name, Hash: hex.EncodeToString(l.Hash), Size: l.Size, Type: l.Type}
+    }
+    info := &JSONContentInfo{
+        Hash:        h.String(),
+        CID:         cidStr,
+        Filename:    fetchedMetadata.Filename,
+        MimeType:    fetchedMetadata.MimeType,
+        Size:        fetchedMetadata.Size,
+        ModTime:     fetchedMetadata.ModTime.AsTime(),
+        IsDirectory: fetchedMetadata.IsDirectory,
+        CreatedAt:   fetchedMetadata.CreatedAt.AsTime(),
+        RefCount:    fetchedMetadata.RefCount,
+        Chunks:      chunks,
+        Links:       links,
+        Message:     "Not found locally. Found on network, replicating in background.",
+    }
+    s.writeJSON(w, http.StatusOK, info)
 }
 
 // fetchMetadata attempts to retrieve metadata for a content root using delegated metadata requests.

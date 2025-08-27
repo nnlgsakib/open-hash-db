@@ -1,17 +1,18 @@
 package replicator
 
 import (
-	"context"
-	"fmt"
-	"log"
-	"sync"
-	"time"
+    "context"
+    "fmt"
+    "log"
+    "sync"
+    "time"
 
 	"openhashdb/core/blockstore"
 	"openhashdb/core/hasher"
-	"openhashdb/network/bitswap"
-	"openhashdb/network/libp2p"
-	"openhashdb/protobuf/pb"
+    "openhashdb/network/bitswap"
+    "openhashdb/network/libp2p"
+    "openhashdb/protobuf/pb"
+    "openhashdb/core/cidutil"
 
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/prometheus/client_golang/prometheus"
@@ -93,14 +94,23 @@ func (r *Replicator) Close() {
 
 // AnnounceContent announces new content
 func (r *Replicator) AnnounceContent(hash hasher.Hash, size int64) error {
-	if !r.blockstore.HasContent(hash) {
-		log.Printf("[Replicator] Content %s not found locally, skipping announcement", hash.String())
-		return fmt.Errorf("content %s not found locally", hash.String())
-	}
+    if !r.blockstore.HasContent(hash) {
+        log.Printf("[Replicator] Content %s not found locally, skipping announcement", hash.String())
+        return fmt.Errorf("content %s not found locally", hash.String())
+    }
 
-	if err := r.node.AnnounceContent(hash.String()); err != nil {
-		log.Printf("[Replicator] Warning: failed to announce content to DHT: %v", err)
-	}
+    if err := r.node.AnnounceContent(hash.String()); err != nil {
+        log.Printf("[Replicator] Warning: failed to announce content to DHT: %v", err)
+    }
+
+    // Provide the CID directly as part of the redesign
+    if c, err := cidutil.FromHash(hash, cidutil.Raw); err == nil {
+        ctx, cancel := context.WithTimeout(r.ctx, 30*time.Second)
+        defer cancel()
+        if err := r.node.ProvideCID(ctx, c); err != nil {
+            log.Printf("[Replicator] Warning: failed to provide CID %s: %v", c.String(), err)
+        }
+    }
 
 	announcement := &pb.ContentAnnouncement{
 		Hash:      hash[:],
@@ -109,7 +119,7 @@ func (r *Replicator) AnnounceContent(hash hasher.Hash, size int64) error {
 		PeerId:    r.node.ID().String(),
 	}
 
-	data, err := proto.Marshal(announcement)
+    data, err := proto.Marshal(announcement)
 	if err != nil {
 		return fmt.Errorf("failed to marshal announcement: %w", err)
 	}

@@ -1,23 +1,25 @@
 package blockstore
 
 import (
-	"context"
-	"fmt"
-	"log"
-	"os"
-	"path/filepath"
-	"sync"
+    "context"
+    "fmt"
+    "log"
+    "os"
+    "path/filepath"
+    "sync"
 
-	"openhashdb/core/block"
-	"openhashdb/core/hasher"
-	"openhashdb/protobuf/pb"
+    "openhashdb/core/block"
+    "openhashdb/core/hasher"
+    "openhashdb/protobuf/pb"
+    "openhashdb/core/cidutil"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/syndtr/goleveldb/leveldb"
-	"github.com/syndtr/goleveldb/leveldb/opt"
-	"github.com/syndtr/goleveldb/leveldb/util"
-	"google.golang.org/protobuf/proto"
+    "github.com/prometheus/client_golang/prometheus"
+    "github.com/prometheus/client_golang/prometheus/promauto"
+    "github.com/syndtr/goleveldb/leveldb"
+    "github.com/syndtr/goleveldb/leveldb/opt"
+    "github.com/syndtr/goleveldb/leveldb/util"
+    "google.golang.org/protobuf/proto"
+    cid "github.com/ipfs/go-cid"
 )
 
 // Metrics for blockstore operations
@@ -50,9 +52,11 @@ var (
 )
 
 const (
-	contentPrefix = "content:"
-	// blockPrefix is no longer used for leveldb but const is kept for reference
-	blockPrefix = "block:"
+    contentPrefix = "content:"
+    // blockPrefix is no longer used for leveldb but const is kept for reference
+    blockPrefix = "block:"
+    // cidContentPrefix stores content metadata keyed by CID string
+    cidContentPrefix = "cid:"
 )
 
 // Blockstore handles persistent storage of blocks.
@@ -239,64 +243,108 @@ func (bs *Blockstore) AllKeysChan(ctx context.Context) (<-chan hasher.Hash, erro
 
 // StoreContent stores content metadata.
 func (bs *Blockstore) StoreContent(metadata *pb.ContentMetadata) error {
-	h, err := hasher.HashFromBytes(metadata.Hash)
-	if err != nil {
-		return err
-	}
-	key := contentPrefix + h.String()
-	data, err := proto.Marshal(metadata)
-	if err != nil {
-		return fmt.Errorf("failed to marshal metadata: %w", err)
-	}
-	return bs.db.Put([]byte(key), data, &opt.WriteOptions{Sync: true})
+    // Store by CID as primary key
+    h, err := hasher.HashFromBytes(metadata.Hash)
+    if err != nil {
+        return err
+    }
+    c, err := cidutil.FromHash(h, cidutil.Raw)
+    if err != nil {
+        return fmt.Errorf("failed to build CID: %w", err)
+    }
+    key := cidContentPrefix + c.String()
+    data, err := proto.Marshal(metadata)
+    if err != nil {
+        return fmt.Errorf("failed to marshal metadata: %w", err)
+    }
+    if err := bs.db.Put([]byte(key), data, &opt.WriteOptions{Sync: true}); err != nil {
+        return err
+    }
+    // Deprecated: also write legacy hash key for backward compatibility during transition
+    legacyKey := contentPrefix + h.String()
+    _ = bs.db.Put([]byte(legacyKey), data, &opt.WriteOptions{Sync: false})
+    return nil
 }
 
 // GetContent retrieves content metadata.
 func (bs *Blockstore) GetContent(hash hasher.Hash) (*pb.ContentMetadata, error) {
-	key := contentPrefix + hash.String()
-	data, err := bs.db.Get([]byte(key), nil)
-	if err != nil {
-		if err == leveldb.ErrNotFound {
-			return nil, fmt.Errorf("content metadata not found for hash %s: %w", hash.String(), err)
-		}
-		return nil, fmt.Errorf("failed to get content metadata: %w", err)
-	}
-
-	var metadata pb.ContentMetadata
-	if err := proto.Unmarshal(data, &metadata); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal metadata: %w", err)
-	}
-	return &metadata, nil
+    // Primary: CID key
+    c, err := cidutil.FromHash(hash, cidutil.Raw)
+    if err == nil {
+        key := cidContentPrefix + c.String()
+        if data, err := bs.db.Get([]byte(key), nil); err == nil {
+            var metadata pb.ContentMetadata
+            if uErr := proto.Unmarshal(data, &metadata); uErr == nil {
+                return &metadata, nil
+            }
+        }
+    }
+    // Fallback: legacy hash key
+    legacyKey := contentPrefix + hash.String()
+    data, err := bs.db.Get([]byte(legacyKey), nil)
+    if err != nil {
+        if err == leveldb.ErrNotFound {
+            return nil, fmt.Errorf("content metadata not found for hash %s: %w", hash.String(), err)
+        }
+        return nil, fmt.Errorf("failed to get content metadata: %w", err)
+    }
+    var metadata pb.ContentMetadata
+    if err := proto.Unmarshal(data, &metadata); err != nil {
+        return nil, fmt.Errorf("failed to unmarshal metadata: %w", err)
+    }
+    return &metadata, nil
 }
 
 // HasContent checks if content metadata exists.
 func (bs *Blockstore) HasContent(hash hasher.Hash) bool {
-	key := contentPrefix + hash.String()
-	val, err := bs.db.Has([]byte(key), nil)
-	return err == nil && val
+    // Check CID first
+    if c, err := cidutil.FromHash(hash, cidutil.Raw); err == nil {
+        key := cidContentPrefix + c.String()
+        if val, err := bs.db.Has([]byte(key), nil); err == nil && val {
+            return true
+        }
+    }
+    // Fallback legacy
+    key := contentPrefix + hash.String()
+    val, err := bs.db.Has([]byte(key), nil)
+    return err == nil && val
 }
 
 // ListContent returns all content hashes.
 func (bs *Blockstore) ListContent() ([]hasher.Hash, error) {
-	var hashes []hasher.Hash
-	prefix := []byte(contentPrefix)
-	iter := bs.db.NewIterator(util.BytesPrefix(prefix), nil)
-	defer iter.Release()
+    var hashes []hasher.Hash
+    // Prefer CID-indexed entries
+    cidPrefix := []byte(cidContentPrefix)
+    iter := bs.db.NewIterator(util.BytesPrefix(cidPrefix), nil)
+    defer iter.Release()
 
-	for iter.Next() {
-		key := string(iter.Key())
-		hashStr := key[len(contentPrefix):]
-		hash, err := hasher.HashFromString(hashStr)
-		if err != nil {
-			continue
-		}
-		hashes = append(hashes, hash)
-	}
+    for iter.Next() {
+        key := string(iter.Key())
+        cidStr := key[len(cidContentPrefix):]
+        if c, err := cid.Parse(cidStr); err == nil {
+            if h, err := cidutil.ToHash(c); err == nil {
+                hashes = append(hashes, h)
+            }
+        }
+    }
 
-	if err := iter.Error(); err != nil {
-		return nil, fmt.Errorf("iterator error while listing content: %w", err)
-	}
-	return hashes, nil
+    if err := iter.Error(); err != nil {
+        return nil, fmt.Errorf("iterator error while listing content: %w", err)
+    }
+    // If none found under CID index, fallback to legacy keys
+    if len(hashes) == 0 {
+        prefix := []byte(contentPrefix)
+        iter2 := bs.db.NewIterator(util.BytesPrefix(prefix), nil)
+        for iter2.Next() {
+            key := string(iter2.Key())
+            hashStr := key[len(contentPrefix):]
+            if h, err := hasher.HashFromString(hashStr); err == nil {
+                hashes = append(hashes, h)
+            }
+        }
+        iter2.Release()
+    }
+    return hashes, nil
 }
 
 // --- Garbage Collection ---

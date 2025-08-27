@@ -15,7 +15,8 @@ import (
 	"openhashdb/core/blockstore"
 	"openhashdb/core/hasher"
 	"openhashdb/network/bitswap"
-	"openhashdb/protobuf/pb"
+    "openhashdb/protobuf/pb"
+    gs "openhashdb/network/graphsync"
 
 	"github.com/ipfs/go-cid"
 	"github.com/libp2p/go-libp2p"
@@ -49,20 +50,25 @@ const (
 
 // Node represents a libp2p node
 type Node struct {
-	host             host.Host
-	ctx              context.Context
-	cancel           context.CancelFunc
-	mdns             mdns.Service
-	dht              *dht.IpfsDHT
-	heartbeatService *HeartbeatService
-	blockstore       *blockstore.Blockstore
-	bitswap          *bitswap.Engine
-	GossipHandler    func(peer.ID, []byte) error
-	peerEvents       []*pb.PeerEvent
-	peerEventsMu     sync.RWMutex
+    host             host.Host
+    ctx              context.Context
+    cancel           context.CancelFunc
+    mdns             mdns.Service
+    dht              *dht.IpfsDHT
+    heartbeatService *HeartbeatService
+    blockstore       *blockstore.Blockstore
+    bitswap          *bitswap.Engine
+    graphsync        *gs.Engine
+    GossipHandler    func(peer.ID, []byte) error
+    peerEvents       []*pb.PeerEvent
+    peerEventsMu     sync.RWMutex
     // reservedRelays tracks relays (and their addrs) we have active v2 reservations with
     reservedRelays   map[peer.ID]*reservedRelayEntry
     reservedRelaysMu sync.RWMutex
+    // relayCandidates are known relays we can attempt to reserve with
+    relayCandidates   []peer.AddrInfo
+    // desiredRelayReservations is the target count of active relay reservations
+    desiredRelayReservations int
 }
 
 type reservedRelayEntry struct {
@@ -198,24 +204,58 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, staticRelays []
 	}
 
 	nodeCtx, cancel := context.WithCancel(ctx)
-	node := &Node{
-		host:           h,
-		ctx:            nodeCtx,
-		cancel:         cancel,
-		dht:            nodeDHT,
-		peerEvents:     make([]*pb.PeerEvent, 0, MaxPeerEventLogs),
-		reservedRelays: reservedRelays,
-	}
+    node := &Node{
+        host:           h,
+        ctx:            nodeCtx,
+        cancel:         cancel,
+        dht:            nodeDHT,
+        peerEvents:     make([]*pb.PeerEvent, 0, MaxPeerEventLogs),
+        reservedRelays: reservedRelays,
+    }
     node.heartbeatService = NewHeartbeatService(nodeCtx, node)
+    // Initialize GraphSync engine and attach blockstore later when available
+    node.graphsync = gs.New(nodeCtx, h)
     // Delegate protocol handler
     h.SetStreamHandler(ProtocolDelegate, node.handleDelegateStream)
+
+    // Record relay candidates and start background reservation maintainer
+    node.relayCandidates = relayInfos
+    node.desiredRelayReservations = 2
+    go node.ensureRelayReservations()
+    go node.adaptToReachability()
 
 	n := &networkNotifiee{node: node}
 	h.Network().Notify(n)
 
 	h.SetStreamHandler(ProtocolGossip, node.handleGossipStream)
 	// Start a ping service (helpful for keepalive and diagnosing reachability)
-	_ = ping.NewPingService(h)
+    _ = ping.NewPingService(h)
+    // Track ping latencies and feed into registry if bitswap present
+    go func() {
+        for {
+            select {
+            case <-nodeCtx.Done():
+                return
+            case <-time.After(30 * time.Second):
+                for _, pid := range h.Network().Peers() {
+                    go func(pid peer.ID) {
+                        ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+                        defer cancel()
+                        ch := ping.NewPingService(h).Ping(ctx, pid)
+                        // one ping
+                        select {
+                        case res, ok := <-ch:
+                            if ok && n.node.bitswap != nil {
+                                n.node.bitswap.UpdatePeerLatency(pid, res.RTT)
+                            }
+                        case <-ctx.Done():
+                            return
+                        }
+                    }(pid)
+                }
+            }
+        }
+    }()
 
 	if err := node.setupMDNS(); err != nil {
 		log.Printf("[libp2p] Warning: failed to setup mDNS: %v", err)
@@ -256,15 +296,159 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, staticRelays []
 
 // Setters for components that are initialized after the node
 func (n *Node) SetBlockstore(bs *blockstore.Blockstore) {
-	n.blockstore = bs
+    n.blockstore = bs
+    // Attach to graphsync if available
+    if n.graphsync != nil {
+        n.graphsync.WithBlockstore(bs)
+    }
+}
+
+// ensureRelayReservations maintains at least desiredRelayReservations active reservations.
+// It refreshes reservations nearing expiry and proactively connects to candidate relays as needed.
+func (n *Node) ensureRelayReservations() {
+    ticker := time.NewTicker(5 * time.Minute)
+    defer ticker.Stop()
+    for {
+        select {
+        case <-n.ctx.Done():
+            return
+        case <-ticker.C:
+            n.maintainReservations()
+        }
+    }
+}
+
+func (n *Node) maintainReservations() {
+    // Count active (non-expired) reservations
+    now := time.Now()
+    active := 0
+    // refresh window
+    const ttl = 30 * time.Minute
+    const refreshBefore = 5 * time.Minute
+    var toRefresh []peer.AddrInfo
+
+    n.reservedRelaysMu.RLock()
+    for pid, entry := range n.reservedRelays {
+        if now.Sub(entry.reservedAt) < ttl {
+            active++
+            if now.Sub(entry.reservedAt) > (ttl - refreshBefore) {
+                toRefresh = append(toRefresh, peer.AddrInfo{ID: pid, Addrs: entry.addrs})
+            }
+        }
+    }
+    n.reservedRelaysMu.RUnlock()
+
+    // Refresh reservations nearing expiry
+    for _, info := range toRefresh {
+        ctx, cancel := context.WithTimeout(n.ctx, 30*time.Second)
+        _, err := relayv2client.Reserve(ctx, n.host, info)
+        cancel()
+        if err == nil {
+            n.reservedRelaysMu.Lock()
+            n.reservedRelays[info.ID] = &reservedRelayEntry{addrs: info.Addrs, reservedAt: time.Now()}
+            n.reservedRelaysMu.Unlock()
+            // Protect relay connection
+            n.host.ConnManager().Protect(info.ID, "relay-reservation")
+        }
+    }
+
+    // Top up if below desired
+    if active >= n.desiredRelayReservations {
+        return
+    }
+    needed := n.desiredRelayReservations - active
+    // Iterate candidates; connect and reserve
+    for _, cand := range n.relayCandidates {
+        if needed <= 0 { break }
+        // Skip if already reserved and fresh
+        n.reservedRelaysMu.RLock()
+        entry, ok := n.reservedRelays[cand.ID]
+        n.reservedRelaysMu.RUnlock()
+        if ok && now.Sub(entry.reservedAt) < ttl-refreshBefore {
+            continue
+        }
+        // Ensure connection
+        ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+        _ = n.host.Connect(ctx, cand)
+        cancel()
+        // Try reserve
+        ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Second)
+        _, err := relayv2client.Reserve(ctx2, n.host, cand)
+        cancel2()
+        if err != nil {
+            continue
+        }
+        n.reservedRelaysMu.Lock()
+        n.reservedRelays[cand.ID] = &reservedRelayEntry{addrs: cand.Addrs, reservedAt: time.Now()}
+        n.reservedRelaysMu.Unlock()
+        n.host.ConnManager().Protect(cand.ID, "relay-reservation")
+        needed--
+    }
+}
+
+// adaptToReachability periodically checks if we have public non-relayed addresses.
+// If behind NAT (no public addresses), increase relay reservations; otherwise reduce.
+func (n *Node) adaptToReachability() {
+    ticker := time.NewTicker(1 * time.Minute)
+    defer ticker.Stop()
+    for {
+        select {
+        case <-n.ctx.Done():
+            return
+        case <-ticker.C:
+            pub := n.hasPublicAddress()
+            if pub {
+                if n.desiredRelayReservations != 1 {
+                    n.desiredRelayReservations = 1
+                }
+                if n.dht != nil { _ = n.bootstrapDHT() }
+            } else {
+                if n.desiredRelayReservations != 3 {
+                    n.desiredRelayReservations = 3
+                }
+                if n.dht != nil { _ = n.bootstrapDHT() }
+            }
+        }
+    }
+}
+
+func (n *Node) hasPublicAddress() bool {
+    for _, a := range n.host.Addrs() {
+        s := a.String()
+        if strings.Contains(s, "/p2p-circuit") {
+            continue
+        }
+        // treat any non-loopback non-relay as public enough
+        if !strings.Contains(s, "/ip4/127.") && !strings.Contains(s, "/ip6/::1") {
+            return true
+        }
+    }
+    return false
 }
 
 func (n *Node) SetBitswap(b *bitswap.Engine) {
-	n.bitswap = b
+    n.bitswap = b
 }
 
 func (n *Node) GetBitswap() *bitswap.Engine {
-	return n.bitswap
+    return n.bitswap
+}
+
+// GraphSync returns the graphsync engine
+func (n *Node) GraphSync() *gs.Engine { return n.graphsync }
+
+// ProvideCID announces a CID as provided by this node via DHT
+func (n *Node) ProvideCID(ctx context.Context, c cid.Cid) error {
+    if n.dht == nil { return fmt.Errorf("[libp2p] DHT not initialized") }
+    return n.dht.Provide(ctx, c, true)
+}
+
+// FindProvidersCID looks up providers for a CID
+func (n *Node) FindProvidersCID(ctx context.Context, c cid.Cid, max int) ([]peer.AddrInfo, error) {
+    if n.dht == nil { return nil, fmt.Errorf("[libp2p] DHT not initialized") }
+    out := make([]peer.AddrInfo, 0, max)
+    for p := range n.dht.FindProvidersAsync(ctx, c, max) { out = append(out, p) }
+    return out, nil
 }
 
 func (n *Node) Host() host.Host {
@@ -664,16 +848,16 @@ func (n *Node) AnnounceContent(contentHashStr string) error {
 		ctx, cancel := context.WithTimeout(n.ctx, 1*time.Minute)
 		defer cancel()
 
-		mh, err := multihash.Sum([]byte(contentHashStr), multihash.SHA2_256, -1)
-		if err != nil {
-			log.Printf("[libp2p] Attempt %d/%d: Failed to create multihash for %s: %v", attempt, maxRetries, contentHashStr, err)
-			if attempt == maxRetries {
-				return fmt.Errorf("[libp2p] failed to create multihash: %w", err)
-			}
-			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
-			continue
-		}
-		contentCID := cid.NewCidV1(cid.Raw, mh)
+    mhb, err := multihash.Encode(hash[:], multihash.SHA2_256)
+    if err != nil {
+        log.Printf("[libp2p] Attempt %d/%d: Failed to encode multihash for %s: %v", attempt, maxRetries, contentHashStr, err)
+        if attempt == maxRetries {
+            return fmt.Errorf("[libp2p] failed to encode multihash: %w", err)
+        }
+        time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
+        continue
+    }
+    contentCID := cid.NewCidV1(cid.Raw, mhb)
 
 		log.Printf("[libp2p] Attempt %d/%d: Announcing content provider for hash: %s (CID: %s)", attempt, maxRetries, contentHashStr, contentCID.String())
 		if err := n.dht.Provide(ctx, contentCID, true); err != nil {
@@ -698,17 +882,15 @@ func (n *Node) FindContentProviders(contentHash string) ([]peer.AddrInfo, error)
 	ctx, cancel := context.WithTimeout(n.ctx, 2*time.Minute)
 	defer cancel()
 
-	hash, err := multihash.FromHexString(contentHash)
-	if err != nil {
-		mh, err := multihash.Sum([]byte(contentHash), multihash.SHA2_256, -1)
-		if err != nil {
-			log.Printf("[libp2p] Failed to create multihash for %s: %v", contentHash, err)
-			return nil, fmt.Errorf("[libp2p] failed to create multihash: %w", err)
-		}
-		hash = mh
-	}
-
-	contentCID := cid.NewCidV1(cid.Raw, hash)
+    h, err := hasher.HashFromString(contentHash)
+    if err != nil {
+        return nil, fmt.Errorf("[libp2p] invalid content hash: %w", err)
+    }
+    mhb, err := multihash.Encode(h[:], multihash.SHA2_256)
+    if err != nil {
+        return nil, fmt.Errorf("[libp2p] failed to encode multihash: %w", err)
+    }
+    contentCID := cid.NewCidV1(cid.Raw, mhb)
 	log.Printf("[libp2p] Finding providers for content hash: %s (CID: %s)", contentHash, contentCID.String())
 
 	providers := n.dht.FindProvidersAsync(ctx, contentCID, 20)

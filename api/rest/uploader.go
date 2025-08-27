@@ -1,14 +1,14 @@
 package rest
 
 import (
-	"io"
-	"log"
-	"net/http"
-	"os"
-	"path/filepath"
-	"strings"
+    "io"
+    "log"
+    "net/http"
+    "os"
+    "path/filepath"
+    "strings"
 
-	"openhashdb/protobuf/pb"
+    "openhashdb/core/cidutil"
 )
 
 // uploadFile handles single file uploads
@@ -32,14 +32,16 @@ func (s *Server) uploadFile(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Failed to announce content: %v", err)
 	}
 
-	response := &pb.UploadResponse{
-		Hash:     hash.String(),
-		Size:     size,
-		Filename: header.Filename,
-		Message:  "File uploaded successfully",
-	}
-
-	s.writeJSON(w, http.StatusOK, response)
+    // Build CID (raw codec) for response
+    c, _ := cidutil.FromHash(hash, cidutil.Raw)
+    response := map[string]interface{}{
+        "hash":     hash.String(),
+        "cid":      c.String(),
+        "size":     size,
+        "filename": header.Filename,
+        "message":  "File uploaded successfully",
+    }
+    s.writeJSON(w, http.StatusOK, response)
 }
 
 // uploadFolder handles folder uploads
@@ -127,12 +129,13 @@ func (s *Server) uploadFolder(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Failed to announce content: %v", err)
 	}
 
-	response := &pb.UploadResponse{
-		Hash:     link.Hash.String(),
-		Size:     link.Size,
-		Filename: folderName,
-		Message:  "Folder uploaded successfully",
-	}
-
-	s.writeJSON(w, http.StatusOK, response)
+    c, _ := cidutil.FromHash(link.Hash, cidutil.Raw)
+    response := map[string]interface{}{
+        "hash":     link.Hash.String(),
+        "cid":      c.String(),
+        "size":     link.Size,
+        "filename": folderName,
+        "message":  "Folder uploaded successfully",
+    }
+    s.writeJSON(w, http.StatusOK, response)
 }

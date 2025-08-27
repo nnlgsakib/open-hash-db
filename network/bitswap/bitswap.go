@@ -13,12 +13,14 @@ import (
 
     "openhashdb/core/block"
     "openhashdb/core/blockstore"
+    "openhashdb/core/cidutil"
     "openhashdb/core/hasher"
     "openhashdb/network/intelligence"
     "openhashdb/network/protocols"
     "openhashdb/protobuf/pb"
 
     "github.com/google/uuid"
+    cid "github.com/ipfs/go-cid"
     "github.com/libp2p/go-libp2p/core/host"
     "github.com/libp2p/go-libp2p/core/network"
     "github.com/libp2p/go-libp2p/core/peer"
@@ -26,14 +28,16 @@ import (
     "google.golang.org/protobuf/proto"
     "github.com/prometheus/client_golang/prometheus"
     "github.com/prometheus/client_golang/prometheus/promauto"
+    "sort"
 )
 
 const (
-	ProtocolBitswap        = protocol.ID("/openhashdb/bitswap/1.2.0")
-	sendWantlistInterval   = 10 * time.Second
-	presenceCacheTTL       = 1 * time.Minute
-	maxConcurrentDownloads = 8
-	providerSearchTimeout  = 5 * time.Minute
+    ProtocolBitswap        = protocol.ID("/openhashdb/bitswap/1.2.0")
+    sendWantlistInterval   = 10 * time.Second
+    presenceCacheTTL       = 1 * time.Minute
+    maxConcurrentDownloads = 8
+    providerSearchTimeout  = 5 * time.Minute
+    maxConcurrentUpper     = 16
 )
 
 // Metrics for delegated fetching
@@ -86,6 +90,13 @@ func NewEngine(ctx context.Context, h host.Host, bs *blockstore.Blockstore) *Eng
 // SetRegistry allows plugging a custom registry (primarily for tests)
 func (e *Engine) SetRegistry(r *intelligence.Registry) { e.registry = r }
 
+// UpdatePeerLatency allows external observers (e.g., ping) to feed latency into provider scoring
+func (e *Engine) UpdatePeerLatency(p peer.ID, lat time.Duration) {
+    if e.registry != nil {
+        e.registry.UpdatePeerLatency(p, lat)
+    }
+}
+
 // GetBlock fetches a single block, waiting for it to become available from the network.
 func (e *Engine) GetBlock(ctx context.Context, h hasher.Hash) (block.Block, error) {
 	if has, _ := e.blockstore.Has(h); has {
@@ -110,10 +121,10 @@ func (e *Engine) GetBlock(ctx context.Context, h hasher.Hash) (block.Block, erro
 
 // GetBlocks fetches multiple blocks concurrently from the network.
 func (e *Engine) GetBlocks(ctx context.Context, hashes []hasher.Hash) (<-chan block.Block, error) {
-	session := e.downloadMgr.NewSession(ctx, hashes)
-	output := make(chan block.Block)
+    session := e.downloadMgr.NewSession(ctx, hashes)
+    output := make(chan block.Block)
 
-	go func() {
+    go func() {
 		defer close(output)
 		defer e.downloadMgr.CloseSession(session.id)
 
@@ -142,11 +153,19 @@ func (e *Engine) GetBlocks(ctx context.Context, hashes []hasher.Hash) (<-chan bl
 		}
 		e.broadcastWantlist()
 
-		var wg sync.WaitGroup
-		for i := 0; i < maxConcurrentDownloads; i++ {
-			wg.Add(1)
-			go e.downloadWorker(session, &wg)
-		}
+        // Adaptive concurrency based on provider counts (rarest-first heuristic)
+        totalProviders := 0
+        for _, h := range initialWants {
+            totalProviders += e.registry.ProviderCount(h)
+        }
+        conc := 2 + totalProviders*2
+        if conc > maxConcurrentUpper { conc = maxConcurrentUpper }
+        if conc < 2 { conc = 2 }
+        var wg sync.WaitGroup
+        for i := 0; i < conc; i++ {
+            wg.Add(1)
+            go e.downloadWorker(session, &wg)
+        }
 
 		// Collect results
 		for i := 0; i < len(initialWants); i++ {
@@ -185,12 +204,12 @@ func (e *Engine) downloadWorker(session *DownloadSession, wg *sync.WaitGroup) {
         // Probe direct peers first
         e.probePeersForWant(hash, true)
         waitCtx, cancel := context.WithTimeout(session.ctx, 3*time.Second)
-        peer, err := session.WaitForProvider(waitCtx, hash)
+        prov, err := session.WaitForProvider(waitCtx, hash)
         cancel()
         if err != nil {
             // Expand to relayed peers
             e.probePeersForWant(hash, false)
-            peer, err = session.WaitForProvider(session.ctx, hash)
+            prov, err = session.WaitForProvider(session.ctx, hash)
         }
 
         if err != nil {
@@ -205,8 +224,27 @@ func (e *Engine) downloadWorker(session *DownloadSession, wg *sync.WaitGroup) {
             continue
         }
 
-        // log.Printf("[Bitswap Worker] Requesting block %s from peer %s", hash, peer)
-        e.sendWantBlockToPeer(peer, hash)
+        // log.Printf("[Bitswap Worker] Requesting block %s from peer %s", hash, prov)
+        e.sendWantBlockToPeer(prov, hash)
+        session.NoteRequest(hash, prov)
+        // Watchdog: if not fulfilled within deadline, requeue (handles slow or unresponsive peers)
+        go func(h hasher.Hash, pid peer.ID) {
+            // Longer timeout for relayed peers
+            timeout := 6 * time.Second
+            if e.classifyPeer(pid) == intelligence.PeerTypeRelayed {
+                timeout = 12 * time.Second
+            }
+            t := time.NewTimer(timeout)
+            defer t.Stop()
+            select {
+            case <-t.C:
+                if !session.IsDone(h) {
+                    session.RequeueWant(h)
+                }
+            case <-session.ctx.Done():
+                return
+            }
+        }(hash, prov)
     }
 }
 
@@ -362,11 +400,20 @@ func (e *Engine) handleNewStream(s network.Stream) {
 
 func (e *Engine) handleIncomingBlocks(blocks []*pb.Message_Block, remotePeer peer.ID) {
     for _, b := range blocks {
-        hash, err := hasher.HashFromBytes(b.Hash)
-        if err != nil {
-            continue
+        var expected hasher.Hash
+        var err error
+        if len(b.Hash) == len(expected) {
+            expected, err = hasher.HashFromBytes(b.Hash)
+        } else {
+            expected, err = parseWantToHash(b.Hash)
         }
-        newBlock := block.NewBlockWithHash(hash, b.Data)
+        if err != nil {
+            expected = hasher.HashBytes(b.Data)
+        }
+        if lat, ok := e.downloadMgr.NoteProviderResponse(expected, remotePeer); ok {
+            e.registry.NoteBlockServed(remotePeer, lat)
+        }
+        newBlock := block.NewBlockWithHash(expected, b.Data)
         log.Printf("[Bitswap] Received block %s from %s", newBlock.Hash().String(), remotePeer.String())
         e.blockstore.Put(newBlock)
         e.wantlist.Remove(newBlock.Hash())
@@ -377,7 +424,7 @@ func (e *Engine) handleIncomingBlocks(blocks []*pb.Message_Block, remotePeer pee
 
 func (e *Engine) handleIncomingPresences(presences []*pb.Message_BlockPresence, remotePeer peer.ID) {
     for _, pres := range presences {
-        hash, err := hasher.HashFromBytes(pres.Hash)
+        hash, err := parseWantToHash(pres.Hash)
         if err != nil {
             continue
         }
@@ -389,6 +436,21 @@ func (e *Engine) handleIncomingPresences(presences []*pb.Message_BlockPresence, 
             e.downloadMgr.DistributeHave(hash, remotePeer)
         }
     }
+}
+
+// parseWantToHash tries to resolve a want identifier to a local hash.
+// Accepts either 32-byte digest or CID bytes (binary or string-encoded).
+func parseWantToHash(b []byte) (hasher.Hash, error) {
+    if len(b) == len(hasher.Hash{}) {
+        return hasher.HashFromBytes(b)
+    }
+    if c, err := cid.Cast(b); err == nil {
+        return cidutil.ToHash(c)
+    }
+    if c, err := cid.Parse(string(b)); err == nil {
+        return cidutil.ToHash(c)
+    }
+    return hasher.Hash{}, fmt.Errorf("unknown want identifier")
 }
 
 func (e *Engine) getOrCreateLedger(p peer.ID) *peerLedger {
@@ -474,16 +536,27 @@ func (e *Engine) sendWantlistToPeer(p peer.ID, full bool) {
     if len(wl) == 0 {
         return
     }
+    // Rarest-first: order by provider count ascending
     // Filter wants using registry hints to avoid spamming peers that likely don't have the data
-    var entries []*pb.Message_Wantlist_Entry
-    for _, entry := range wl {
-        if e.registry.ShouldProbePeerFor(p, entry.Hash) {
-            entries = append(entries, &pb.Message_Wantlist_Entry{
-                Hash:     entry.Hash[:],
-                Priority: int32(entry.Priority),
-                WantType: entry.WantType,
-            })
+    type wantWrap struct{ entry WantlistEntry; providers int }
+    wants := make([]wantWrap, 0, len(wl))
+    for _, e1 := range wl {
+        if e.registry.ShouldProbePeerFor(p, e1.Hash) {
+            wants = append(wants, wantWrap{entry: e1, providers: e.registry.ProviderCount(e1.Hash)})
         }
+    }
+    sort.Slice(wants, func(i, j int) bool {
+        if wants[i].providers != wants[j].providers { return wants[i].providers < wants[j].providers }
+        return wants[i].entry.Priority > wants[j].entry.Priority
+    })
+    var entries []*pb.Message_Wantlist_Entry
+    for _, w := range wants {
+        c, _ := cidutil.FromHash(w.entry.Hash, cidutil.Raw)
+        entries = append(entries, &pb.Message_Wantlist_Entry{
+            Hash:     c.Bytes(),
+            Priority: int32(w.entry.Priority),
+            WantType: w.entry.WantType,
+        })
     }
     if len(entries) == 0 {
         return
@@ -495,24 +568,28 @@ func (e *Engine) sendWantlistToPeer(p peer.ID, full bool) {
 }
 
 func (e *Engine) sendWantBlockToPeer(p peer.ID, h hasher.Hash) {
-	entry := &pb.Message_Wantlist_Entry{
-		Hash:     h[:],
-		Priority: 100,
-		WantType: pb.Message_Wantlist_Entry_Block,
-	}
-	msg := &pb.Message{
-		Wantlist: &pb.Message_Wantlist{Entries: []*pb.Message_Wantlist_Entry{entry}},
-	}
-	e.sendMessage(p, msg)
+    c, _ := cidutil.FromHash(h, cidutil.Raw)
+    entry := &pb.Message_Wantlist_Entry{
+        Hash:     c.Bytes(),
+        Priority: 100,
+        WantType: pb.Message_Wantlist_Entry_Block,
+    }
+    msg := &pb.Message{Wantlist: &pb.Message_Wantlist{Entries: []*pb.Message_Wantlist_Entry{entry}}}
+    e.sendMessage(p, msg)
 }
 
 func (e *Engine) sendMatchingBlocks(p peer.ID, wl *pb.Message_Wantlist) {
     var blocksToSend []*pb.Message_Block
     var presencesToSend []*pb.Message_BlockPresence
     ledger := e.getOrCreateLedger(p)
+    // Simple reciprocity policy: deprioritize block sending for poor reciprocators
+    ledger.mu.RLock()
+    sent, recv := ledger.bytesSent, ledger.bytesRecv
+    ledger.mu.RUnlock()
+    leech := recv > 0 && sent > 4*recv
 
     for _, entry := range wl.Entries {
-        hash, err := hasher.HashFromBytes(entry.Hash)
+        hash, err := parseWantToHash(entry.Hash)
         if err != nil {
             continue
         }
@@ -520,7 +597,7 @@ func (e *Engine) sendMatchingBlocks(p peer.ID, wl *pb.Message_Wantlist) {
         hasMeta := e.blockstore.HasContent(hash)
 
         if entry.WantType == pb.Message_Wantlist_Entry_Block {
-            if has {
+            if has && !leech {
                 blk, err := e.blockstore.Get(hash)
                 if err != nil {
                     log.Printf("[Bitswap] Core Error: Failed to get block %s from blockstore, but Has() was true: %v", hash, err)
@@ -599,16 +676,18 @@ func (dm *DownloadManager) NewSession(ctx context.Context, hashes []hasher.Hash)
 	defer dm.mu.Unlock()
 
 	sessCtx, cancel := context.WithCancel(ctx)
-	s := &DownloadSession{
-		id:         uuid.New().String(),
-		ctx:        sessCtx,
-		cancel:     cancel,
-		wants:      make(chan hasher.Hash, len(hashes)),
-		providers:  make(map[hasher.Hash]map[peer.ID]struct{}),
-		provChans:  make(map[hasher.Hash]chan peer.ID),
-		output:     make(chan block.Block, len(hashes)),
-		doneBlocks: make(map[hasher.Hash]struct{}),
-	}
+    s := &DownloadSession{
+        id:         uuid.New().String(),
+        ctx:        sessCtx,
+        cancel:     cancel,
+        wants:      make(chan hasher.Hash, len(hashes)),
+        providers:  make(map[hasher.Hash]map[peer.ID]struct{}),
+        provChans:  make(map[hasher.Hash]chan peer.ID),
+        output:     make(chan block.Block, len(hashes)),
+        doneBlocks: make(map[hasher.Hash]struct{}),
+        reqTime:    make(map[hasher.Hash]time.Time),
+        reqPeer:    make(map[hasher.Hash]peer.ID),
+    }
 
 	for _, h := range hashes {
 		s.wants <- h
@@ -644,16 +723,32 @@ func (dm *DownloadManager) DistributeHave(h hasher.Hash, p peer.ID) {
 	}
 }
 
+// NoteProviderResponse informs sessions that a response arrived from a peer for a given hash.
+// Returns the first latency found.
+func (dm *DownloadManager) NoteProviderResponse(h hasher.Hash, p peer.ID) (time.Duration, bool) {
+    dm.mu.RLock()
+    defer dm.mu.RUnlock()
+    for _, s := range dm.sessions {
+        if lat, ok := s.NoteResponse(h, p); ok {
+            return lat, true
+        }
+    }
+    return 0, false
+}
+
+
 type DownloadSession struct {
-	id         string
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wants      chan hasher.Hash
-	providers  map[hasher.Hash]map[peer.ID]struct{}
-	provChans  map[hasher.Hash]chan peer.ID
-	output     chan block.Block
-	doneBlocks map[hasher.Hash]struct{}
-	mu         sync.RWMutex
+    id         string
+    ctx        context.Context
+    cancel     context.CancelFunc
+    wants      chan hasher.Hash
+    providers  map[hasher.Hash]map[peer.ID]struct{}
+    provChans  map[hasher.Hash]chan peer.ID
+    output     chan block.Block
+    doneBlocks map[hasher.Hash]struct{}
+    mu         sync.RWMutex
+    reqTime    map[hasher.Hash]time.Time
+    reqPeer    map[hasher.Hash]peer.ID
 }
 
 func (s *DownloadSession) NextWant() (hasher.Hash, bool) {
@@ -673,9 +768,37 @@ func (s *DownloadSession) RequeueWant(h hasher.Hash) {
 }
 
 func (s *DownloadSession) MarkAsDone(h hasher.Hash) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.doneBlocks[h] = struct{}{}
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    s.doneBlocks[h] = struct{}{}
+}
+
+func (s *DownloadSession) IsDone(h hasher.Hash) bool {
+    s.mu.RLock()
+    defer s.mu.RUnlock()
+    _, ok := s.doneBlocks[h]
+    return ok
+}
+
+func (s *DownloadSession) NoteRequest(h hasher.Hash, p peer.ID) {
+    s.mu.Lock()
+    s.reqTime[h] = time.Now()
+    s.reqPeer[h] = p
+    s.mu.Unlock()
+}
+
+// NoteResponse returns latency if we had a request recorded for this hash and peer.
+func (s *DownloadSession) NoteResponse(h hasher.Hash, p peer.ID) (time.Duration, bool) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    if tp, ok := s.reqPeer[h]; ok && tp == p {
+        if t0, ok2 := s.reqTime[h]; ok2 {
+            delete(s.reqTime, h)
+            delete(s.reqPeer, h)
+            return time.Since(t0), true
+        }
+    }
+    return 0, false
 }
 
 func (s *DownloadSession) addProvider(h hasher.Hash, p peer.ID) {

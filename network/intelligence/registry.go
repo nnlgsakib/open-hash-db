@@ -21,6 +21,9 @@ type Registry struct {
 
     // peer -> last type classification
     peerTypes map[peer.ID]PeerType
+
+    // peer -> last known latency
+    peerLatency map[peer.ID]time.Duration
 }
 
 func NewRegistry() *Registry {
@@ -28,6 +31,7 @@ func NewRegistry() *Registry {
         providers: make(map[hasher.Hash]map[peer.ID]*ProviderMeta),
         peerBlooms: make(map[peer.ID]*Bloom),
         peerTypes: make(map[peer.ID]PeerType),
+        peerLatency: make(map[peer.ID]time.Duration),
     }
 }
 
@@ -64,6 +68,7 @@ func (r *Registry) RegisterHave(p peer.ID, h hasher.Hash) {
 func (r *Registry) NoteBlockServed(p peer.ID, latency time.Duration) {
     r.mu.Lock()
     defer r.mu.Unlock()
+    r.peerLatency[p] = latency
     for _, peers := range r.providers {
         if pm, ok := peers[p]; ok {
             // Simple EWMA for latency and additive score
@@ -140,3 +145,48 @@ func (r *Registry) ShouldProbePeerFor(p peer.ID, h hasher.Hash) bool {
     return true
 }
 
+// ProviderCount returns the number of known providers for a given hash.
+func (r *Registry) ProviderCount(h hasher.Hash) int {
+    r.mu.RLock()
+    defer r.mu.RUnlock()
+    if mp, ok := r.providers[h]; ok {
+        return len(mp)
+    }
+    return 0
+}
+
+// UpdatePeerLatency stores the measured latency for a peer (e.g., from ping or request timing).
+func (r *Registry) UpdatePeerLatency(p peer.ID, latency time.Duration) {
+    r.mu.Lock()
+    r.peerLatency[p] = latency
+    // also update any provider metas
+    for _, peers := range r.providers {
+        if pm, ok := peers[p]; ok {
+            if pm.Latency == 0 {
+                pm.Latency = latency
+            } else {
+                pm.Latency = time.Duration(0.7*float64(pm.Latency) + 0.3*float64(latency))
+            }
+            pm.LastSeen = time.Now()
+        }
+    }
+    r.mu.Unlock()
+}
+
+// AverageLatency estimates average latency for a set of hashes by looking at their providers.
+func (r *Registry) AverageLatency(hashes []hasher.Hash) time.Duration {
+    r.mu.RLock()
+    defer r.mu.RUnlock()
+    var sum time.Duration
+    var n int
+    for _, h := range hashes {
+        for _, pm := range r.providers[h] {
+            if pm.Latency > 0 {
+                sum += pm.Latency
+                n++
+            }
+        }
+    }
+    if n == 0 { return 0 }
+    return time.Duration(int64(sum) / int64(n))
+}
