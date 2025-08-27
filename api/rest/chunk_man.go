@@ -256,21 +256,32 @@ func (s *Server) streamChunkWithBuffer(ctx context.Context, w io.Writer, hash ha
 		}
 	}
 
-	// Retrieve the block from storage
-	blk, err := s.storage.Get(hash)
-	if err != nil {
-		return fmt.Errorf("failed to get block %s from storage: %w", hash, err)
-	}
+    // Retrieve the block from storage
+    blk, err := s.storage.Get(hash)
+    if err != nil {
+        return fmt.Errorf("failed to get block %s from storage: %w", hash, err)
+    }
 
-	data := blk.RawData()
+    data := blk.RawData()
 
 	// Add to cache for future use
 	s.chunkCache.Put(hash.String(), data)
 
-	// Write the requested part of the chunk
-	if _, err := w.Write(data[offset : offset+length]); err != nil {
-		return err
-	}
+    // Clamp bounds to prevent panics in case of size mismatches
+    if offset < 0 {
+        offset = 0
+    }
+    if offset > len(data) {
+        offset = len(data)
+    }
+    end := offset + length
+    if end > len(data) {
+        end = len(data)
+    }
+    // Write the requested part of the chunk
+    if _, err := w.Write(data[offset:end]); err != nil {
+        return err
+    }
 
 	return nil
 }

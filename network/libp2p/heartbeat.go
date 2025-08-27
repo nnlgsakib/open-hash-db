@@ -191,7 +191,11 @@ func isProtocolUnsupported(err error) bool {
     s := err.Error()
     if strings.Contains(s, "protocol not supported") ||
         strings.Contains(s, "protocol negotiation failed") ||
-        strings.Contains(s, "no handler for protocol") {
+        strings.Contains(s, "no handler for protocol") ||
+        // Treat common relay/remote drops as non-fatal for heartbeat
+        strings.Contains(s, "unexpected EOF") ||
+        strings.Contains(s, "stream reset") ||
+        strings.Contains(s, "connection closed") {
         return true
     }
     return false

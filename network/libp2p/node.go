@@ -1,15 +1,16 @@
 package libp2p
 
 import (
-	"context"
-	"crypto/rand"
-	"encoding/base64"
-	"fmt"
-	"log"
-	"os"
-	"path/filepath"
-	"sync"
-	"time"
+    "context"
+    "crypto/rand"
+    "encoding/base64"
+    "fmt"
+    "log"
+    "os"
+    "path/filepath"
+    "strings"
+    "sync"
+    "time"
 
 	"openhashdb/core/blockstore"
 	"openhashdb/core/hasher"
@@ -27,15 +28,17 @@ import (
 	"github.com/libp2p/go-libp2p/core/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"github.com/libp2p/go-libp2p/p2p/net/swarm"
-	relayv2client "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
-	circuit "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
-	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
-	"github.com/libp2p/go-libp2p/p2p/security/noise"
-	quic "github.com/libp2p/go-libp2p/p2p/transport/quic"
-	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
-	"github.com/multiformats/go-multiaddr"
-	"github.com/multiformats/go-multihash"
-	"google.golang.org/protobuf/types/known/timestamppb"
+    relayv2client "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
+    circuit "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
+    "github.com/libp2p/go-libp2p/p2p/protocol/ping"
+    "github.com/libp2p/go-libp2p/p2p/security/noise"
+    quic "github.com/libp2p/go-libp2p/p2p/transport/quic"
+    "github.com/libp2p/go-libp2p/p2p/transport/tcp"
+    "github.com/multiformats/go-multiaddr"
+    "github.com/multiformats/go-multihash"
+    "google.golang.org/protobuf/types/known/timestamppb"
+    "github.com/prometheus/client_golang/prometheus"
+    "github.com/prometheus/client_golang/prometheus/promauto"
 )
 
 const (
@@ -66,6 +69,22 @@ type reservedRelayEntry struct {
     addrs      []multiaddr.Multiaddr
     reservedAt time.Time
 }
+
+// Metrics for relay reservations
+var (
+    relayReservationAttempts = promauto.NewCounter(prometheus.CounterOpts{
+        Name: "openhashdb_relay_reservation_attempts_total",
+        Help: "Total number of relay reservation attempts",
+    })
+    relayReservationSuccess = promauto.NewCounter(prometheus.CounterOpts{
+        Name: "openhashdb_relay_reservation_success_total",
+        Help: "Total number of successful relay reservations",
+    })
+    relayReservationFailures = promauto.NewCounter(prometheus.CounterOpts{
+        Name: "openhashdb_relay_reservation_failures_total",
+        Help: "Total number of failed relay reservations",
+    })
+)
 
 // NewNodeWithKeyPath creates a new libp2p node
 func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, staticRelays []string, keyPath string, p2pPort int) (*Node, error) {
@@ -269,19 +288,19 @@ func (n *networkNotifiee) Connected(net network.Network, conn network.Conn) {
 	}
 
 	// Try to make a reservation with the peer if it supports relaying
-	go func(p peer.ID) {
+    go func(p peer.ID) {
 		// Use a background context because the connection is already established
 		// and we don't want to block the notifier.
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
 		defer cancel()
 
 		pinfo := n.node.host.Peerstore().PeerInfo(p)
-		protocols, err := n.node.host.Peerstore().GetProtocols(p)
-		if err != nil {
-			// Can happen if the peer disconnects quickly
-			log.Printf("[libp2p] Could not get protocols for peer %s: %v", p, err)
-			return
-		}
+        protocols, err := n.node.host.Peerstore().GetProtocols(p)
+        if err != nil {
+            // Can happen if the peer disconnects quickly
+            log.Printf("[libp2p] Could not get protocols for peer %s: %v", p, err)
+            return
+        }
 
 		hasRelay := false
 		for _, proto := range protocols {
@@ -291,22 +310,39 @@ func (n *networkNotifiee) Connected(net network.Network, conn network.Conn) {
 			}
 		}
 
-		if !hasRelay {
-			return // Not a relay
-		}
+        // Only attempt reservation if the connection to this peer is direct (not via circuit)
+        // to avoid attempting to reserve with non-relay peers reached through a relay.
+        isRelayed := false
+        if c := n.node.host.Network().ConnsToPeer(p); len(c) > 0 {
+            // Inspect any of the remote multiaddrs for /p2p-circuit
+            for _, cc := range c {
+                if cc != nil && cc.RemoteMultiaddr() != nil {
+                    if strings.Contains(cc.RemoteMultiaddr().String(), "/p2p-circuit") {
+                        isRelayed = true
+                        break
+                    }
+                }
+            }
+        }
+        if !hasRelay || isRelayed {
+            return // Not a relay
+        }
 
 		log.Printf("[libp2p] Attempting to reserve slot with newly connected relay: %s", p)
+        relayReservationAttempts.Inc()
         _, err = relayv2client.Reserve(ctx, n.node.host, pinfo)
         if err != nil {
             log.Printf("[libp2p] Failed to reserve slot with %s: %v", p, err)
+            relayReservationFailures.Inc()
         } else {
             log.Printf("[libp2p] Successfully reserved slot with %s", p)
             // Track reservation addrs for AddrsFactory to advertise
             n.node.reservedRelaysMu.Lock()
             n.node.reservedRelays[p] = &reservedRelayEntry{addrs: pinfo.Addrs, reservedAt: time.Now()}
             n.node.reservedRelaysMu.Unlock()
+            relayReservationSuccess.Inc()
         }
-	}(conn.RemotePeer())
+    }(conn.RemotePeer())
 }
 
 func (n *networkNotifiee) Disconnected(net network.Network, conn network.Conn) {
