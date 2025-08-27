@@ -187,7 +187,9 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, staticRelays []
 		peerEvents:     make([]*pb.PeerEvent, 0, MaxPeerEventLogs),
 		reservedRelays: reservedRelays,
 	}
-	node.heartbeatService = NewHeartbeatService(nodeCtx, node)
+    node.heartbeatService = NewHeartbeatService(nodeCtx, node)
+    // Delegate protocol handler
+    h.SetStreamHandler(ProtocolDelegate, node.handleDelegateStream)
 
 	n := &networkNotifiee{node: node}
 	h.Network().Notify(n)
