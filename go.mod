@@ -74,6 +74,7 @@ require (
 	github.com/multiformats/go-multistream v0.6.1 // indirect
 	github.com/multiformats/go-varint v0.0.7 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
+	github.com/nnlgsakib/tmt-go v1.0.0 // indirect
 	github.com/nxadm/tail v1.4.11 // indirect
 	github.com/onsi/ginkgo/v2 v2.23.4 // indirect
 	github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58 // indirect
