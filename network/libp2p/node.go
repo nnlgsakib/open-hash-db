@@ -95,7 +95,7 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 		libp2p.Transport(quic.NewTransport),
 		libp2p.Routing(func(h host.Host) (routing.PeerRouting, error) {
 			nodeDHT, err = dht.New(ctx, h,
-				dht.Mode(dht.ModeAuto),
+				dht.Mode(dht.ModeServer),
 				dht.BootstrapPeers(addrInfos...),
 				dht.BucketSize(20),
 			)
@@ -117,6 +117,9 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 		peerEvents: make([]*pb.PeerEvent, 0, MaxPeerEventLogs),
 	}
 	node.router = NewRouting(node, nodeDHT)
+	if err := node.router.Bootstrap(); err != nil {
+		return nil, fmt.Errorf("failed to bootstrap DHT: %w", err)
+	}
 
 	node.relayer, err = NewRelayer(nodeCtx, h)
 	if err != nil {
@@ -139,12 +142,6 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 	// for _, addr := range h.Addrs() {
 	// 	log.Printf("  %s/p2p/%s", addr, h.ID().String())
 	// }
-
-	go func() {
-		if err := node.connectToBootnodes(allBootnodes); err != nil {
-			log.Printf("[libp2p] Warning: failed to connect to some bootnodes: %v", err)
-		}
-	}()
 
 	return node, nil
 }
@@ -180,6 +177,11 @@ func (n *networkNotifiee) Connected(net network.Network, conn network.Conn) {
 	n.node.heartbeatService.MonitorConnection(conn.RemotePeer())
 	if n.node.bitswap != nil {
 		n.node.bitswap.HandleNewPeer(conn.RemotePeer())
+	}
+
+	// Add the newly connected peer to the DHT's routing table
+	if n.node.router != nil && n.node.router.dht != nil {
+		n.node.router.dht.RoutingTable().TryAddPeer(conn.RemotePeer(), true, true)
 	}
 
 	// Try to make a reservation with the peer if it supports relaying

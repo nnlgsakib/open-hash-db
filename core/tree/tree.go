@@ -1,4 +1,4 @@
-package merkle
+package tree
 
 import (
 	"fmt"
@@ -27,6 +27,7 @@ type File struct {
 	Root      tmt.Hash
 	Chunks    []chunker.ChunkInfo
 	TotalSize int64
+	tree      *tmt.TernaryMeshTree
 }
 
 // Directory represents a directory as a list of links to its contents.
@@ -66,6 +67,7 @@ func BuildFileTree(r io.Reader, c *chunker.Chunker) (*File, []chunker.Chunk, err
 		Root:      root,
 		Chunks:    chunkedFile.Chunks,
 		TotalSize: chunkedFile.TotalSize,
+		tree:      tree,
 	}
 	return file, chunks, nil
 }
@@ -109,6 +111,7 @@ func BuildErasureCodedFileTree(r io.Reader, s sharder.ErasureCoder) (*File, []bl
 		Root:      root,
 		Chunks:    shardInfos,
 		TotalSize: int64(len(data)),
+		tree:      tree,
 	}
 	return file, shardBlocks, nil
 }
@@ -143,4 +146,19 @@ func BuildDirectoryTree(links []Link) (tmt.Hash, error) {
 	}
 	root, _ := tree.RootHash()
 	return root, nil
+}
+
+// ------------------ Verification ------------------
+
+// GenerateProof generates a verification proof for a leaf in a file tree.
+func (f *File) GenerateProof(leafIndex int) (tmt.VerificationProof, error) {
+	if f.tree == nil {
+		return tmt.VerificationProof{}, fmt.Errorf("tree is not available")
+	}
+	return f.tree.GenerateProof(leafIndex)
+}
+
+// VerifyProof verifies a proof for a given leaf data.
+func VerifyProof(proof tmt.VerificationProof, leafData []byte, rootHash tmt.Hash) (bool, error) {
+	return tmt.VerifyProofWithRoot(proof, leafData, rootHash)
 }

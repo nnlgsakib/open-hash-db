@@ -14,7 +14,8 @@ import (
 	"openhashdb/api/pages"
 	"openhashdb/core/block"
 	"openhashdb/core/hasher"
-	"openhashdb/core/merkle"
+	"openhashdb/core/tree"
+	"openhashdb/core/tmt"
 	"openhashdb/core/utils"
 	"openhashdb/protobuf/pb"
 
@@ -147,7 +148,7 @@ func (s *Server) showDirectoryListing(w http.ResponseWriter, r *http.Request, me
 func (s *Server) storeUploadedFile(filename string, reader io.Reader, useEC bool) (hasher.Hash, int64, error) {
 	if useEC {
 		// Erasure Coding Path
-		merkleFile, shards, err := merkle.BuildErasureCodedFileTree(reader, s.sharder)
+		treeFile, shards, err := tree.BuildErasureCodedFileTree(reader, s.sharder)
 		if err != nil {
 			return hasher.Hash{}, 0, fmt.Errorf("failed to build erasure-coded merkle tree: %w", err)
 		}
@@ -155,21 +156,21 @@ func (s *Server) storeUploadedFile(filename string, reader io.Reader, useEC bool
 		for _, shard := range shards {
 			if has, _ := s.storage.Has(shard.Hash()); !has {
 				if err := s.storage.Put(shard); err != nil {
-					return hasher.Hash{}, 0, fmt.Errorf("failed to store shard %s: %w", shard.Hash().String(), err)
+					return hasher.Hash{}, 0, fmt.Errorf("failed to store shard %s: %w", tmt.HashToHex(shard.Hash()), err)
 				}
 			}
 		}
 
-		chunks := make([]*pb.ChunkInfo, len(merkleFile.Chunks))
-		for i, c := range merkleFile.Chunks {
+		chunks := make([]*pb.ChunkInfo, len(treeFile.Chunks))
+		for i, c := range treeFile.Chunks {
 			chunks[i] = &pb.ChunkInfo{Hash: c.Hash[:], Size: int64(c.Size)}
 		}
 
 		metadata := &pb.ContentMetadata{
-			Hash:           merkleFile.Root[:],
+			Hash:           treeFile.Root[:],
 			Filename:       filename,
 			MimeType:       utils.GetMimeType(filename),
-			Size:           merkleFile.TotalSize,
+			Size:           treeFile.TotalSize,
 			ModTime:        timestamppb.Now(),
 			IsDirectory:    false,
 			CreatedAt:      timestamppb.Now(),
@@ -185,7 +186,7 @@ func (s *Server) storeUploadedFile(filename string, reader io.Reader, useEC bool
 		if err != nil {
 			return hasher.Hash{}, 0, fmt.Errorf("failed to marshal metadata: %w", err)
 		}
-		if err := s.storage.Put(block.NewBlockWithHash(merkleFile.Root, metaBytes)); err != nil {
+		if err := s.storage.Put(block.NewBlockWithHash(treeFile.Root, metaBytes)); err != nil {
 			return hasher.Hash{}, 0, fmt.Errorf("failed to store metadata block: %w", err)
 		}
 
@@ -193,12 +194,12 @@ func (s *Server) storeUploadedFile(filename string, reader io.Reader, useEC bool
 			return hasher.Hash{}, 0, fmt.Errorf("failed to store metadata: %w", err)
 		}
 
-		log.Printf("Successfully stored erasure-coded file %s with Merkle root %s", filename, merkleFile.Root.String())
-		return merkleFile.Root, merkleFile.TotalSize, nil
+		log.Printf("Successfully stored erasure-coded file %s with Merkle root %s", filename, tmt.HashToHex(treeFile.Root))
+		return treeFile.Root, treeFile.TotalSize, nil
 
 	} else {
 		// Chunking Path (existing logic)
-		merkleFile, chunks, err := merkle.BuildFileTree(reader, s.chunker)
+		treeFile, chunks, err := tree.BuildFileTree(reader, s.chunker)
 		if err != nil {
 			return hasher.Hash{}, 0, fmt.Errorf("failed to build merkle tree: %w", err)
 		}
@@ -206,21 +207,21 @@ func (s *Server) storeUploadedFile(filename string, reader io.Reader, useEC bool
 		for _, chunk := range chunks {
 			if has, _ := s.storage.Has(chunk.Hash); !has {
 				if err := s.storage.Put(block.NewBlock(chunk.Data)); err != nil {
-					return hasher.Hash{}, 0, fmt.Errorf("failed to store chunk %s: %w", chunk.Hash.String(), err)
+					return hasher.Hash{}, 0, fmt.Errorf("failed to store chunk %s: %w", tmt.HashToHex(chunk.Hash), err)
 				}
 			}
 		}
 
-		pbChunks := make([]*pb.ChunkInfo, len(merkleFile.Chunks))
-		for i, c := range merkleFile.Chunks {
+		pbChunks := make([]*pb.ChunkInfo, len(treeFile.Chunks))
+		for i, c := range treeFile.Chunks {
 			pbChunks[i] = &pb.ChunkInfo{Hash: c.Hash[:], Size: int64(c.Size)}
 		}
 
 		metadata := &pb.ContentMetadata{
-			Hash:        merkleFile.Root[:],
+			Hash:        treeFile.Root[:],
 			Filename:    filename,
 			MimeType:    utils.GetMimeType(filename),
-			Size:        merkleFile.TotalSize,
+			Size:        treeFile.TotalSize,
 			ModTime:     timestamppb.Now(),
 			IsDirectory: false,
 			CreatedAt:   timestamppb.Now(),
@@ -233,7 +234,7 @@ func (s *Server) storeUploadedFile(filename string, reader io.Reader, useEC bool
 		if err != nil {
 			return hasher.Hash{}, 0, fmt.Errorf("failed to marshal metadata: %w", err)
 		}
-		if err := s.storage.Put(block.NewBlockWithHash(merkleFile.Root, metaBytes)); err != nil {
+		if err := s.storage.Put(block.NewBlockWithHash(treeFile.Root, metaBytes)); err != nil {
 			return hasher.Hash{}, 0, fmt.Errorf("failed to store metadata block: %w", err)
 		}
 
@@ -241,22 +242,22 @@ func (s *Server) storeUploadedFile(filename string, reader io.Reader, useEC bool
 			return hasher.Hash{}, 0, fmt.Errorf("failed to store metadata: %w", err)
 		}
 
-		log.Printf("Successfully stored file %s with Merkle root %s", filename, merkleFile.Root.String())
-		return merkleFile.Root, merkleFile.TotalSize, nil
+		log.Printf("Successfully stored file %s with Merkle root %s", filename, tmt.HashToHex(treeFile.Root))
+		return treeFile.Root, treeFile.TotalSize, nil
 	}
 }
 
-func (s *Server) storeUploadedDirectory(path string, name string) (*merkle.Link, error) {
+func (s *Server) storeUploadedDirectory(path string, name string) (*tree.Link, error) {
 	entries, err := os.ReadDir(path)
 	if err != nil {
 		return nil, err
 	}
 
-	var links []merkle.Link
+	var links []tree.Link
 
 	for _, entry := range entries {
 		entryPath := filepath.Join(path, entry.Name())
-		var link *merkle.Link
+		var link *tree.Link
 
 		if entry.IsDir() {
 			link, err = s.storeUploadedDirectory(entryPath, entry.Name())
@@ -275,7 +276,7 @@ func (s *Server) storeUploadedDirectory(path string, name string) (*merkle.Link,
 				return nil, err
 			}
 
-			link = &merkle.Link{
+			link = &tree.Link{
 				Name: entry.Name(),
 				Hash: hash,
 				Size: size,
@@ -285,7 +286,7 @@ func (s *Server) storeUploadedDirectory(path string, name string) (*merkle.Link,
 		links = append(links, *link)
 	}
 
-	dirHash, err := merkle.BuildDirectoryTree(links)
+	dirHash, err := tree.BuildDirectoryTree(links)
 	if err != nil {
 		return nil, err
 	}
@@ -325,7 +326,7 @@ func (s *Server) storeUploadedDirectory(path string, name string) (*merkle.Link,
 		return nil, err
 	}
 
-	return &merkle.Link{
+	return &tree.Link{
 		Name: name,
 		Hash: dirHash,
 		Size: totalSize,

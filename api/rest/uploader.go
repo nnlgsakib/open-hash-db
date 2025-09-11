@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"openhashdb/core/tmt"
 	"openhashdb/protobuf/pb"
 )
 
@@ -33,7 +34,7 @@ func (s *Server) uploadFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response := &pb.UploadResponse{
-		Hash:     hash.String(),
+		Hash:     tmt.HashToHex(hash),
 		Size:     size,
 		Filename: header.Filename,
 		Message:  "File uploaded successfully",
@@ -128,7 +129,7 @@ func (s *Server) uploadFolder(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response := &pb.UploadResponse{
-		Hash:     link.Hash.String(),
+		Hash:     tmt.HashToHex(link.Hash),
 		Size:     link.Size,
 		Filename: folderName,
 		Message:  "Folder uploaded successfully",

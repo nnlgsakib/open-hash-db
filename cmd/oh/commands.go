@@ -20,7 +20,8 @@ import (
 	"openhashdb/core/blockstore"
 	"openhashdb/core/chunker"
 	"openhashdb/core/hasher"
-	"openhashdb/core/merkle"
+	"openhashdb/core/tmt"
+	"openhashdb/core/tree"
 	"openhashdb/core/utils"
 	"openhashdb/network/bitswap"
 	"openhashdb/network/libp2p"
@@ -362,7 +363,7 @@ func addFile(path string) error {
 	defer file.Close()
 
 	c := chunker.NewChunker()
-	merkleFile, chunks, err := merkle.BuildFileTree(file, c)
+	merkleFile, chunks, err := tree.BuildFileTree(file, c)
 	if err != nil {
 		return fmt.Errorf("failed to build merkle tree: %w", err)
 	}
@@ -370,7 +371,7 @@ func addFile(path string) error {
 	for _, chunk := range chunks {
 		if has, _ := bs.Has(chunk.Hash); !has {
 			if err := bs.Put(block.NewBlock(chunk.Data)); err != nil {
-				return fmt.Errorf("failed to store chunk %s: %w", chunk.Hash.String(), err)
+				return fmt.Errorf("failed to store chunk %s: %w", tmt.HashToHex(chunk.Hash), err)
 			}
 		}
 	}
@@ -405,15 +406,13 @@ func addFile(path string) error {
 	}
 
 	if node != nil {
-		if err := node.AnnounceContent(merkleFile.Root.String()); err != nil {
+		if err := node.AnnounceContent(tmt.HashToHex(merkleFile.Root)); err != nil {
 			log.Printf("Warning: failed to announce content to DHT: %v", err)
 		}
 	}
 
-	fmt.Printf("✅ File added: %s\n", merkleFile.Root.String())
+	fmt.Printf("✅ File added: %s\n", tmt.HashToHex(merkleFile.Root))
 	fmt.Printf("   Size: %d bytes\n", merkleFile.TotalSize)
-	fmt.Printf("   Name: %s\n", filepath.Base(path))
-
 	return nil
 }
 
@@ -424,25 +423,25 @@ func addFolder(path string) error {
 		return err
 	}
 
-	fmt.Printf("✅ Folder added: %s\n", link.Hash.String())
+	fmt.Printf("✅ Folder added: %s\n", tmt.HashToHex(link.Hash))
 	fmt.Printf("   Size: %d bytes\n", link.Size)
 	fmt.Printf("   Name: %s\n", link.Name)
 
 	return nil
 }
 
-func storeDirectoryRecursive(path string, name string) (*merkle.Link, error) {
+func storeDirectoryRecursive(path string, name string) (*tree.Link, error) {
 	entries, err := os.ReadDir(path)
 	if err != nil {
 		return nil, err
 	}
 
-	var links []merkle.Link
+	var links []tree.Link
 	c := chunker.NewChunker()
 
 	for _, entry := range entries {
 		entryPath := filepath.Join(path, entry.Name())
-		var link *merkle.Link
+		var link *tree.Link
 
 		if entry.IsDir() {
 			link, err = storeDirectoryRecursive(entryPath, entry.Name())
@@ -455,7 +454,7 @@ func storeDirectoryRecursive(path string, name string) (*merkle.Link, error) {
 				return nil, err
 			}
 
-			merkleFile, chunks, err := merkle.BuildFileTree(file, c)
+			merkleFile, chunks, err := tree.BuildFileTree(file, c)
 			file.Close()
 			if err != nil {
 				return nil, fmt.Errorf("failed to build merkle tree for %s: %w", entry.Name(), err)
@@ -464,7 +463,7 @@ func storeDirectoryRecursive(path string, name string) (*merkle.Link, error) {
 			for _, chunk := range chunks {
 				if has, _ := bs.Has(chunk.Hash); !has {
 					if err := bs.Put(block.NewBlock(chunk.Data)); err != nil {
-						return nil, fmt.Errorf("failed to store chunk %s: %w", chunk.Hash.String(), err)
+						return nil, fmt.Errorf("failed to store chunk %s: %w", tmt.HashToHex(chunk.Hash), err)
 					}
 				}
 			}
@@ -494,7 +493,7 @@ func storeDirectoryRecursive(path string, name string) (*merkle.Link, error) {
 				return nil, fmt.Errorf("failed to store metadata for %s: %w", entry.Name(), err)
 			}
 
-			link = &merkle.Link{
+			link = &tree.Link{
 				Name: entry.Name(),
 				Hash: merkleFile.Root,
 				Size: merkleFile.TotalSize,
@@ -504,7 +503,7 @@ func storeDirectoryRecursive(path string, name string) (*merkle.Link, error) {
 		links = append(links, *link)
 	}
 
-	dirHash, err := merkle.BuildDirectoryTree(links)
+	dirHash, err := tree.BuildDirectoryTree(links)
 	if err != nil {
 		return nil, err
 	}
@@ -545,7 +544,7 @@ func storeDirectoryRecursive(path string, name string) (*merkle.Link, error) {
 		return nil, err
 	}
 
-	return &merkle.Link{
+	return &tree.Link{
 		Name: name,
 		Hash: dirHash,
 		Size: totalSize,
@@ -573,7 +572,7 @@ func getContent(hash hasher.Hash) error {
 		}
 		log.Printf("Got block: %s", blk.Hash())
 		// We can't display full content info as we only have the root block.
-		fmt.Printf("✅ Content retrieved from network: %s\n", hash.String())
+		fmt.Printf("✅ Content retrieved from network: %s\n", tmt.HashToHex(hash))
 		return nil
 	}
 
@@ -584,7 +583,7 @@ func getContent(hash hasher.Hash) error {
 func displayContent(metadata *pb.ContentMetadata, hash hasher.Hash) error {
 	if metadata.IsDirectory {
 		fmt.Printf("📁 Directory: %s\n", metadata.Filename)
-		fmt.Printf("   Hash: %s\n", hash.String())
+		fmt.Printf("   Hash: %s\n", tmt.HashToHex(hash))
 		fmt.Printf("   Size: %d bytes\n", metadata.Size)
 		fmt.Printf("   Files:\n")
 
@@ -598,7 +597,7 @@ func displayContent(metadata *pb.ContentMetadata, hash hasher.Hash) error {
 	} else {
 		// Regular file
 		fmt.Printf("📄 File: %s\n", metadata.Filename)
-		fmt.Printf("   Hash: %s\n", hash.String())
+		fmt.Printf("   Hash: %s\n", tmt.HashToHex(hash))
 		fmt.Printf("   Size: %d bytes\n", metadata.Size)
 		fmt.Printf("   MIME: %s\n", metadata.MimeType)
 	}
@@ -656,7 +655,7 @@ func listContent() error {
 		}
 
 		fmt.Printf("%s %s\n", typeIcon, metadata.Filename)
-		fmt.Printf("   Hash: %s\n", hash.String())
+		fmt.Printf("   Hash: %s\n", tmt.HashToHex(hash))
 		fmt.Printf("   Size: %d bytes\n", metadata.Size)
 		fmt.Printf("   Created: %s\n", metadata.CreatedAt.AsTime().Format("2006-01-02 15:04:05"))
 		fmt.Println()

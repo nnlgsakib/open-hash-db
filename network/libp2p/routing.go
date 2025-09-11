@@ -45,12 +45,6 @@ func NewRouting(node *Node, dht *dht.IpfsDHT) *Routing {
 		}
 	}()
 
-	go func() {
-		if err := r.Bootstrap(); err != nil {
-			log.Printf("[routing] Warning: failed to bootstrap DHT: %v", err)
-		}
-	}()
-
 	return r
 }
 
@@ -90,7 +84,7 @@ func (r *Routing) AnnounceContent(contentHashStr string) error {
 		ctx, cancel := context.WithTimeout(r.node.ctx, 30*time.Second)
 		defer cancel()
 
-		mh, err := multihash.Sum([]byte(contentHashStr), multihash.SHA2_256, -1)
+		mh, err := multihash.Encode(hash[:], multihash.SHA2_256)
 		if err != nil {
 			log.Printf("[routing] Attempt %d/%d: Failed to create multihash for %s: %v", attempt, maxRetries, contentHashStr, err)
 			if attempt == maxRetries {
@@ -124,7 +118,12 @@ func (r *Routing) FindContentProviders(contentHash string) ([]peer.AddrInfo, err
 	ctx, cancel := context.WithTimeout(r.node.ctx, 90*time.Second)
 	defer cancel()
 
-	mh, err := multihash.Sum([]byte(contentHash), multihash.SHA2_256, -1)
+	hash, err := hasher.HashFromString(contentHash)
+	if err != nil {
+		return nil, fmt.Errorf("[routing] invalid content hash: %w", err)
+	}
+
+	mh, err := multihash.Encode(hash[:], multihash.SHA2_256)
 	if err != nil {
 		log.Printf("[routing] Failed to create multihash for %s: %v", contentHash, err)
 		return nil, fmt.Errorf("[routing] failed to create multihash: %w", err)
