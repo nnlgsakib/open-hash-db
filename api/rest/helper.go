@@ -114,25 +114,33 @@ func (s *Server) showDirectoryListing(w http.ResponseWriter, r *http.Request, me
 	w.WriteHeader(http.StatusOK)
 
 	var html strings.Builder
-	html.WriteString(fmt.Sprintf(pages.DirViewerPage, metadata.Filename, metadata.Filename, string(metadata.Hash)))
+	html.WriteString(fmt.Sprintf(pages.DirViewerPage, metadata.Filename, metadata.Filename, fmt.Sprintf("%x", metadata.Hash)))
 
 	for _, link := range metadata.Links {
+		hashHex := fmt.Sprintf("%x", link.Hash)
 		var linkHref, nameDisplay string
+
+		typeIcon := "file"
 		if link.Type == "directory" {
-			linkHref = fmt.Sprintf("/view/%s", string(link.Hash))
+			linkHref = fmt.Sprintf("/view/%s", hashHex)
 			nameDisplay = link.Name + "/"
+			typeIcon = "folder"
 		} else {
-			linkHref = fmt.Sprintf("/download/%s", string(link.Hash))
+			linkHref = fmt.Sprintf("/download/%s", hashHex)
 			nameDisplay = link.Name
 		}
+
 		html.WriteString(fmt.Sprintf(`
 			<tr>
-				<td>%s</td>
-				<td><a href="%s" title="%s">%s</a></td>
-				<td>%d bytes</td>
-				<td><a href="/info/%s" title="View details of %s">%s...</a></td>
+				<td class="file-type">
+					<span class="type-icon type-%s"></span>
+					<span>%s</span>
+				</td>
+				<td class="file-name"><a href="%s" title="%s">%s</a></td>
+				<td class="file-size">%d bytes</td>
+				<td><a href="/view/%s" title="View details of %s" class="file-hash">%s</a></td>
 			</tr>
-		`, link.Type, linkHref, link.Name, nameDisplay, link.Size, string(link.Hash), link.Name, string(link.Hash)[:16]))
+		`, typeIcon, link.Type, linkHref, link.Name, nameDisplay, link.Size, hashHex, link.Name, hashHex))
 	}
 
 	html.WriteString(
