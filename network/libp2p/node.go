@@ -12,11 +12,9 @@ import (
 	"time"
 
 	"openhashdb/core/blockstore"
-	"openhashdb/core/hasher"
 	"openhashdb/network/bitswap"
 	"openhashdb/protobuf/pb"
 
-	"github.com/ipfs/go-cid"
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -27,12 +25,11 @@ import (
 	"github.com/libp2p/go-libp2p/core/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"github.com/libp2p/go-libp2p/p2p/net/swarm"
-	
+
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	quic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
 	"github.com/multiformats/go-multiaddr"
-	"github.com/multiformats/go-multihash"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -48,7 +45,7 @@ type Node struct {
 	ctx              context.Context
 	cancel           context.CancelFunc
 	mdns             mdns.Service
-	dht              *dht.IpfsDHT
+	router           *Routing
 	heartbeatService *HeartbeatService
 	relayer          *Relayer
 	blockstore       *blockstore.Blockstore
@@ -98,7 +95,7 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 		libp2p.Transport(quic.NewTransport),
 		libp2p.Routing(func(h host.Host) (routing.PeerRouting, error) {
 			nodeDHT, err = dht.New(ctx, h,
-				dht.Mode(dht.ModeAutoServer),
+				dht.Mode(dht.ModeAuto),
 				dht.BootstrapPeers(addrInfos...),
 				dht.BucketSize(20),
 			)
@@ -117,9 +114,9 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 		host:       h,
 		ctx:        nodeCtx,
 		cancel:     cancel,
-		dht:        nodeDHT,
 		peerEvents: make([]*pb.PeerEvent, 0, MaxPeerEventLogs),
 	}
+	node.router = NewRouting(node, nodeDHT)
 
 	node.relayer, err = NewRelayer(nodeCtx, h)
 	if err != nil {
@@ -144,24 +141,6 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 	}
 
 	go func() {
-		ticker := time.NewTicker(5 * time.Minute)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-nodeCtx.Done():
-				return
-			case <-ticker.C:
-				if err := node.bootstrapDHT(); err != nil {
-					log.Printf("[libp2p] Failed to bootstrap DHT: %v", err)
-				}
-			}
-		}
-	}()
-
-	go func() {
-		if err := node.bootstrapDHT(); err != nil {
-			log.Printf("[libp2p] Warning: failed to bootstrap DHT: %v", err)
-		}
 		if err := node.connectToBootnodes(allBootnodes); err != nil {
 			log.Printf("[libp2p] Warning: failed to connect to some bootnodes: %v", err)
 		}
@@ -222,6 +201,16 @@ func (n *networkNotifiee) Disconnected(net network.Network, conn network.Conn) {
 func (n *networkNotifiee) Listen(net network.Network, addr multiaddr.Multiaddr)      {}
 func (n *networkNotifiee) ListenClose(net network.Network, addr multiaddr.Multiaddr) {}
 
+// AnnounceContent announces content availability
+func (n *Node) AnnounceContent(contentHashStr string) error {
+	return n.router.AnnounceContent(contentHashStr)
+}
+
+// FindContentProviders finds content providers
+func (n *Node) FindContentProviders(contentHash string) ([]peer.AddrInfo, error) {
+	return n.router.FindContentProviders(contentHash)
+}
+
 // setupMDNS sets up mDNS discovery
 func (n *Node) setupMDNS() error {
 	mdnsService := mdns.NewMdnsService(n.host, ServiceTag, &discoveryNotifee{node: n})
@@ -239,10 +228,8 @@ func (n *Node) Close() error {
 			log.Printf("[libp2p] Error closing mDNS: %v", err)
 		}
 	}
-	if n.dht != nil {
-		if err := n.dht.Close(); err != nil {
-			log.Printf("[libp2p] Error closing DHT: %v", err)
-		}
+	if err := n.router.Close(); err != nil {
+		log.Printf("[libp2p] Error closing DHT: %v", err)
 	}
 	n.cancel()
 	return n.host.Close()
@@ -402,7 +389,7 @@ func (n *Node) GetNetworkStats() *pb.NetworkStatsResponse {
 		ConnectedPeers: int32(len(peers)),
 		PeerList:       peerList,
 		Addresses:      n.Addrs(),
-		Dht:            n.GetDHTStats(),
+		Dht:            n.router.GetStats(),
 		PeerEvents:     peerEvents,
 	}
 }
@@ -476,116 +463,6 @@ func (n *Node) connectToBootnodes(bootnodes []string) error {
 		return fmt.Errorf("[libp2p] failed to connect to any bootnodes: %w", lastErr)
 	}
 	return nil
-}
-
-// bootstrapDHT bootstraps the DHT
-func (n *Node) bootstrapDHT() error {
-	if n.dht == nil {
-		return fmt.Errorf("[libp2p] DHT not initialized")
-	}
-	log.Printf("[libp2p] Bootstrapping DHT...")
-	ctx, cancel := context.WithTimeout(n.ctx, 30*time.Second)
-	defer cancel()
-	return n.dht.Bootstrap(ctx)
-}
-
-// AnnounceContent announces content availability
-func (n *Node) AnnounceContent(contentHashStr string) error {
-	if n.dht == nil {
-		return fmt.Errorf("[libp2p] DHT not initialized")
-	}
-
-	hash, err := hasher.HashFromString(contentHashStr)
-	if err != nil {
-		return fmt.Errorf("[libp2p] invalid content hash: %w", err)
-	}
-
-	if n.blockstore == nil {
-		log.Printf("[libp2p] Blockstore not configured for content %s", contentHashStr)
-		return fmt.Errorf("[libp2p] blockstore not configured")
-	}
-	if !n.blockstore.HasContent(hash) {
-		log.Printf("[libp2p] Validation failed for content %s: content not in blockstore", contentHashStr)
-		return fmt.Errorf("[libp2p] content not in blockstore")
-	}
-
-	const maxRetries = 5
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		ctx, cancel := context.WithTimeout(n.ctx, 30*time.Second)
-		defer cancel()
-
-		mh, err := multihash.Sum([]byte(contentHashStr), multihash.SHA2_256, -1)
-		if err != nil {
-			log.Printf("[libp2p] Attempt %d/%d: Failed to create multihash for %s: %v", attempt, maxRetries, contentHashStr, err)
-			if attempt == maxRetries {
-				return fmt.Errorf("[libp2p] failed to create multihash: %w", err)
-			}
-			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
-			continue
-		}
-		contentCID := cid.NewCidV1(cid.Raw, mh)
-
-		log.Printf("[libp2p] Attempt %d/%d: Announcing content provider for hash: %s (CID: %s)", attempt, maxRetries, contentHashStr, contentCID.String())
-		if err := n.dht.Provide(ctx, contentCID, true); err != nil {
-			log.Printf("[libp2p] Attempt %d/%d: Failed to announce content %s: %v", attempt, maxRetries, contentHashStr, err)
-			if attempt == maxRetries {
-				return fmt.Errorf("[libp2p] failed to announce content after %d attempts: %w", maxRetries, err)
-			}
-			time.Sleep(time.Duration(100*(1<<uint(attempt))) * time.Millisecond)
-			continue
-		}
-		return nil
-	}
-	return fmt.Errorf("[libp2p] failed to announce content %s: max retries exceeded", contentHashStr)
-}
-
-// FindContentProviders finds content providers
-func (n *Node) FindContentProviders(contentHash string) ([]peer.AddrInfo, error) {
-	if n.dht == nil {
-		return nil, fmt.Errorf("[libp2p] DHT not initialized")
-	}
-
-	ctx, cancel := context.WithTimeout(n.ctx, 90*time.Second)
-	defer cancel()
-
-	hash, err := multihash.FromHexString(contentHash)
-	if err != nil {
-		mh, err := multihash.Sum([]byte(contentHash), multihash.SHA2_256, -1)
-		if err != nil {
-			log.Printf("[libp2p] Failed to create multihash for %s: %v", contentHash, err)
-			return nil, fmt.Errorf("[libp2p] failed to create multihash: %w", err)
-		}
-		hash = mh
-	}
-
-	contentCID := cid.NewCidV1(cid.Raw, hash)
-	log.Printf("[libp2p] Finding providers for content hash: %s (CID: %s)", contentHash, contentCID.String())
-
-	providers := n.dht.FindProvidersAsync(ctx, contentCID, 20)
-	var result []peer.AddrInfo
-	for provider := range providers {
-		if provider.ID != n.ID() {
-			result = append(result, provider)
-			log.Printf("[libp2p] Found provider: %s for hash %s", provider.ID.String(), contentHash)
-		}
-	}
-
-	log.Printf("[libp2p] Found %d provider(s) for hash: %s", len(result), contentHash)
-	return result, nil
-}
-
-// GetDHTStats returns DHT statistics
-func (n *Node) GetDHTStats() *pb.DHTStats {
-	if n.dht == nil {
-		return &pb.DHTStats{
-			Enabled: false,
-		}
-	}
-	routingTable := n.dht.RoutingTable()
-	return &pb.DHTStats{
-		Enabled:    true,
-		PeerCount:  int32(routingTable.Size()),
-	}
 }
 
 // Helper functions that were removed

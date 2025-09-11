@@ -14,6 +14,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
+	"github.com/multiformats/go-multiaddr"
 )
 
 const (
@@ -102,6 +103,15 @@ func (r *Relayer) ReserveSlot(ctx context.Context, p peer.AddrInfo) {
 		}
 		r.reservationsMu.Unlock()
 		log.Printf("[relayer] Reservation with %s expires at %s", p.ID, time.Unix(int64(msg.Reservation.Expire), 0))
+		// Add the relay address to the host's peerstore, so it's advertised to the network.
+		relayAddr, err := multiaddr.NewMultiaddr("/p2p/" + p.ID.String() + "/p2p-circuit")
+		if err != nil {
+			log.Printf("[relayer] failed to create relay multiaddr: %v", err)
+		} else {
+			// The TTL should be greater than the reservation refresh interval.
+			r.host.Peerstore().AddAddr(r.host.ID(), relayAddr, ReservationRefreshInterval*2)
+			log.Printf("[relayer] Added relay address to peerstore: %s", relayAddr)
+		}
 	}
 }
 
