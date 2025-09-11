@@ -27,8 +27,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"github.com/libp2p/go-libp2p/p2p/net/swarm"
-	relayv2client "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
-	circuit "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
+	
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	quic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
@@ -51,6 +50,7 @@ type Node struct {
 	mdns             mdns.Service
 	dht              *dht.IpfsDHT
 	heartbeatService *HeartbeatService
+	relayer          *Relayer
 	blockstore       *blockstore.Blockstore
 	bitswap          *bitswap.Engine
 	GossipHandler    func(peer.ID, []byte) error
@@ -112,10 +112,6 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 		return nil, fmt.Errorf("failed to create libp2p host: %w", err)
 	}
 
-	if _, err := circuit.New(h); err != nil {
-		return nil, fmt.Errorf("failed to create circuit relay: %w", err)
-	}
-
 	nodeCtx, cancel := context.WithCancel(ctx)
 	node := &Node{
 		host:       h,
@@ -124,6 +120,12 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 		dht:        nodeDHT,
 		peerEvents: make([]*pb.PeerEvent, 0, MaxPeerEventLogs),
 	}
+
+	node.relayer, err = NewRelayer(h)
+	if err != nil {
+		return nil, err
+	}
+
 	node.heartbeatService = NewHeartbeatService(nodeCtx, node)
 
 	n := &networkNotifiee{node: node}
@@ -202,40 +204,7 @@ func (n *networkNotifiee) Connected(net network.Network, conn network.Conn) {
 	}
 
 	// Try to make a reservation with the peer if it supports relaying
-	go func(p peer.ID) {
-		// Use a background context because the connection is already established
-		// and we don't want to block the notifier.
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-
-		pinfo := n.node.host.Peerstore().PeerInfo(p)
-		protocols, err := n.node.host.Peerstore().GetProtocols(p)
-		if err != nil {
-			// Can happen if the peer disconnects quickly
-			log.Printf("[libp2p] Could not get protocols for peer %s: %v", p, err)
-			return
-		}
-
-		hasRelay := false
-		for _, proto := range protocols {
-			if proto == "/libp2p/circuit/relay/0.2.0/hop" {
-				hasRelay = true
-				break
-			}
-		}
-
-		if !hasRelay {
-			return // Not a relay
-		}
-
-		log.Printf("[libp2p] Attempting to reserve slot with newly connected relay: %s", p)
-		_, err = relayv2client.Reserve(ctx, n.node.host, pinfo)
-		if err != nil {
-			log.Printf("[libp2p] Failed to reserve slot with %s: %v", p, err)
-		} else {
-			log.Printf("[libp2p] Successfully reserved slot with %s", p)
-		}
-	}(conn.RemotePeer())
+	n.node.relayer.DiscoverAndReserve(conn.RemotePeer())
 }
 
 func (n *networkNotifiee) Disconnected(net network.Network, conn network.Conn) {
@@ -494,15 +463,9 @@ func (n *Node) connectToBootnodes(bootnodes []string) error {
 					log.Printf("[libp2p] Could not parse bootnode address %s for reservation: %v", addr, err)
 					return
 				}
-				log.Printf("[libp2p] Attempting to reserve slot with bootnode %s", pinfo.ID)
 				reserveCtx, reserveCancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer reserveCancel()
-				_, err = relayv2client.Reserve(reserveCtx, n.host, *pinfo)
-				if err != nil {
-					log.Printf("[libp2p] Failed to reserve slot with %s: %v", pinfo.ID, err)
-				} else {
-					log.Printf("[libp2p] Successfully reserved slot with %s.", pinfo.ID)
-				}
+				n.relayer.ReserveSlot(reserveCtx, *pinfo)
 			}
 		}(bootnode)
 	}
