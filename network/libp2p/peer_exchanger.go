@@ -168,6 +168,10 @@ func (pe *PeerExchanger) handleExchange(stream network.Stream) {
 	remotePeer := stream.Conn().RemotePeer()
 	// log.Printf("[libp2p] Handling peer exchange with %s", remotePeer.String())
 
+	if pe.node.relayer != nil {
+		pe.node.relayer.DiscoverAndReserve(remotePeer)
+	}
+
 	// 1. Receive their peers
 	reader := bufio.NewReader(stream)
 	msgLen, err := binary.ReadUvarint(reader)
@@ -231,6 +235,10 @@ func (pe *PeerExchanger) initiateExchange(stream network.Stream) error {
 	defer stream.Close()
 	remotePeer := stream.Conn().RemotePeer()
 	// log.Printf("[libp2p] Initiating peer exchange with %s", remotePeer.String())
+
+	if pe.node.relayer != nil {
+		pe.node.relayer.DiscoverAndReserve(remotePeer)
+	}
 
 	// 1. Send our peers
 	ourPeersProto, err := pe.getPeerListProto()

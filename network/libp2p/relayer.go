@@ -3,7 +3,6 @@ package libp2p
 import (
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"sync"
 	"time"
@@ -77,9 +76,7 @@ func (r *Relayer) ReserveSlot(ctx context.Context, p peer.AddrInfo) {
 	rdr := ggio.NewFullReader(stream, 2048)
 	msg.Reset()
 	if err := rdr.ReadMsg(&msg); err != nil {
-		if err != io.EOF {
-			log.Printf("[relayer] failed to read reservation response from %s: %v", p.ID, err)
-		}
+		log.Printf("[relayer] failed to read reservation response from %s: %v", p.ID, err)
 		return
 	}
 
@@ -178,6 +175,10 @@ func (r *Relayer) refreshSoonToExpireReservations() {
 			continue
 		}
 		// Use a background context for the async refresh operation.
-		go r.ReserveSlot(context.Background(), pinfo)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		go func() {
+			defer cancel()
+			r.ReserveSlot(ctx, pinfo)
+		}()
 	}
 }
