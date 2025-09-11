@@ -86,7 +86,7 @@ func (r *Relayer) ReserveSlot(ctx context.Context, p peer.AddrInfo) {
 	}
 
 	if msg.Status != pb.Status_OK {
-		log.Printf("[relayer] Failed to reserve slot with %s: status %s", p.ID, msg.Status.String())
+		log.Printf("[relayer] Failed to reserve slot with %s: status code %d", p.ID, msg.Status)
 		return
 	}
 

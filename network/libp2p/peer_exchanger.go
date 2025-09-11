@@ -65,16 +65,13 @@ func protoToAddrInfo(pi *pb.PeerInfo) (peer.AddrInfo, error) {
 
 // getPeerListProto gets the list of connected peers as a proto byte slice.
 func (pe *PeerExchanger) getPeerListProto() ([]byte, error) {
-	peers := pe.node.Host().Peerstore().Peers()
+	peers := pe.node.Host().Network().Peers()
 	var addrInfos []*pb.PeerInfo
 	for _, p := range peers {
 		if p == pe.node.Host().ID() {
 			continue
 		}
-		// We only want to share peers we are connected to.
-		if pe.node.Host().Network().Connectedness(p) == network.Connected {
-			addrInfos = append(addrInfos, addrInfoToProto(pe.node.Host().Peerstore().PeerInfo(p)))
-		}
+		addrInfos = append(addrInfos, addrInfoToProto(pe.node.Host().Peerstore().PeerInfo(p)))
 	}
 	return proto.Marshal(&pb.PeerInfoList{Peers: addrInfos})
 }
@@ -168,7 +165,12 @@ func (pe *PeerExchanger) handleExchange(stream network.Stream) {
 	remotePeer := stream.Conn().RemotePeer()
 	// log.Printf("[libp2p] Handling peer exchange with %s", remotePeer.String())
 
-	if pe.node.relayer != nil {
+	// Instantly reserve a slot if the peer is a direct connection and a relay.
+	isRelayed := false
+	if _, err := stream.Conn().RemoteMultiaddr().ValueForProtocol(multiaddr.P_CIRCUIT); err == nil {
+		isRelayed = true
+	}
+	if !isRelayed && pe.node.relayer != nil {
 		pe.node.relayer.DiscoverAndReserve(remotePeer)
 	}
 
@@ -236,7 +238,12 @@ func (pe *PeerExchanger) initiateExchange(stream network.Stream) error {
 	remotePeer := stream.Conn().RemotePeer()
 	// log.Printf("[libp2p] Initiating peer exchange with %s", remotePeer.String())
 
-	if pe.node.relayer != nil {
+	// Instantly reserve a slot if the peer is a direct connection and a relay.
+	isRelayed := false
+	if _, err := stream.Conn().RemoteMultiaddr().ValueForProtocol(multiaddr.P_CIRCUIT); err == nil {
+		isRelayed = true
+	}
+	if !isRelayed && pe.node.relayer != nil {
 		pe.node.relayer.DiscoverAndReserve(remotePeer)
 	}
 
