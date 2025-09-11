@@ -363,9 +363,9 @@ func addFile(path string) error {
 	defer file.Close()
 
 	c := chunker.NewChunker()
-	merkleFile, chunks, err := tree.BuildFileTree(file, c)
+	fileTree, chunks, err := tree.BuildFileTree(file, c)
 	if err != nil {
-		return fmt.Errorf("failed to build merkle tree: %w", err)
+		return fmt.Errorf("failed to build file tree: %w", err)
 	}
 
 	for _, chunk := range chunks {
@@ -390,10 +390,10 @@ func addFile(path string) error {
 	}
 
 	metadata := &pb.ContentMetadata{
-		Hash:        merkleFile.Root[:],
+		Hash:        fileTree.Root[:],
 		Filename:    filepath.Base(path),
 		MimeType:    utils.GetMimeType(path),
-		Size:        merkleFile.TotalSize,
+		Size:        fileTree.TotalSize,
 		ModTime:     timestamppb.New(info.ModTime()),
 		IsDirectory: false,
 		CreatedAt:   timestamppb.Now(),
@@ -406,13 +406,13 @@ func addFile(path string) error {
 	}
 
 	if node != nil {
-		if err := node.AnnounceContent(tmt.HashToHex(merkleFile.Root)); err != nil {
+		if err := node.AnnounceContent(tmt.HashToHex(fileTree.Root)); err != nil {
 			log.Printf("Warning: failed to announce content to DHT: %v", err)
 		}
 	}
 
-	fmt.Printf("✅ File added: %s\n", tmt.HashToHex(merkleFile.Root))
-	fmt.Printf("   Size: %d bytes\n", merkleFile.TotalSize)
+	fmt.Printf("✅ File added: %s\n", tmt.HashToHex(fileTree.Root))
+	fmt.Printf("   Size: %d bytes\n", fileTree.TotalSize)
 	return nil
 }
 
@@ -454,10 +454,10 @@ func storeDirectoryRecursive(path string, name string) (*tree.Link, error) {
 				return nil, err
 			}
 
-			merkleFile, chunks, err := tree.BuildFileTree(file, c)
+			fileTree, chunks, err := tree.BuildFileTree(file, c)
 			file.Close()
 			if err != nil {
-				return nil, fmt.Errorf("failed to build merkle tree for %s: %w", entry.Name(), err)
+				return nil, fmt.Errorf("failed to build file tree for %s: %w", entry.Name(), err)
 			}
 
 			for _, chunk := range chunks {
@@ -479,10 +479,10 @@ func storeDirectoryRecursive(path string, name string) (*tree.Link, error) {
 			}
 
 			fileMetadata := &pb.ContentMetadata{
-				Hash:        merkleFile.Root[:],
+				Hash:        fileTree.Root[:],
 				Filename:    entry.Name(),
 				MimeType:    utils.GetMimeType(entry.Name()),
-				Size:        merkleFile.TotalSize,
+				Size:        fileTree.TotalSize,
 				ModTime:     timestamppb.New(info.ModTime()),
 				IsDirectory: false,
 				CreatedAt:   timestamppb.Now(),
@@ -495,8 +495,8 @@ func storeDirectoryRecursive(path string, name string) (*tree.Link, error) {
 
 			link = &tree.Link{
 				Name: entry.Name(),
-				Hash: merkleFile.Root,
-				Size: merkleFile.TotalSize,
+				Hash: fileTree.Root,
+				Size: fileTree.TotalSize,
 				Type: "file",
 			}
 		}

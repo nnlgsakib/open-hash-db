@@ -74,17 +74,7 @@ func HashFile(filepath string) (Hash, error) {
 	return HashReader(file)
 }
 
-// HashMultiple computes hash of concatenated hashes (for Merkle trees)
-func HashMultiple(hashes ...Hash) Hash {
-	hasher := sha256.New()
-	for _, h := range hashes {
-		hasher.Write(h[:])
-	}
-	
-	var result Hash
-	copy(result[:], hasher.Sum(nil))
-	return result
-}
+
 
 // Verify checks if data matches the expected hash
 func Verify(data []byte, expectedHash Hash) bool {

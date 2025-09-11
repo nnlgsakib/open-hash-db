@@ -6,6 +6,7 @@ import (
 	"io"
 
 	"openhashdb/core/hasher"
+	"openhashdb/core/tmt"
 
 	"github.com/jotfs/fastcdc-go"
 )
@@ -33,7 +34,6 @@ type ChunkInfo struct {
 type ChunkedFile struct {
 	Chunks    []ChunkInfo
 	TotalSize int64
-	RootHash  hasher.Hash
 }
 
 // Chunker handles file chunking operations
@@ -97,7 +97,6 @@ func (c *Chunker) ChunkReader(r io.Reader) ([]Chunk, error) {
 func (c *Chunker) CreateChunkedFile(chunks []Chunk) *ChunkedFile {
 	var chunkInfos []ChunkInfo
 	var totalSize int64
-	var hashes []hasher.Hash
 
 	for _, chunk := range chunks {
 		chunkInfos = append(chunkInfos, ChunkInfo{
@@ -105,50 +104,12 @@ func (c *Chunker) CreateChunkedFile(chunks []Chunk) *ChunkedFile {
 			Size: chunk.Size,
 		})
 		totalSize += int64(chunk.Size)
-		hashes = append(hashes, chunk.Hash)
 	}
-
-	// Create Merkle tree root hash
-	rootHash := c.computeMerkleRoot(hashes)
 
 	return &ChunkedFile{
 		Chunks:    chunkInfos,
 		TotalSize: totalSize,
-		RootHash:  rootHash,
 	}
-}
-
-// computeMerkleRoot computes the Merkle tree root hash from chunk hashes
-func (c *Chunker) computeMerkleRoot(hashes []hasher.Hash) hasher.Hash {
-	if len(hashes) == 0 {
-		return hasher.Hash{}
-	}
-	if len(hashes) == 1 {
-		return hashes[0]
-	}
-
-	// Build Merkle tree bottom-up
-	currentLevel := make([]hasher.Hash, len(hashes))
-	copy(currentLevel, hashes)
-
-	for len(currentLevel) > 1 {
-		var nextLevel []hasher.Hash
-
-		for i := 0; i < len(currentLevel); i += 2 {
-			if i+1 < len(currentLevel) {
-				// Pair exists, hash both
-				combined := hasher.HashMultiple(currentLevel[i], currentLevel[i+1])
-				nextLevel = append(nextLevel, combined)
-			} else {
-				// Odd number, promote single hash
-				nextLevel = append(nextLevel, currentLevel[i])
-			}
-		}
-
-		currentLevel = nextLevel
-	}
-
-	return currentLevel[0]
 }
 
 // ReassembleChunks reconstructs original data from chunks
@@ -172,15 +133,15 @@ func ReassembleChunks(chunks []Chunk) ([]byte, error) {
 	return buffer.Bytes(), nil
 }
 
-// VerifyChunkedFile verifies the integrity of a chunked file
-func VerifyChunkedFile(chunkedFile *ChunkedFile, chunks []Chunk) error {
+// VerifyChunkedFile verifies the integrity of a chunked file against a TMT root.
+func VerifyChunkedFile(chunkedFile *ChunkedFile, chunks []Chunk, rootHash tmt.Hash) error {
 	if len(chunks) != len(chunkedFile.Chunks) {
 		return fmt.Errorf("chunk count mismatch: expected %d, got %d",
 			len(chunkedFile.Chunks), len(chunks))
 	}
 
 	var totalSize int64
-	var hashes []hasher.Hash
+	var hashes [][]byte
 
 	for i, chunk := range chunks {
 		expectedInfo := chunkedFile.Chunks[i]
@@ -198,7 +159,7 @@ func VerifyChunkedFile(chunkedFile *ChunkedFile, chunks []Chunk) error {
 		}
 
 		totalSize += int64(chunk.Size)
-		hashes = append(hashes, chunk.Hash)
+		hashes = append(hashes, chunk.Hash[:])
 	}
 
 	if totalSize != chunkedFile.TotalSize {
@@ -206,11 +167,18 @@ func VerifyChunkedFile(chunkedFile *ChunkedFile, chunks []Chunk) error {
 			chunkedFile.TotalSize, totalSize)
 	}
 
-	// Verify Merkle root
-	chunker := NewChunker() // Size doesn't matter for verification
-	rootHash := chunker.computeMerkleRoot(hashes)
-	if rootHash != chunkedFile.RootHash {
-		return fmt.Errorf("Merkle root hash mismatch")
+	// Verify TMT root
+	tree := tmt.NewDefault()
+	if err := tree.Build(hashes); err != nil {
+		return fmt.Errorf("tmt build error: %w", err)
+	}
+	computedRoot, ok := tree.RootHash()
+	if !ok {
+		return fmt.Errorf("failed to get TMT root hash")
+	}
+
+	if computedRoot != rootHash {
+		return fmt.Errorf("TMT root hash mismatch")
 	}
 
 	return nil

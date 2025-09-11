@@ -14,8 +14,8 @@ import (
 	"openhashdb/api/pages"
 	"openhashdb/core/block"
 	"openhashdb/core/hasher"
-	"openhashdb/core/tree"
 	"openhashdb/core/tmt"
+	"openhashdb/core/tree"
 	"openhashdb/core/utils"
 	"openhashdb/protobuf/pb"
 
@@ -194,7 +194,7 @@ func (s *Server) storeUploadedFile(filename string, reader io.Reader, useEC bool
 			return hasher.Hash{}, 0, fmt.Errorf("failed to store metadata: %w", err)
 		}
 
-		log.Printf("Successfully stored erasure-coded file %s with Merkle root %s", filename, tmt.HashToHex(treeFile.Root))
+		log.Printf("Successfully stored erasure-coded file %s with TMT root %s", filename, tmt.HashToHex(treeFile.Root))
 		return treeFile.Root, treeFile.TotalSize, nil
 
 	} else {
@@ -242,7 +242,7 @@ func (s *Server) storeUploadedFile(filename string, reader io.Reader, useEC bool
 			return hasher.Hash{}, 0, fmt.Errorf("failed to store metadata: %w", err)
 		}
 
-		log.Printf("Successfully stored file %s with Merkle root %s", filename, tmt.HashToHex(treeFile.Root))
+		log.Printf("Successfully stored file %s with TMT root %s", filename, tmt.HashToHex(treeFile.Root))
 		return treeFile.Root, treeFile.TotalSize, nil
 	}
 }
