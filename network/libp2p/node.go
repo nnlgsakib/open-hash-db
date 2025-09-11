@@ -121,7 +121,7 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 		peerEvents: make([]*pb.PeerEvent, 0, MaxPeerEventLogs),
 	}
 
-	node.relayer, err = NewRelayer(h)
+	node.relayer, err = NewRelayer(nodeCtx, h)
 	if err != nil {
 		return nil, err
 	}
