@@ -135,10 +135,10 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 	}
 
 	log.Printf("[libp2p] Node started with ID: %s", h.ID().String())
-	log.Printf("[libp2p] Listening on addresses:")
-	for _, addr := range h.Addrs() {
-		log.Printf("  %s/p2p/%s", addr, h.ID().String())
-	}
+	// log.Printf("[libp2p] Listening on addresses:")
+	// for _, addr := range h.Addrs() {
+	// 	log.Printf("  %s/p2p/%s", addr, h.ID().String())
+	// }
 
 	go func() {
 		if err := node.connectToBootnodes(allBootnodes); err != nil {
@@ -482,8 +482,8 @@ func (n *Node) logPeerEvent(peerID peer.ID, eventType string, addrs []string) {
 		n.peerEvents = n.peerEvents[len(n.peerEvents)-MaxPeerEventLogs:]
 	}
 
-	log.Printf("Peer %s event: %s at %s, Addresses: %v",
-		peerID.String(), eventType, event.Timestamp.AsTime().Format(time.RFC3339), addrs)
+	log.Printf("Peer %s event: %s at %s",
+		peerID.String(), eventType, event.Timestamp.AsTime().Format(time.RFC3339))
 }
 
 func loadOrCreateIdentity(keyPath string) (crypto.PrivKey, error) {

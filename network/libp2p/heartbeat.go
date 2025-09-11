@@ -65,7 +65,7 @@ func NewHeartbeatService(ctx context.Context, node *Node) *HeartbeatService {
 
 // handleHeartbeatStream handles incoming heartbeat requests and peer exchange
 func (hs *HeartbeatService) handleHeartbeatStream(stream network.Stream) {
-	log.Printf("[libp2p] Received heartbeat from %s, starting peer exchange.", stream.Conn().RemotePeer().String())
+	// log.Printf("[libp2p] Received heartbeat from %s, starting peer exchange.", stream.Conn().RemotePeer().String())
 	hs.peerExchanger.handleExchange(stream)
 }
 
@@ -107,7 +107,7 @@ func (hs *HeartbeatService) monitor(ctx context.Context, peerID peer.ID) {
 		return
 	}
 
-	log.Printf("[libp2p] Starting heartbeat monitor for peer %s", peerID.String())
+	// log.Printf("[libp2p] Starting heartbeat monitor for peer %s", peerID.String())
 	ticker := time.NewTicker(HeartbeatInterval)
 	defer ticker.Stop()
 
@@ -122,7 +122,7 @@ func (hs *HeartbeatService) monitor(ctx context.Context, peerID peer.ID) {
 			return
 		}
 		heartbeatSuccessTotal.Inc()
-		log.Printf("[libp2p] Successful heartbeat to %s", peerID.String())
+		// log.Printf("[libp2p] Successful heartbeat to %s", peerID.String())
 
 		select {
 		case <-ctx.Done():

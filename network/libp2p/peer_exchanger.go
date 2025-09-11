@@ -8,11 +8,12 @@ import (
 	"log"
 	"sync"
 
+	"openhashdb/protobuf/pb"
+
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
 	"google.golang.org/protobuf/proto"
-	"openhashdb/protobuf/pb"
 )
 
 // PeerExchanger handles exchanging peer lists.
@@ -165,7 +166,7 @@ func (pe *PeerExchanger) connectToNewPeers(addrInfos []*pb.PeerInfo, sourcePeer 
 func (pe *PeerExchanger) handleExchange(stream network.Stream) {
 	defer stream.Close()
 	remotePeer := stream.Conn().RemotePeer()
-	log.Printf("[libp2p] Handling peer exchange with %s", remotePeer.String())
+	// log.Printf("[libp2p] Handling peer exchange with %s", remotePeer.String())
 
 	// 1. Receive their peers
 	reader := bufio.NewReader(stream)
@@ -229,7 +230,7 @@ func (pe *PeerExchanger) handleExchange(stream network.Stream) {
 func (pe *PeerExchanger) initiateExchange(stream network.Stream) error {
 	defer stream.Close()
 	remotePeer := stream.Conn().RemotePeer()
-	log.Printf("[libp2p] Initiating peer exchange with %s", remotePeer.String())
+	// log.Printf("[libp2p] Initiating peer exchange with %s", remotePeer.String())
 
 	// 1. Send our peers
 	ourPeersProto, err := pe.getPeerListProto()
