@@ -13,6 +13,7 @@ import (
 
 	"openhashdb/core/blockstore"
 	"openhashdb/network/bitswap"
+	"openhashdb/network/libp2p/dial"
 	"openhashdb/protobuf/pb"
 
 	"github.com/libp2p/go-libp2p"
@@ -55,6 +56,10 @@ type Node struct {
 	GossipHandler    func(peer.ID, []byte) error
 	peerEvents       []*pb.PeerEvent
 	peerEventsMu     sync.RWMutex
+
+	// dial management
+	dialQueue *dial.DialQueue
+	dialSlots Slots
 }
 
 // NewNodeWithKeyPath creates a new libp2p node
@@ -187,6 +192,9 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 		cancel:     cancel,
 		peerEvents: make([]*pb.PeerEvent, 0, MaxPeerEventLogs),
 	}
+	// dial manager setup
+	node.dialQueue = dial.NewDialQueue()
+	node.dialSlots = NewSlots(8) // limit concurrent outbound dial attempts
 	node.router = NewRouting(node, nodeDHT)
 	if err := node.router.Bootstrap(); err != nil {
 		return nil, fmt.Errorf("failed to bootstrap DHT: %w", err)
@@ -213,6 +221,9 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 	// for _, addr := range h.Addrs() {
 	// 	log.Printf("  %s/p2p/%s", addr, h.ID().String())
 	// }
+
+	// start dial worker
+	go node.runDialer()
 
 	return node, nil
 }
@@ -324,6 +335,45 @@ func (n *Node) Addrs() []string {
 // ConnectedPeers returns connected peers
 func (n *Node) ConnectedPeers() []peer.ID {
 	return n.host.Network().Peers()
+}
+
+// enqueueDial enqueues a dial attempt with priority
+func (n *Node) enqueueDial(info peer.AddrInfo, prio dial.DialPriority) {
+    if info.ID == "" {
+        return
+    }
+    n.dialQueue.AddTask(&info, prio)
+}
+
+// runDialer processes queued dials with limited concurrency
+func (n *Node) runDialer() {
+    ctx := n.ctx
+    for {
+        if n.dialQueue.Wait(ctx) { // closed or ctx done
+            return
+        }
+        for {
+            task := n.dialQueue.PopTask()
+            if task == nil {
+                break
+            }
+            // skip already-connected
+            if n.host.Network().Connectedness(task.GetAddrInfo().ID) == network.Connected {
+                continue
+            }
+            if closed := n.dialSlots.Take(ctx); closed { return }
+            go func(pi peer.AddrInfo) {
+                defer n.dialSlots.Release()
+                dctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+                defer cancel()
+                if err := n.host.Connect(dctx, pi); err != nil {
+                    log.Printf("[dialer] Failed to dial %s: %v", pi.ID, err)
+                } else {
+                    log.Printf("[dialer] Connected to %s", pi.ID)
+                }
+            }(*task.GetAddrInfo())
+        }
+    }
 }
 
 // Connect connects to a peer with exponential backoff
@@ -493,34 +543,32 @@ func (n *Node) connectToBootnodes(bootnodes []string) error {
 		return nil
 	}
 
-	log.Printf("[libp2p] Connecting to %d bootnode(s)...", len(nodesToConnect))
-	var wg sync.WaitGroup
-	connectedCount := 0
-	var lastErr error
-	mu := sync.Mutex{}
+    log.Printf("[libp2p] Connecting to %d bootnode(s)...", len(nodesToConnect))
+    var wg sync.WaitGroup
+    connectedCount := 0
+    var lastErr error
+    mu := sync.Mutex{}
 
 	for _, bootnode := range nodesToConnect {
 		if bootnode == "" {
 			continue
 		}
 		wg.Add(1)
-		go func(addr string) {
-			defer wg.Done()
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			if err := n.Connect(ctx, addr); err != nil {
-				mu.Lock()
-				lastErr = err
-				mu.Unlock()
-				log.Printf("[libp2p] Failed to connect to bootnode %s: %v", addr, err)
-			} else {
-				mu.Lock()
-				connectedCount++
-				mu.Unlock()
-				// No manual reservation; AutoRelay manages this.
-			}
-		}(bootnode)
-	}
+        go func(addr string) {
+            defer wg.Done()
+            // Parse and enqueue dial with high priority
+            if addr == "" { return }
+            info, err := peer.AddrInfoFromString(addr)
+            if err != nil {
+                mu.Lock(); lastErr = err; mu.Unlock()
+                log.Printf("[libp2p] Failed to parse bootnode %s: %v", addr, err)
+                return
+            }
+            n.enqueueDial(*info, dial.PriorityRequestedDial)
+            // mark as pending success; actual connect count will update upon connect
+            mu.Lock(); connectedCount++ ; mu.Unlock()
+        }(bootnode)
+    }
 	wg.Wait()
 
 	log.Printf("[libp2p] Connected to %d out of %d bootnodes", connectedCount, len(nodesToConnect))

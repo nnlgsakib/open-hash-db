@@ -11,6 +11,7 @@ import (
 
     "openhashdb/protobuf/pb"
 
+    "openhashdb/network/libp2p/dial"
     "github.com/libp2p/go-libp2p/core/network"
     "github.com/libp2p/go-libp2p/core/peer"
     "github.com/multiformats/go-multiaddr"
@@ -68,15 +69,24 @@ func protoToAddrInfo(pi *pb.PeerInfo) (peer.AddrInfo, error) {
 
 // getPeerListProto gets the list of connected peers as a proto byte slice.
 func (pe *PeerExchanger) getPeerListProto() ([]byte, error) {
-	peers := pe.node.Host().Network().Peers()
-	var addrInfos []*pb.PeerInfo
-	for _, p := range peers {
-		if p == pe.node.Host().ID() {
-			continue
-		}
-		addrInfos = append(addrInfos, addrInfoToProto(pe.node.Host().Peerstore().PeerInfo(p)))
-	}
-	return proto.Marshal(&pb.PeerInfoList{Peers: addrInfos})
+    peers := pe.node.Host().Network().Peers()
+    var addrInfos []*pb.PeerInfo
+    for _, p := range peers {
+        if p == pe.node.Host().ID() {
+            continue
+        }
+        // Only share peers that are currently connected
+        if pe.node.Host().Network().Connectedness(p) != network.Connected {
+            continue
+        }
+        info := pe.node.Host().Peerstore().PeerInfo(p)
+        if len(info.Addrs) == 0 {
+            // Skip peers with no dialable addresses to reduce useless exchange entries.
+            continue
+        }
+        addrInfos = append(addrInfos, addrInfoToProto(info))
+    }
+    return proto.Marshal(&pb.PeerInfoList{Peers: addrInfos})
 }
 
 // connectToNewPeers takes a list of AddrInfo, filters out known/current peers,
@@ -148,14 +158,16 @@ func (pe *PeerExchanger) connectToNewPeers(addrInfos []*pb.PeerInfo, sourcePeer 
                 }
             }
 
-            // Attempt normal connect using whatever addresses we have.
-            if err := pe.node.Host().Connect(pe.ctx, pi); err == nil {
-                log.Printf("[PeerExchanger] Connected to %s", pi.ID)
-                connected = true
+            // If we still have no addresses, skip dialing for now and back off.
+            if len(pi.Addrs) == 0 {
+                log.Printf("[PeerExchanger] Skipping %s: no dialable addresses yet", pi.ID)
                 return
-            } else {
-                log.Printf("[PeerExchanger] Failed to connect to %s: %v", pi.ID, err)
             }
+
+            // Enqueue dial; dialer will manage concurrency + timeouts
+            pe.node.enqueueDial(pi, dial.PriorityRandomDial)
+            connected = true
+            return
 
             // Do not fabricate relay paths. If the peer needs a relay, it will
             // advertise a relayed address via Identify. We'll connect once addrs
@@ -172,7 +184,7 @@ func (pe *PeerExchanger) handleExchange(stream network.Stream) {
     remotePeer := stream.Conn().RemotePeer()
     // log.Printf("[libp2p] Handling peer exchange with %s", remotePeer.String())
 
-    // Avoid manual reservation attempts here; rely on AutoRelay/Identify like IPFS.
+    // Avoid manual reservation attempts here; rely on AutoRelay/Identify.
 
     // 1. Receive their peers
     reader := bufio.NewReader(stream)
@@ -238,7 +250,7 @@ func (pe *PeerExchanger) initiateExchange(stream network.Stream) error {
     remotePeer := stream.Conn().RemotePeer()
     // log.Printf("[libp2p] Initiating peer exchange with %s", remotePeer.String())
 
-    // Avoid manual reservation attempts here; rely on AutoRelay/Identify like IPFS.
+    // Avoid manual reservation attempts here; rely on AutoRelay/Identify.
 
 	// 1. Send our peers
 	ourPeersProto, err := pe.getPeerListProto()
