@@ -24,6 +24,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/core/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+    badcmgr "github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	"github.com/libp2p/go-libp2p/p2p/host/autorelay"
 	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 
@@ -85,25 +86,68 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 		fmt.Sprintf("/ip4/0.0.0.0/udp/%d/quic-v1", p2pPort),
 	}
 
-	var nodeDHT *dht.IpfsDHT
+    var nodeDHT *dht.IpfsDHT
+    var hostRef host.Host
 	// Prepare candidate relays (use bootnodes by default). AutoRelay will
 	// probe and maintain relay reservations and advertise relayed addresses
-	// via Identify, matching IPFS behavior.
+	// via Identify.
 	relayCandidates := addrInfos
 
-	h, err := libp2p.New(
-		libp2p.Identity(privKey),
-		libp2p.ListenAddrStrings(listenAddrs...),
-		libp2p.EnableRelay(),
-		libp2p.EnableAutoRelayWithPeerSource(
-			func(ctx context.Context, num int) <-chan peer.AddrInfo {
-				ch := make(chan peer.AddrInfo, len(relayCandidates))
-				go func() {
-					defer close(ch)
-					// feed up to num candidates, or all if num <= 0
-					limit := num
-					if limit <= 0 || limit > len(relayCandidates) {
-						limit = len(relayCandidates)
+    // Build a connection manager first
+    cm, err := badcmgr.NewConnManager(50, 120, badcmgr.WithGracePeriod(time.Minute))
+    if err != nil {
+        return nil, fmt.Errorf("failed to create conn manager: %w", err)
+    }
+
+    h, err := libp2p.New(
+        libp2p.Identity(privKey),
+        libp2p.ListenAddrStrings(listenAddrs...),
+        libp2p.EnableRelay(),
+        libp2p.NATPortMap(),
+        libp2p.EnableNATService(),
+        libp2p.ConnectionManager(cm),
+        libp2p.EnableAutoRelayWithPeerSource(
+            func(ctx context.Context, num int) <-chan peer.AddrInfo {
+                ch := make(chan peer.AddrInfo, 32)
+                go func() {
+                    defer close(ch)
+					count := 0
+					// If we have a host reference, try dynamic relay-capable peers first
+					if hostRef != nil {
+						peers := hostRef.Peerstore().Peers()
+						for _, pid := range peers {
+							if pid == hostRef.ID() {
+								continue
+							}
+							protos, err := hostRef.Peerstore().GetProtocols(pid)
+							if err != nil {
+								continue
+							}
+							hop := false
+							for _, p := range protos {
+								if p == RelayV2Hop {
+									hop = true
+									break
+								}
+							}
+							if !hop {
+								continue
+							}
+							info := hostRef.Peerstore().PeerInfo(pid)
+							if len(info.Addrs) == 0 {
+								continue
+							}
+							ch <- info
+							count++
+							if num > 0 && count >= num {
+								return
+							}
+						}
+					}
+					// Then add configured candidates
+					limit := len(relayCandidates)
+					if num > 0 && num-count < limit {
+						limit = num - count
 					}
 					for i := 0; i < limit; i++ {
 						ch <- relayCandidates[i]
@@ -132,6 +176,9 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 	if err != nil {
 		return nil, fmt.Errorf("failed to create libp2p host: %w", err)
 	}
+
+	// Set hostRef after host creation so the AutoRelay PeerSource can use it.
+	hostRef = h
 
 	nodeCtx, cancel := context.WithCancel(ctx)
 	node := &Node{

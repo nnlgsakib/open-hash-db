@@ -96,7 +96,7 @@ func (hs *HeartbeatService) StopMonitoring(peerID peer.ID) {
 
 // monitor periodically sends heartbeats to a peer
 func (hs *HeartbeatService) monitor(ctx context.Context, peerID peer.ID) {
-	defer hs.StopMonitoring(peerID)
+    defer hs.StopMonitoring(peerID)
 
 	// Add a random initial delay to de-synchronize heartbeats
 	initialDelay := time.Duration(rand.Intn(1000)) * time.Millisecond
@@ -108,21 +108,27 @@ func (hs *HeartbeatService) monitor(ctx context.Context, peerID peer.ID) {
 	}
 
 	// log.Printf("[libp2p] Starting heartbeat monitor for peer %s", peerID.String())
-	ticker := time.NewTicker(HeartbeatInterval)
-	defer ticker.Stop()
+    ticker := time.NewTicker(HeartbeatInterval)
+    defer ticker.Stop()
+    consecutiveFailures := 0
 
-	for {
-		if err := hs.sendHeartbeat(peerID); err != nil {
-			log.Printf("[libp2p] Heartbeat to %s failed: %v", peerID.String(), err)
-			heartbeatFailureTotal.Inc()
-			// Reset all connections to the peer on failure
-			hs.node.host.Network().ClosePeer(peerID)
-			connectionResetTotal.Inc()
-			log.Printf("[libp2p] Connection to %s reset due to heartbeat failure", peerID.String())
-			return
-		}
-		heartbeatSuccessTotal.Inc()
-		// log.Printf("[libp2p] Successful heartbeat to %s", peerID.String())
+    for {
+        if err := hs.sendHeartbeat(peerID); err != nil {
+            log.Printf("[libp2p] Heartbeat to %s failed: %v", peerID.String(), err)
+            heartbeatFailureTotal.Inc()
+            consecutiveFailures++
+            if consecutiveFailures >= 3 {
+                // After several consecutive failures, reset the connection.
+                hs.node.host.Network().ClosePeer(peerID)
+                connectionResetTotal.Inc()
+                log.Printf("[libp2p] Connection to %s reset after %d heartbeat failures", peerID.String(), consecutiveFailures)
+                return
+            }
+        } else {
+            consecutiveFailures = 0
+        }
+        heartbeatSuccessTotal.Inc()
+        // log.Printf("[libp2p] Successful heartbeat to %s", peerID.String())
 
 		select {
 		case <-ctx.Done():
