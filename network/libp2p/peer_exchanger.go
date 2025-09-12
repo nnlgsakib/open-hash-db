@@ -157,31 +157,9 @@ func (pe *PeerExchanger) connectToNewPeers(addrInfos []*pb.PeerInfo, sourcePeer 
                 log.Printf("[PeerExchanger] Failed to connect to %s: %v", pi.ID, err)
             }
 
-            // Fallback: try building relayed addresses using the source peer's known addresses.
-            if len(pi.Addrs) == 0 {
-                srcAddrs := pe.node.Host().Peerstore().Addrs(sourcePeer)
-                if len(srcAddrs) > 0 {
-                    var relayAddrs []multiaddr.Multiaddr
-                    for _, a := range srcAddrs {
-                        // Construct: <src addr>/p2p/<srcID>/p2p-circuit/p2p/<destID>
-                        ra, err := multiaddr.NewMultiaddr(a.String() + "/p2p/" + sourcePeer.String() + "/p2p-circuit/p2p/" + pi.ID.String())
-                        if err == nil {
-                            relayAddrs = append(relayAddrs, ra)
-                        }
-                    }
-                    if len(relayAddrs) > 0 {
-                        relayPeerInfo := peer.AddrInfo{ID: pi.ID, Addrs: relayAddrs}
-                        log.Printf("[PeerExchanger] Attempting relay dial to %s via %s with %d addrs", pi.ID, sourcePeer, len(relayAddrs))
-                        if err := pe.node.Host().Connect(pe.ctx, relayPeerInfo); err == nil {
-                            log.Printf("[PeerExchanger] Connected to %s via relay %s", pi.ID, sourcePeer)
-                            connected = true
-                            return
-                        } else {
-                            log.Printf("[PeerExchanger] Relay dial to %s via %s failed: %v", pi.ID, sourcePeer, err)
-                        }
-                    }
-                }
-            }
+            // Do not fabricate relay paths. If the peer needs a relay, it will
+            // advertise a relayed address via Identify. We'll connect once addrs
+            // become available (via peer exchange or DHT).
         }(addrInfo)
     }
     wg.Wait()

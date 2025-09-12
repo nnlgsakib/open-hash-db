@@ -126,8 +126,8 @@ func (hs *HeartbeatService) monitor(ctx context.Context, peerID peer.ID) {
             }
         } else {
             consecutiveFailures = 0
+            heartbeatSuccessTotal.Inc()
         }
-        heartbeatSuccessTotal.Inc()
         // log.Printf("[libp2p] Successful heartbeat to %s", peerID.String())
 
 		select {
