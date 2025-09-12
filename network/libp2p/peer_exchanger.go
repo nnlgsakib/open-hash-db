@@ -1,19 +1,19 @@
 package libp2p
 
 import (
-	"bufio"
-	"context"
-	"encoding/binary"
-	"io"
-	"log"
-	"sync"
+    "bufio"
+    "context"
+    "encoding/binary"
+    "io"
+    "log"
+    "sync"
 
-	"openhashdb/protobuf/pb"
+    "openhashdb/protobuf/pb"
 
-	"github.com/libp2p/go-libp2p/core/network"
-	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/multiformats/go-multiaddr"
-	"google.golang.org/protobuf/proto"
+    "github.com/libp2p/go-libp2p/core/network"
+    "github.com/libp2p/go-libp2p/core/peer"
+    "github.com/multiformats/go-multiaddr"
+    "google.golang.org/protobuf/proto"
 )
 
 // PeerExchanger handles exchanging peer lists.
@@ -79,7 +79,7 @@ func (pe *PeerExchanger) getPeerListProto() ([]byte, error) {
 // connectToNewPeers takes a list of AddrInfo, filters out known/current peers,
 // and attempts to connect to the new ones, using the source as a relay if direct connection fails.
 func (pe *PeerExchanger) connectToNewPeers(addrInfos []*pb.PeerInfo, sourcePeer peer.ID) {
-	var wg sync.WaitGroup
+    var wg sync.WaitGroup
 
 	for _, pi := range addrInfos {
 		addrInfo, err := protoToAddrInfo(pi)
@@ -103,9 +103,9 @@ func (pe *PeerExchanger) connectToNewPeers(addrInfos []*pb.PeerInfo, sourcePeer 
 		pe.connectingMu.Unlock()
 
 		wg.Add(1)
-		go func(pi peer.AddrInfo) {
-			defer wg.Done()
-			var connected bool
+        go func(pi peer.AddrInfo) {
+            defer wg.Done()
+            var connected bool
 
 			defer func() {
 				if !connected {
@@ -115,67 +115,39 @@ func (pe *PeerExchanger) connectToNewPeers(addrInfos []*pb.PeerInfo, sourcePeer 
 				}
 			}()
 
-			if pe.node.Host().Network().Connectedness(pi.ID) == network.Connected {
-				connected = true
-				return
-			}
+            if pe.node.Host().Network().Connectedness(pi.ID) == network.Connected {
+                connected = true
+                return
+            }
 
-			log.Printf("[PeerExchanger] Discovered new peer %s from %s", pi.ID, sourcePeer)
+            log.Printf("[PeerExchanger] Discovered new peer %s from %s", pi.ID, sourcePeer)
 
-			if len(pi.Addrs) > 0 {
-				log.Printf("[PeerExchanger] Attempting direct connection to %s with addrs: %v", pi.ID, pi.Addrs)
-				err := pe.node.Host().Connect(pe.ctx, pi)
-				if err == nil {
-					log.Printf("[PeerExchanger] Successfully connected directly to new peer %s", pi.ID)
-					connected = true
-					return
-				}
-				log.Printf("[PeerExchanger] Failed to connect directly to %s: %v. Trying via relay.", pi.ID, err)
-			} else {
-				log.Printf("[PeerExchanger] Peer %s has no public addresses, trying via relay.", pi.ID)
-			}
-
-			log.Printf("[PeerExchanger] Attempting relay connection to %s via %s", pi.ID, sourcePeer)
-			relayAddr, err := multiaddr.NewMultiaddr("/p2p/" + sourcePeer.String() + "/p2p-circuit/p2p/" + pi.ID.String())
-			if err != nil {
-				log.Printf("[PeerExchanger] Error creating relay address for %s via %s: %v", pi.ID, sourcePeer, err)
-				return
-			}
-
-			relayPeerInfo := peer.AddrInfo{
-				ID:    pi.ID,
-				Addrs: []multiaddr.Multiaddr{relayAddr},
-			}
-
-			if err := pe.node.Host().Connect(pe.ctx, relayPeerInfo); err != nil {
-				log.Printf("[PeerExchanger] Failed to connect to %s via relay %s: %v", pi.ID, sourcePeer, err)
-			} else {
-				log.Printf("[PeerExchanger] Successfully connected to %s via relay %s", pi.ID, sourcePeer)
-				connected = true
-			}
-		}(addrInfo)
-	}
-	wg.Wait()
+            // Let libp2p handle dialing using whatever addrs the peer advertises
+            // (direct, relayed, QUIC, TCP, etc). This matches IPFS behavior and
+            // avoids trying to force a specific relay path that may not be reserved
+            // by the destination peer.
+            if err := pe.node.Host().Connect(pe.ctx, pi); err != nil {
+                log.Printf("[PeerExchanger] Failed to connect to %s: %v", pi.ID, err)
+                return
+            }
+            log.Printf("[PeerExchanger] Connected to %s", pi.ID)
+            connected = true
+        }(addrInfo)
+    }
+    wg.Wait()
 }
 
 // handleExchange handles the peer exchange on an incoming stream.
 // It reads the peer list, connects to new peers, sends its own list back.
 func (pe *PeerExchanger) handleExchange(stream network.Stream) {
-	defer stream.Close()
-	remotePeer := stream.Conn().RemotePeer()
-	// log.Printf("[libp2p] Handling peer exchange with %s", remotePeer.String())
+    defer stream.Close()
+    remotePeer := stream.Conn().RemotePeer()
+    // log.Printf("[libp2p] Handling peer exchange with %s", remotePeer.String())
 
-	// Instantly reserve a slot if the peer is a direct connection and a relay.
-	isRelayed := false
-	if _, err := stream.Conn().RemoteMultiaddr().ValueForProtocol(multiaddr.P_CIRCUIT); err == nil {
-		isRelayed = true
-	}
-	if !isRelayed && pe.node.relayer != nil {
-		pe.node.relayer.DiscoverAndReserve(remotePeer)
-	}
+    // Avoid manual reservation attempts here; rely on AutoRelay/Identify like IPFS.
 
-	// 1. Receive their peers
-	reader := bufio.NewReader(stream)
+    // 1. Receive their peers
+    reader := bufio.NewReader(stream)
 	msgLen, err := binary.ReadUvarint(reader)
 	if err != nil {
 		log.Printf("[libp2p] Failed to read peer list length from stream with %s: %v", remotePeer.String(), err)
@@ -234,18 +206,11 @@ func (pe *PeerExchanger) handleExchange(stream network.Stream) {
 // initiateExchange initiates a peer exchange on an outgoing stream.
 // It sends its own peer list, then reads the other's list and connects to new peers.
 func (pe *PeerExchanger) initiateExchange(stream network.Stream) error {
-	defer stream.Close()
-	remotePeer := stream.Conn().RemotePeer()
-	// log.Printf("[libp2p] Initiating peer exchange with %s", remotePeer.String())
+    defer stream.Close()
+    remotePeer := stream.Conn().RemotePeer()
+    // log.Printf("[libp2p] Initiating peer exchange with %s", remotePeer.String())
 
-	// Instantly reserve a slot if the peer is a direct connection and a relay.
-	isRelayed := false
-	if _, err := stream.Conn().RemoteMultiaddr().ValueForProtocol(multiaddr.P_CIRCUIT); err == nil {
-		isRelayed = true
-	}
-	if !isRelayed && pe.node.relayer != nil {
-		pe.node.relayer.DiscoverAndReserve(remotePeer)
-	}
+    // Avoid manual reservation attempts here; rely on AutoRelay/Identify like IPFS.
 
 	// 1. Send our peers
 	ourPeersProto, err := pe.getPeerListProto()

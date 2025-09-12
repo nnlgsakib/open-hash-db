@@ -24,6 +24,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/core/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+	"github.com/libp2p/go-libp2p/p2p/host/autorelay"
 	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
@@ -85,10 +86,33 @@ func NewNodeWithKeyPath(ctx context.Context, bootnodes []string, keyPath string,
 	}
 
 	var nodeDHT *dht.IpfsDHT
+	// Prepare candidate relays (use bootnodes by default). AutoRelay will
+	// probe and maintain relay reservations and advertise relayed addresses
+	// via Identify, matching IPFS behavior.
+	relayCandidates := addrInfos
+
 	h, err := libp2p.New(
 		libp2p.Identity(privKey),
 		libp2p.ListenAddrStrings(listenAddrs...),
 		libp2p.EnableRelay(),
+		libp2p.EnableAutoRelayWithPeerSource(
+			func(ctx context.Context, num int) <-chan peer.AddrInfo {
+				ch := make(chan peer.AddrInfo, len(relayCandidates))
+				go func() {
+					defer close(ch)
+					// feed up to num candidates, or all if num <= 0
+					limit := num
+					if limit <= 0 || limit > len(relayCandidates) {
+						limit = len(relayCandidates)
+					}
+					for i := 0; i < limit; i++ {
+						ch <- relayCandidates[i]
+					}
+				}()
+				return ch
+			},
+			autorelay.WithNumRelays(2),
+		),
 		libp2p.EnableHolePunching(),
 		libp2p.Security(noise.ID, noise.New),
 		libp2p.Transport(tcp.NewTCPTransport),
@@ -184,8 +208,7 @@ func (n *networkNotifiee) Connected(net network.Network, conn network.Conn) {
 		n.node.router.dht.RoutingTable().TryAddPeer(conn.RemotePeer(), true, true)
 	}
 
-	// Try to make a reservation with the peer if it supports relaying
-	n.node.relayer.DiscoverAndReserve(conn.RemotePeer())
+	// Rely on AutoRelay/Identify to discover relays and manage reservations.
 }
 
 func (n *networkNotifiee) Disconnected(net network.Network, conn network.Conn) {
@@ -447,14 +470,7 @@ func (n *Node) connectToBootnodes(bootnodes []string) error {
 				mu.Lock()
 				connectedCount++
 				mu.Unlock()
-				pinfo, err := peer.AddrInfoFromString(addr)
-				if err != nil {
-					log.Printf("[libp2p] Could not parse bootnode address %s for reservation: %v", addr, err)
-					return
-				}
-				reserveCtx, reserveCancel := context.WithTimeout(context.Background(), 10*time.Second)
-				defer reserveCancel()
-				n.relayer.ReserveSlot(reserveCtx, *pinfo)
+				// No manual reservation; AutoRelay manages this.
 			}
 		}(bootnode)
 	}

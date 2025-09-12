@@ -1,19 +1,18 @@
 package libp2p
 
 import (
-	"context"
-	"fmt"
-	"log"
-	"sync"
-	"time"
+    "context"
+    "fmt"
+    "log"
+    "sync"
+    "time"
 
-	"openhashdb/protobuf/pb"
+    "openhashdb/protobuf/pb"
 
-	ggio "github.com/gogo/protobuf/io"
-	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
-	"github.com/multiformats/go-multiaddr"
+    ggio "github.com/gogo/protobuf/io"
+    "github.com/libp2p/go-libp2p/core/host"
+    "github.com/libp2p/go-libp2p/core/peer"
+    "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 )
 
 const (
@@ -91,25 +90,18 @@ func (r *Relayer) ReserveSlot(ctx context.Context, p peer.AddrInfo) {
 	}
 
 	log.Printf("[relayer] Successfully reserved slot with %s.", p.ID)
-	if msg.Reservation != nil {
-		r.reservationsMu.Lock()
-		r.reservations[p.ID] = &ReservationInfo{
-			Relay:      p.ID,
-			Expiration: time.Unix(int64(msg.Reservation.Expire), 0),
-			Voucher:    msg.Reservation.Voucher,
-		}
-		r.reservationsMu.Unlock()
-		log.Printf("[relayer] Reservation with %s expires at %s", p.ID, time.Unix(int64(msg.Reservation.Expire), 0))
-		// Add the relay address to the host's peerstore, so it's advertised to the network.
-		relayAddr, err := multiaddr.NewMultiaddr("/p2p/" + p.ID.String() + "/p2p-circuit")
-		if err != nil {
-			log.Printf("[relayer] failed to create relay multiaddr: %v", err)
-		} else {
-			// The TTL should be greater than the reservation refresh interval.
-			r.host.Peerstore().AddAddr(r.host.ID(), relayAddr, ReservationRefreshInterval*2)
-			log.Printf("[relayer] Added relay address to peerstore: %s", relayAddr)
-		}
-	}
+    if msg.Reservation != nil {
+        r.reservationsMu.Lock()
+        r.reservations[p.ID] = &ReservationInfo{
+            Relay:      p.ID,
+            Expiration: time.Unix(int64(msg.Reservation.Expire), 0),
+            Voucher:    msg.Reservation.Voucher,
+        }
+        r.reservationsMu.Unlock()
+        log.Printf("[relayer] Reservation with %s expires at %s", p.ID, time.Unix(int64(msg.Reservation.Expire), 0))
+        // AutoRelay will advertise relayed addresses via Identify. No manual
+        // mutation of self addresses here.
+    }
 }
 
 // DiscoverAndReserve checks if a peer is a relay and attempts to reserve a slot.
