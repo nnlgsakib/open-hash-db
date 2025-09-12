@@ -6,6 +6,7 @@ import (
     "encoding/binary"
     "io"
     "log"
+    "time"
     "sync"
 
     "openhashdb/protobuf/pb"
@@ -122,16 +123,39 @@ func (pe *PeerExchanger) connectToNewPeers(addrInfos []*pb.PeerInfo, sourcePeer 
 
             log.Printf("[PeerExchanger] Discovered new peer %s from %s", pi.ID, sourcePeer)
 
-            // Let libp2p handle dialing using whatever addrs the peer advertises
-            // (direct, relayed, QUIC, TCP, etc). This matches IPFS behavior and
-            // avoids trying to force a specific relay path that may not be reserved
-            // by the destination peer.
-            if err := pe.node.Host().Connect(pe.ctx, pi); err != nil {
-                log.Printf("[PeerExchanger] Failed to connect to %s: %v", pi.ID, err)
-                return
+            // If we have no addresses, try to resolve via DHT first.
+            if len(pi.Addrs) == 0 && pe.node.router != nil && pe.node.router.dht != nil {
+                ctx, cancel := context.WithTimeout(pe.ctx, 20*time.Second)
+                defer cancel()
+                if info, err := pe.node.router.dht.FindPeer(ctx, pi.ID); err == nil && len(info.Addrs) > 0 {
+                    pi.Addrs = info.Addrs
+                    log.Printf("[PeerExchanger] Resolved %s via DHT with %d addrs", pi.ID, len(pi.Addrs))
+                } else if err != nil {
+                    log.Printf("[PeerExchanger] DHT find peer %s failed: %v", pi.ID, err)
+                }
             }
-            log.Printf("[PeerExchanger] Connected to %s", pi.ID)
-            connected = true
+
+            // Attempt normal connect using whatever addresses we have.
+            if err := pe.node.Host().Connect(pe.ctx, pi); err == nil {
+                log.Printf("[PeerExchanger] Connected to %s", pi.ID)
+                connected = true
+                return
+            } else {
+                log.Printf("[PeerExchanger] Failed to connect to %s: %v", pi.ID, err)
+            }
+
+            // Fallback: if still no addresses, try via the source as relay once.
+            if len(pi.Addrs) == 0 {
+                relayAddr, err := multiaddr.NewMultiaddr("/p2p/" + sourcePeer.String() + "/p2p-circuit/p2p/" + pi.ID.String())
+                if err == nil {
+                    relayPeerInfo := peer.AddrInfo{ID: pi.ID, Addrs: []multiaddr.Multiaddr{relayAddr}}
+                    if err := pe.node.Host().Connect(pe.ctx, relayPeerInfo); err == nil {
+                        log.Printf("[PeerExchanger] Connected to %s via relay %s", pi.ID, sourcePeer)
+                        connected = true
+                        return
+                    }
+                }
+            }
         }(addrInfo)
     }
     wg.Wait()
