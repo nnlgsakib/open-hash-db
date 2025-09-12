@@ -79,14 +79,40 @@ func (pe *PeerExchanger) getPeerListProto() ([]byte, error) {
         if pe.node.Host().Network().Connectedness(p) != network.Connected {
             continue
         }
+        // Fetch addresses from peerstore; if empty, fall back to live connection addresses
         info := pe.node.Host().Peerstore().PeerInfo(p)
-        if len(info.Addrs) == 0 {
-            // Skip peers with no dialable addresses to reduce useless exchange entries.
+        addrs := info.Addrs
+        if len(addrs) == 0 {
+            conns := pe.node.Host().Network().ConnsToPeer(p)
+            for _, c := range conns {
+                if c == nil { continue }
+                ra := c.RemoteMultiaddr()
+                if ra == nil { continue }
+                addrs = append(addrs, ra)
+            }
+        }
+        if len(addrs) == 0 {
             continue
         }
-        addrInfos = append(addrInfos, addrInfoToProto(info))
+        addrInfos = append(addrInfos, &pb.PeerInfo{
+            Id:    p.String(),
+            Addrs: multiaddrsToStrings(addrs),
+        })
     }
     return proto.Marshal(&pb.PeerInfoList{Peers: addrInfos})
+}
+
+func multiaddrsToStrings(addrs []multiaddr.Multiaddr) []string {
+    out := make([]string, 0, len(addrs))
+    seen := make(map[string]struct{}, len(addrs))
+    for _, a := range addrs {
+        if a == nil { continue }
+        s := a.String()
+        if _, ok := seen[s]; ok { continue }
+        seen[s] = struct{}{}
+        out = append(out, s)
+    }
+    return out
 }
 
 // connectToNewPeers takes a list of AddrInfo, filters out known/current peers,
