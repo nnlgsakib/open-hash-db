@@ -1,11 +1,12 @@
 package libp2p
 
 import (
-	"context"
-	"log"
-	"math/rand"
-	"sync"
-	"time"
+    "context"
+    "fmt"
+    "log"
+    "math/rand"
+    "sync"
+    "time"
 
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -13,6 +14,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
+
+var errPeerNotConnected = fmt.Errorf("peer not connected")
 
 const (
 	ProtocolHeartbeat = protocol.ID("/openhashdb/heartbeat/1.0.0")
@@ -116,6 +119,11 @@ func (hs *HeartbeatService) monitor(ctx context.Context, peerID peer.ID) {
         if err := hs.sendHeartbeat(peerID); err != nil {
             log.Printf("[libp2p] Heartbeat to %s failed: %v", peerID.String(), err)
             heartbeatFailureTotal.Inc()
+            if err == errPeerNotConnected {
+                // Stop monitoring immediately when peer is offline
+                log.Printf("[libp2p] Peer %s offline, stopping heartbeat monitor", peerID.String())
+                return
+            }
             consecutiveFailures++
             if consecutiveFailures >= 3 {
                 // After several consecutive failures, reset the connection.
@@ -141,21 +149,24 @@ func (hs *HeartbeatService) monitor(ctx context.Context, peerID peer.ID) {
 
 // sendHeartbeat sends a single heartbeat to a peer and initiates peer exchange
 func (hs *HeartbeatService) sendHeartbeat(peerID peer.ID) error {
-	ctx, cancel := context.WithTimeout(hs.ctx, HeartbeatTimeout)
-	defer cancel()
+    // Do not attempt to dial for heartbeat. If not connected, stop monitoring.
+    if hs.node.host.Network().Connectedness(peerID) != network.Connected {
+        return errPeerNotConnected
+    }
 
-	stream, err := hs.node.host.NewStream(network.WithAllowLimitedConn(ctx, "heartbeat"), peerID, ProtocolHeartbeat)
-	if err != nil {
-		log.Printf("[libp2p] Failed to open heartbeat stream to %s: %v", peerID.String(), err)
-		return err
-	}
+    ctx, cancel := context.WithTimeout(hs.ctx, HeartbeatTimeout)
+    defer cancel()
+
+    stream, err := hs.node.host.NewStream(ctx, peerID, ProtocolHeartbeat)
+    if err != nil {
+        return err
+    }
 
 	// The actual exchange logic is handled by the PeerExchanger
 	// It will close the stream
-	if err := hs.peerExchanger.initiateExchange(stream); err != nil {
-		log.Printf("Peer exchange with %s failed: %v", peerID.String(), err)
-		return err
-	}
+    if err := hs.peerExchanger.initiateExchange(stream); err != nil {
+        return err
+    }
 
 	return nil
 }

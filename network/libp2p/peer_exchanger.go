@@ -1,40 +1,42 @@
 package libp2p
 
 import (
-    "bufio"
-    "context"
-    "encoding/binary"
-    "io"
-    "log"
-    "time"
-    "sync"
+	"bufio"
+	"context"
+	"encoding/binary"
+	"io"
+	"log"
+	"strings"
+	"sync"
+	"time"
 
-    "openhashdb/protobuf/pb"
+	"openhashdb/protobuf/pb"
 
-    "openhashdb/network/libp2p/dial"
-    "github.com/libp2p/go-libp2p/core/network"
-    "github.com/libp2p/go-libp2p/core/peer"
-    "github.com/multiformats/go-multiaddr"
-    "google.golang.org/protobuf/proto"
+	"openhashdb/network/libp2p/dial"
+
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/multiformats/go-multiaddr"
+	"google.golang.org/protobuf/proto"
 )
 
 // PeerExchanger handles exchanging peer lists.
 type PeerExchanger struct {
-    node         *Node
-    ctx          context.Context
-    connecting   map[peer.ID]bool // Keep track of in-flight connections
-    connectingMu sync.Mutex
-    backoffUntil map[peer.ID]time.Time // Next time we may retry dialing this peer
+	node         *Node
+	ctx          context.Context
+	connecting   map[peer.ID]bool // Keep track of in-flight connections
+	connectingMu sync.Mutex
+	backoffUntil map[peer.ID]time.Time // Next time we may retry dialing this peer
 }
 
 // NewPeerExchanger creates a new PeerExchanger.
 func NewPeerExchanger(ctx context.Context, node *Node) *PeerExchanger {
-    return &PeerExchanger{
-        node:       node,
-        ctx:        ctx,
-        connecting: make(map[peer.ID]bool),
-        backoffUntil: make(map[peer.ID]time.Time),
-    }
+	return &PeerExchanger{
+		node:         node,
+		ctx:          ctx,
+		connecting:   make(map[peer.ID]bool),
+		backoffUntil: make(map[peer.ID]time.Time),
+	}
 }
 
 func addrInfoToProto(pi peer.AddrInfo) *pb.PeerInfo {
@@ -69,154 +71,188 @@ func protoToAddrInfo(pi *pb.PeerInfo) (peer.AddrInfo, error) {
 
 // getPeerListProto gets the list of connected peers as a proto byte slice.
 func (pe *PeerExchanger) getPeerListProto() ([]byte, error) {
-    peers := pe.node.Host().Network().Peers()
-    var addrInfos []*pb.PeerInfo
-    for _, p := range peers {
-        if p == pe.node.Host().ID() {
-            continue
-        }
-        // Only share peers that are currently connected
-        if pe.node.Host().Network().Connectedness(p) != network.Connected {
-            continue
-        }
-        // Fetch addresses from peerstore; if empty, fall back to live connection addresses
-        info := pe.node.Host().Peerstore().PeerInfo(p)
-        addrs := info.Addrs
-        if len(addrs) == 0 {
-            conns := pe.node.Host().Network().ConnsToPeer(p)
-            for _, c := range conns {
-                if c == nil { continue }
-                ra := c.RemoteMultiaddr()
-                if ra == nil { continue }
-                addrs = append(addrs, ra)
-            }
-        }
-        if len(addrs) == 0 {
-            continue
-        }
-        addrInfos = append(addrInfos, &pb.PeerInfo{
-            Id:    p.String(),
-            Addrs: multiaddrsToStrings(addrs),
-        })
-    }
-    return proto.Marshal(&pb.PeerInfoList{Peers: addrInfos})
+	peers := pe.node.Host().Network().Peers()
+	var addrInfos []*pb.PeerInfo
+	for _, p := range peers {
+		if p == pe.node.Host().ID() {
+			continue
+		}
+		// Only share peers that are currently connected
+		if pe.node.Host().Network().Connectedness(p) != network.Connected {
+			continue
+		}
+		// Fetch addresses from peerstore; if empty, fall back to live connection addresses
+		info := pe.node.Host().Peerstore().PeerInfo(p)
+		addrs := info.Addrs
+		if len(addrs) == 0 {
+			conns := pe.node.Host().Network().ConnsToPeer(p)
+			for _, c := range conns {
+				if c == nil {
+					continue
+				}
+				ra := c.RemoteMultiaddr()
+				if ra == nil {
+					continue
+				}
+				addrs = append(addrs, ra)
+			}
+		}
+		if len(addrs) == 0 {
+			continue
+		}
+		addrInfos = append(addrInfos, &pb.PeerInfo{
+			Id:    p.String(),
+			Addrs: multiaddrsToStrings(addrs),
+		})
+	}
+	return proto.Marshal(&pb.PeerInfoList{Peers: addrInfos})
 }
 
 func multiaddrsToStrings(addrs []multiaddr.Multiaddr) []string {
-    out := make([]string, 0, len(addrs))
-    seen := make(map[string]struct{}, len(addrs))
-    for _, a := range addrs {
-        if a == nil { continue }
-        s := a.String()
-        if _, ok := seen[s]; ok { continue }
-        seen[s] = struct{}{}
-        out = append(out, s)
-    }
-    return out
+	out := make([]string, 0, len(addrs))
+	seen := make(map[string]struct{}, len(addrs))
+	for _, a := range addrs {
+		if a == nil {
+			continue
+		}
+		s := a.String()
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
+}
+
+// isTransientStreamErr returns true for common, non-actionable stream errors
+// like timeouts, resets, or no recent network activity.
+func isTransientStreamErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	es := err.Error()
+	switch {
+	case strings.Contains(es, "timeout"),
+		strings.Contains(es, "no recent network activity"),
+		strings.Contains(es, "stream reset"),
+		strings.Contains(es, "reset by peer"),
+		strings.Contains(es, "EOF"):
+		return true
+	default:
+		return false
+	}
 }
 
 // connectToNewPeers takes a list of AddrInfo, filters out known/current peers,
 // and attempts to connect to the new ones, using the source as a relay if direct connection fails.
 func (pe *PeerExchanger) connectToNewPeers(addrInfos []*pb.PeerInfo, sourcePeer peer.ID) {
-    var wg sync.WaitGroup
+	var wg sync.WaitGroup
 
-    for _, pi := range addrInfos {
-        addrInfo, err := protoToAddrInfo(pi)
-        if err != nil {
-            log.Printf("[PeerExchanger] Error converting proto to addr info: %v", err)
-            continue
-        }
+	for _, pi := range addrInfos {
+		addrInfo, err := protoToAddrInfo(pi)
+		if err != nil {
+			log.Printf("[PeerExchanger] Error converting proto to addr info: %v", err)
+			continue
+		}
 
 		// Don't connect to self or already connected peers
 		if pe.node.IsSelf(addrInfo) || pe.node.Host().Network().Connectedness(addrInfo.ID) == network.Connected {
 			continue
 		}
 
-        // Check backoff and if a connection is already in progress
-        pe.connectingMu.Lock()
-        if next, ok := pe.backoffUntil[addrInfo.ID]; ok && time.Now().Before(next) {
-            pe.connectingMu.Unlock()
-            continue
-        }
-        if pe.connecting[addrInfo.ID] {
-            pe.connectingMu.Unlock()
-            continue
-        }
-        pe.connecting[addrInfo.ID] = true
-        pe.connectingMu.Unlock()
+		// Check backoff and if a connection is already in progress
+		pe.connectingMu.Lock()
+		if next, ok := pe.backoffUntil[addrInfo.ID]; ok && time.Now().Before(next) {
+			pe.connectingMu.Unlock()
+			continue
+		}
+		if pe.connecting[addrInfo.ID] {
+			pe.connectingMu.Unlock()
+			continue
+		}
+		pe.connecting[addrInfo.ID] = true
+		pe.connectingMu.Unlock()
 
 		wg.Add(1)
-        go func(pi peer.AddrInfo) {
-            defer wg.Done()
-            var connected bool
+		go func(pi peer.AddrInfo) {
+			defer wg.Done()
+			var connected bool
 
-            defer func() {
-                if !connected {
-                    pe.connectingMu.Lock()
-                    delete(pe.connecting, pi.ID)
-                    // Set backoff before next attempt
-                    base := 2 * time.Minute
-                    pidBytes := []byte(pi.ID)
-                    var b byte
-                    if len(pidBytes) > 0 { b = pidBytes[0] }
-                    jitter := time.Duration(int64(time.Second) * int64((b%30)))
-                    pe.backoffUntil[pi.ID] = time.Now().Add(base + jitter)
-                    pe.connectingMu.Unlock()
-                }
-            }()
+			defer func() {
+				if !connected {
+					pe.connectingMu.Lock()
+					delete(pe.connecting, pi.ID)
+					// Set backoff before next attempt
+					base := 2 * time.Minute
+					pidBytes := []byte(pi.ID)
+					var b byte
+					if len(pidBytes) > 0 {
+						b = pidBytes[0]
+					}
+					jitter := time.Duration(int64(time.Second) * int64((b % 30)))
+					pe.backoffUntil[pi.ID] = time.Now().Add(base + jitter)
+					pe.connectingMu.Unlock()
+				}
+			}()
 
-            if pe.node.Host().Network().Connectedness(pi.ID) == network.Connected {
-                connected = true
-                return
-            }
+			if pe.node.Host().Network().Connectedness(pi.ID) == network.Connected {
+				connected = true
+				return
+			}
 
-            log.Printf("[PeerExchanger] Discovered new peer %s from %s", pi.ID, sourcePeer)
+			log.Printf("[PeerExchanger] Discovered new peer %s from %s", pi.ID, sourcePeer)
 
-            // If we have no addresses, try to resolve via DHT first.
-            if len(pi.Addrs) == 0 && pe.node.router != nil && pe.node.router.dht != nil {
-                ctx, cancel := context.WithTimeout(pe.ctx, 20*time.Second)
-                defer cancel()
-                if info, err := pe.node.router.dht.FindPeer(ctx, pi.ID); err == nil && len(info.Addrs) > 0 {
-                    pi.Addrs = info.Addrs
-                    log.Printf("[PeerExchanger] Resolved %s via DHT with %d addrs", pi.ID, len(pi.Addrs))
-                } else if err != nil {
-                    log.Printf("[PeerExchanger] DHT find peer %s failed: %v", pi.ID, err)
-                }
-            }
+			// If we have no addresses, try to resolve via DHT first.
+			if len(pi.Addrs) == 0 && pe.node.router != nil && pe.node.router.dht != nil {
+				ctx, cancel := context.WithTimeout(pe.ctx, 20*time.Second)
+				defer cancel()
+				if info, err := pe.node.router.dht.FindPeer(ctx, pi.ID); err == nil && len(info.Addrs) > 0 {
+					pi.Addrs = info.Addrs
+					log.Printf("[PeerExchanger] Resolved %s via DHT with %d addrs", pi.ID, len(pi.Addrs))
+				} else if err != nil {
+					log.Printf("[PeerExchanger] DHT find peer %s failed: %v", pi.ID, err)
+				}
+			}
 
-            // If we still have no addresses, skip dialing for now and back off.
-            if len(pi.Addrs) == 0 {
-                log.Printf("[PeerExchanger] Skipping %s: no dialable addresses yet", pi.ID)
-                return
-            }
+			// If we still have no addresses, skip dialing for now and back off.
+			if len(pi.Addrs) == 0 {
+				log.Printf("[PeerExchanger] Skipping %s: no dialable addresses yet", pi.ID)
+				return
+			}
 
-            // Enqueue dial; dialer will manage concurrency + timeouts
-            pe.node.enqueueDial(pi, dial.PriorityRandomDial)
-            connected = true
-            return
+			// Enqueue dial; dialer will manage concurrency + timeouts
+			pe.node.enqueueDial(pi, dial.PriorityRandomDial)
+			connected = true
+			return
 
-            // Do not fabricate relay paths. If the peer needs a relay, it will
-            // advertise a relayed address via Identify. We'll connect once addrs
-            // become available (via peer exchange or DHT).
-        }(addrInfo)
-    }
-    wg.Wait()
+			// Do not fabricate relay paths. If the peer needs a relay, it will
+			// advertise a relayed address via Identify. We'll connect once addrs
+			// become available (via peer exchange or DHT).
+		}(addrInfo)
+	}
+	wg.Wait()
 }
 
 // handleExchange handles the peer exchange on an incoming stream.
 // It reads the peer list, connects to new peers, sends its own list back.
 func (pe *PeerExchanger) handleExchange(stream network.Stream) {
-    defer stream.Close()
-    remotePeer := stream.Conn().RemotePeer()
-    // log.Printf("[libp2p] Handling peer exchange with %s", remotePeer.String())
+	defer stream.Close()
+	remotePeer := stream.Conn().RemotePeer()
+	// log.Printf("[libp2p] Handling peer exchange with %s", remotePeer.String())
 
-    // Avoid manual reservation attempts here; rely on AutoRelay/Identify.
+	// Avoid manual reservation attempts here; rely on AutoRelay/Identify.
 
-    // 1. Receive their peers
-    reader := bufio.NewReader(stream)
+	// 1. Receive their peers
+	reader := bufio.NewReader(stream)
 	msgLen, err := binary.ReadUvarint(reader)
 	if err != nil {
-		log.Printf("[libp2p] Failed to read peer list length from stream with %s: %v", remotePeer.String(), err)
+		// Treat timeouts / resets as normal termination
+		if isTransientStreamErr(err) {
+			// quiet end
+		} else {
+			log.Printf("[libp2p] Peer exchange read error from %s: %v", remotePeer.String(), err)
+		}
 		stream.Reset()
 		return
 	}
@@ -224,14 +260,16 @@ func (pe *PeerExchanger) handleExchange(stream network.Stream) {
 	theirPeersProto := make([]byte, msgLen)
 	_, err = io.ReadFull(reader, theirPeersProto)
 	if err != nil {
-		log.Printf("[libp2p] Failed to read peer list from stream with %s: %v", remotePeer.String(), err)
+		if !isTransientStreamErr(err) {
+			log.Printf("[libp2p] Peer exchange body read error from %s: %v", remotePeer.String(), err)
+		}
 		stream.Reset()
 		return
 	}
 
 	var theirPeers pb.PeerInfoList
 	if err := proto.Unmarshal(theirPeersProto, &theirPeers); err != nil {
-		log.Printf("[libp2p] Failed to unmarshal peer list from %s: %v", remotePeer.String(), err)
+		log.Printf("[libp2p] Invalid peer list from %s: %v", remotePeer.String(), err)
 		stream.Reset()
 		return
 	}
@@ -272,11 +310,11 @@ func (pe *PeerExchanger) handleExchange(stream network.Stream) {
 // initiateExchange initiates a peer exchange on an outgoing stream.
 // It sends its own peer list, then reads the other's list and connects to new peers.
 func (pe *PeerExchanger) initiateExchange(stream network.Stream) error {
-    defer stream.Close()
-    remotePeer := stream.Conn().RemotePeer()
-    // log.Printf("[libp2p] Initiating peer exchange with %s", remotePeer.String())
+	defer stream.Close()
+	remotePeer := stream.Conn().RemotePeer()
+	// log.Printf("[libp2p] Initiating peer exchange with %s", remotePeer.String())
 
-    // Avoid manual reservation attempts here; rely on AutoRelay/Identify.
+	// Avoid manual reservation attempts here; rely on AutoRelay/Identify.
 
 	// 1. Send our peers
 	ourPeersProto, err := pe.getPeerListProto()
@@ -311,7 +349,9 @@ func (pe *PeerExchanger) initiateExchange(stream network.Stream) error {
 	reader := bufio.NewReader(stream)
 	msgLen, err := binary.ReadUvarint(reader)
 	if err != nil {
-		log.Printf("[libp2p] Failed to read peer list length from stream with %s: %v", remotePeer.String(), err)
+		if !isTransientStreamErr(err) {
+			log.Printf("[libp2p] Peer exchange read error from %s: %v", remotePeer.String(), err)
+		}
 		stream.Reset()
 		return err
 	}
@@ -319,7 +359,9 @@ func (pe *PeerExchanger) initiateExchange(stream network.Stream) error {
 	theirPeersProto := make([]byte, msgLen)
 	_, err = io.ReadFull(reader, theirPeersProto)
 	if err != nil {
-		log.Printf("[libp2p] Failed to read peer list from stream with %s: %v", remotePeer.String(), err)
+		if !isTransientStreamErr(err) {
+			log.Printf("[libp2p] Peer exchange body read error from %s: %v", remotePeer.String(), err)
+		}
 		stream.Reset()
 		return err
 	}
