@@ -1,4 +1,4 @@
-package rest
+package gateway
 
 import (
     "container/list"
@@ -7,11 +7,11 @@ import (
 
 // ChunkCache is an LRU cache bounded by total bytes.
 type ChunkCache struct {
-    mu         sync.Mutex
-    maxBytes   int64
-    curBytes   int64
-    ll         *list.List
-    cache      map[string]*list.Element
+    mu       sync.Mutex
+    maxBytes int64
+    curBytes int64
+    ll       *list.List
+    cache    map[string]*list.Element
 }
 
 type entry struct {
@@ -69,3 +69,4 @@ func (cc *ChunkCache) evict() {
         cc.ll.Remove(ele)
     }
 }
+

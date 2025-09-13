@@ -1,9 +1,11 @@
-package rest
+package gateway
 
 import (
     "context"
     "log"
     "net/http"
+    "os"
+    "strconv"
     "sync"
     "time"
 
@@ -15,24 +17,23 @@ import (
     "openhashdb/network/streammanager"
 
     "github.com/gorilla/mux"
-    "os"
-    "strconv"
 )
 
 const (
-	// Buffer sizes and limits
-	bufferSize       = 64 * 1024 // 64KB buffer for streaming
-	maxConcurrentOps = 10        // Maximum concurrent chunk operations
-	chunkCacheSize   = 100       // Number of chunks to keep in memory
-	prefetchAhead    = 5         // Number of chunks to prefetch ahead
+    // Buffer sizes and limits
+    bufferSize       = 64 * 1024 // 64KB buffer for streaming
+    maxConcurrentOps = 10        // Maximum concurrent chunk operations
+    chunkCacheSize   = 100       // retained for compatibility (unused)
+    prefetchAhead    = 5         // retained for compatibility
 )
 
-// NewServer creates a new REST API server
-func NewServer(bs *blockstore.Blockstore, replicator *replicator.Replicator, node interface{}) *Server {
-	sharder, err := sharder.NewReedSolomon(sharder.DefaultDataShards, sharder.DefaultParityShards)
-	if err != nil {
-		log.Fatalf("Failed to create sharder: %v", err)
-	}
+// NewServer creates a new HTTP API gateway server
+func NewServer(bs *blockstore.Blockstore, repl *replicator.Replicator, node interface{}) *Server {
+    sh, err := sharder.NewReedSolomon(sharder.DefaultDataShards, sharder.DefaultParityShards)
+    if err != nil {
+        log.Fatalf("Failed to create sharder: %v", err)
+    }
+
     // Chunk cache size in bytes (default 128MB)
     var cacheBytes int64 = 128 << 20
     if v := os.Getenv("OPENHASHDB_CHUNK_CACHE_BYTES"); v != "" {
@@ -43,22 +44,18 @@ func NewServer(bs *blockstore.Blockstore, replicator *replicator.Replicator, nod
 
     s := &Server{
         storage:    bs,
-        replicator: replicator,
+        replicator: repl,
         chunker:    chunker.NewChunker(),
-        sharder:    sharder,
+        sharder:    sh,
         node:       node,
         router:     mux.NewRouter(),
         chunkCache: NewChunkCacheBytes(cacheBytes),
-        bufferPool: sync.Pool{
-            New: func() interface{} {
-                return make([]byte, bufferSize)
-            },
-        },
+        bufferPool: sync.Pool{New: func() interface{} { return make([]byte, bufferSize) }},
     }
 
-	if libp2pNode, ok := node.(*libp2p.Node); ok {
-		s.streamer = streammanager.NewStreamManager(libp2pNode)
-	}
+    if libp2pNode, ok := node.(*libp2p.Node); ok {
+        s.streamer = streammanager.NewStreamManager(libp2pNode)
+    }
 
     s.setupRoutes()
     return s
@@ -90,23 +87,24 @@ func parseBytesEnv(s string) (int64, error) {
 
 // Start starts the server with optimized timeouts
 func (s *Server) Start(addr string) error {
-	s.server = &http.Server{
-		Addr:           addr,
-		Handler:        s.router,
-		ReadTimeout:    5 * time.Minute,  // Increased for large file operations
-		WriteTimeout:   10 * time.Minute, // Increased for large downloads
-		IdleTimeout:    2 * time.Minute,  // Connection keepalive
-		MaxHeaderBytes: 1 << 20,          // 1MB max headers
-	}
+    s.server = &http.Server{
+        Addr:           addr,
+        Handler:        s.router,
+        ReadTimeout:    5 * time.Minute,  // Increased for large file operations
+        WriteTimeout:   10 * time.Minute, // Increased for large downloads
+        IdleTimeout:    2 * time.Minute,  // Connection keepalive
+        MaxHeaderBytes: 1 << 20,          // 1MB max headers
+    }
 
-	log.Printf("Starting REST API server on %s", addr)
-	return s.server.ListenAndServe()
+    log.Printf("Starting API gateway on %s", addr)
+    return s.server.ListenAndServe()
 }
 
 // Stop stops the server
 func (s *Server) Stop(ctx context.Context) error {
-	if s.server != nil {
-		return s.server.Shutdown(ctx)
-	}
-	return nil
+    if s.server != nil {
+        return s.server.Shutdown(ctx)
+    }
+    return nil
 }
+

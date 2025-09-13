@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"encoding/hex"
-	"openhashdb/api/rest"
+	"openhashdb/api/gateway"
 	"openhashdb/core/block"
 	"openhashdb/core/blockstore"
 	"openhashdb/core/chunker"
@@ -42,12 +42,13 @@ var (
 	verbose   bool
 	bootnodes string
 	apiURL    string
+    enableAutoReplicate bool
 
 	// Global instances
 	bs        *blockstore.Blockstore
 	node      *libp2p.Node
 	repl      *replicator.Replicator
-	apiServer *rest.Server
+	apiServer *gateway.Server
 )
 
 // rootCmd represents the base command when called without any subcommands
@@ -222,7 +223,7 @@ var daemonCmd = &cobra.Command{
 	Use:   "daemon",
 	Short: "Start OpenHashDB daemon with REST API",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		enableRest, _ := cmd.Flags().GetBool("enable-rest")
+	enableRest, _ := cmd.Flags().GetBool("enable-rest")
 
 		// Initialize all components
 		if err := initAll(); err != nil {
@@ -238,8 +239,8 @@ var daemonCmd = &cobra.Command{
 		}
 
 		if enableRest {
-			// Initialize API server
-			apiServer = rest.NewServer(bs, repl, node)
+			// Initialize API gateway server
+			apiServer = gateway.NewServer(bs, repl, node)
 			addr := fmt.Sprintf("0.0.0.0:%d", apiPort)
 			fmt.Printf("REST API available at: http://%s\n", addr)
 
@@ -268,6 +269,7 @@ func init() {
 	// Command-specific flags
 
 	daemonCmd.Flags().Bool("enable-rest", true, "Enable REST API")
+	daemonCmd.Flags().BoolVar(&enableAutoReplicate, "enable-auto-replicate", false, "Auto-replicate all announced content from the network (default: off)")
 
 	// Add commands
 	rootCmd.AddCommand(addCmd)
@@ -330,8 +332,8 @@ func initAll() error {
 	bitswapEngine := bitswap.NewEngine(ctx, node.Host(), bs)
 	node.SetBitswap(bitswapEngine)
 
-	// Initialize replicator
-	repl = replicator.NewReplicator(bs, node, bitswapEngine, replicator.DefaultReplicationFactor)
+	// Initialize replicator (auto-replication off by default; enabled with --enable-auto-replicate)
+	repl = replicator.NewReplicator(bs, node, bitswapEngine, replicator.DefaultReplicationFactor, enableAutoReplicate)
 
 	return nil
 }
@@ -362,62 +364,62 @@ func addFile(path string) error {
 	}
 	defer file.Close()
 
-    c := chunker.NewChunker()
-    var chunkInfos []chunker.ChunkInfo
-    var leafHashes [][]byte
-    var totalSize int64
-    if err := c.Stream(file, func(ch chunker.Chunk) error {
-        if has, _ := bs.Has(ch.Hash); !has {
-            if err := bs.Put(block.NewBlock(ch.Data)); err != nil {
-                return fmt.Errorf("failed to store chunk %s: %w", tmt.HashToHex(ch.Hash), err)
-            }
-        }
-        chunkInfos = append(chunkInfos, chunker.ChunkInfo{Hash: ch.Hash, Size: ch.Size})
-        leafHashes = append(leafHashes, ch.Hash[:])
-        totalSize += int64(ch.Size)
-        return nil
-    }); err != nil {
-        return fmt.Errorf("failed to chunk file: %w", err)
-    }
+	c := chunker.NewChunker()
+	var chunkInfos []chunker.ChunkInfo
+	var leafHashes [][]byte
+	var totalSize int64
+	if err := c.Stream(file, func(ch chunker.Chunk) error {
+		if has, _ := bs.Has(ch.Hash); !has {
+			if err := bs.Put(block.NewBlock(ch.Data)); err != nil {
+				return fmt.Errorf("failed to store chunk %s: %w", tmt.HashToHex(ch.Hash), err)
+			}
+		}
+		chunkInfos = append(chunkInfos, chunker.ChunkInfo{Hash: ch.Hash, Size: ch.Size})
+		leafHashes = append(leafHashes, ch.Hash[:])
+		totalSize += int64(ch.Size)
+		return nil
+	}); err != nil {
+		return fmt.Errorf("failed to chunk file: %w", err)
+	}
 
-    fileTree := &tree.File{}
-    if len(leafHashes) == 0 {
-        root := tmt.ComputeHash(nil)
-        fileTree.Root = root
-        fileTree.Chunks = []chunker.ChunkInfo{}
-        fileTree.TotalSize = 0
-    } else {
-        t := tmt.NewDefault()
-        if err := t.Build(leafHashes); err != nil {
-            return fmt.Errorf("tmt build error: %w", err)
-        }
-        root, _ := t.RootHash()
-        fileTree.Root = root
-        fileTree.Chunks = chunkInfos
-        fileTree.TotalSize = totalSize
-    }
+	fileTree := &tree.File{}
+	if len(leafHashes) == 0 {
+		root := tmt.ComputeHash(nil)
+		fileTree.Root = root
+		fileTree.Chunks = []chunker.ChunkInfo{}
+		fileTree.TotalSize = 0
+	} else {
+		t := tmt.NewDefault()
+		if err := t.Build(leafHashes); err != nil {
+			return fmt.Errorf("tmt build error: %w", err)
+		}
+		root, _ := t.RootHash()
+		fileTree.Root = root
+		fileTree.Chunks = chunkInfos
+		fileTree.TotalSize = totalSize
+	}
 
 	info, err := os.Stat(path)
 	if err != nil {
 		return fmt.Errorf("failed to stat file: %w", err)
 	}
 
-    pbChunks := make([]*pb.ChunkInfo, len(fileTree.Chunks))
-    for i, chunk := range fileTree.Chunks {
-        pbChunks[i] = &pb.ChunkInfo{Hash: chunk.Hash[:], Size: int64(chunk.Size)}
-    }
+	pbChunks := make([]*pb.ChunkInfo, len(fileTree.Chunks))
+	for i, chunk := range fileTree.Chunks {
+		pbChunks[i] = &pb.ChunkInfo{Hash: chunk.Hash[:], Size: int64(chunk.Size)}
+	}
 
-    metadata := &pb.ContentMetadata{
-        Hash:        fileTree.Root[:],
-        Filename:    filepath.Base(path),
-        MimeType:    utils.GetMimeType(path),
-        Size:        fileTree.TotalSize,
-        ModTime:     timestamppb.New(info.ModTime()),
-        IsDirectory: false,
-        CreatedAt:   timestamppb.Now(),
-        RefCount:    1,
-        Chunks:      pbChunks,
-    }
+	metadata := &pb.ContentMetadata{
+		Hash:        fileTree.Root[:],
+		Filename:    filepath.Base(path),
+		MimeType:    utils.GetMimeType(path),
+		Size:        fileTree.TotalSize,
+		ModTime:     timestamppb.New(info.ModTime()),
+		IsDirectory: false,
+		CreatedAt:   timestamppb.Now(),
+		RefCount:    1,
+		Chunks:      pbChunks,
+	}
 
 	if err := bs.StoreContent(metadata); err != nil {
 		return fmt.Errorf("failed to store metadata: %w", err)

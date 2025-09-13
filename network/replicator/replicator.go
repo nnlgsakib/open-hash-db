@@ -54,30 +54,32 @@ const (
 
 // Replicator handles content replication and availability
 type Replicator struct {
-	blockstore        *blockstore.Blockstore
-	node              *libp2p.Node
-	bitswap           *bitswap.Engine
-	replicationFactor ReplicationFactor
-	pinnedContent     map[string]struct{}
-	replicatingNow    map[string]struct{}
-	mu                sync.RWMutex
-	ctx               context.Context
-	cancel            context.CancelFunc
+    blockstore        *blockstore.Blockstore
+    node              *libp2p.Node
+    bitswap           *bitswap.Engine
+    replicationFactor ReplicationFactor
+    autoReplicate     bool
+    pinnedContent     map[string]struct{}
+    replicatingNow    map[string]struct{}
+    mu                sync.RWMutex
+    ctx               context.Context
+    cancel            context.CancelFunc
 }
 
 // NewReplicator creates a new replicator
-func NewReplicator(bs *blockstore.Blockstore, node *libp2p.Node, bitswap *bitswap.Engine, replicationFactor ReplicationFactor) *Replicator {
-	ctx, cancel := context.WithCancel(context.Background())
-	r := &Replicator{
-		blockstore:        bs,
-		node:              node,
-		bitswap:           bitswap,
-		replicationFactor: replicationFactor,
-		pinnedContent:     make(map[string]struct{}),
-		replicatingNow:    make(map[string]struct{}),
-		ctx:               ctx,
-		cancel:            cancel,
-	}
+func NewReplicator(bs *blockstore.Blockstore, node *libp2p.Node, bitswap *bitswap.Engine, replicationFactor ReplicationFactor, autoReplicate bool) *Replicator {
+    ctx, cancel := context.WithCancel(context.Background())
+    r := &Replicator{
+        blockstore:        bs,
+        node:              node,
+        bitswap:           bitswap,
+        replicationFactor: replicationFactor,
+        autoReplicate:     autoReplicate,
+        pinnedContent:     make(map[string]struct{}),
+        replicatingNow:    make(map[string]struct{}),
+        ctx:               ctx,
+        cancel:            cancel,
+    }
 
     node.GossipHandler = r.handleGossipMessage
     go r.announceContentPeriodically()
@@ -187,13 +189,18 @@ func (r *Replicator) handleGossipMessage(peerID peer.ID, data []byte) error {
 
 // handleContentAnnouncement handles content announcements by replicating content.
 func (r *Replicator) handleContentAnnouncement(peerID peer.ID, announcement *pb.ContentAnnouncement) error {
-	h, err := hasher.HashFromBytes(announcement.Hash)
-	if err != nil {
-		return err
-	}
-	if r.blockstore.HasContent(h) {
-		return nil
-	}
+    h, err := hasher.HashFromBytes(announcement.Hash)
+    if err != nil {
+        return err
+    }
+    if r.blockstore.HasContent(h) {
+        return nil
+    }
+
+    // If auto-replication is disabled, ignore background replication and return.
+    if !r.autoReplicate {
+        return nil
+    }
 
 	r.mu.Lock()
 	if _, ongoing := r.replicatingNow[h.String()]; ongoing {
@@ -213,19 +220,12 @@ func (r *Replicator) handleContentAnnouncement(peerID peer.ID, announcement *pb.
 		return nil
 	}
 
-	providers, err := r.node.FindContentProviders(h.String())
-	if err != nil {
-		return nil
-	}
+    // When auto-replication is enabled, replicate regardless of provider count.
+    // We still avoid very large files as per LargeFileSizeThreshold.
+    log.Printf("[Replicator] Auto-replicating announced content %s...", h.String())
+    go r.FetchAndStore(h)
 
-	if len(providers) >= int(r.replicationFactor) {
-		return nil
-	}
-
-	log.Printf("[Replicator] Replication factor not met for %s, starting replication...", h.String())
-	go r.FetchAndStore(h)
-
-	return nil
+    return nil
 }
 
 func (r *Replicator) FetchAndStore(hash hasher.Hash) error {

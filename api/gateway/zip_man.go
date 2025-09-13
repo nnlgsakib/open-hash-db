@@ -1,0 +1,87 @@
+package gateway
+
+import (
+    "archive/zip"
+    "context"
+    "fmt"
+    "io"
+    "log"
+    "net/http"
+    "path/filepath"
+
+    "openhashdb/core/hasher"
+    "openhashdb/protobuf/pb"
+)
+
+// streamDirectoryAsZip creates zip files with optimized streaming
+func (s *Server) streamDirectoryAsZip(w http.ResponseWriter, r *http.Request, metadata *pb.ContentMetadata) {
+    w.Header().Set("Content-Type", "application/zip")
+    w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s.zip\"", metadata.Filename))
+    // Use Transfer-Encoding: chunked for streaming
+    w.Header().Set("Transfer-Encoding", "chunked")
+    // Create a pipe for streaming zip data
+    pr, pw := io.Pipe()
+    defer pr.Close()
+    // Start zip creation in a goroutine
+    go func() {
+        defer pw.Close()
+        zipWriter := zip.NewWriter(pw)
+        defer zipWriter.Close()
+        if err := s.addFilesToZipOptimized(r.Context(), zipWriter, metadata.Links, ""); err != nil {
+            log.Printf("Error creating zip archive for %s: %v", string(metadata.Hash), err)
+        }
+    }()
+    // Stream the zip data
+    buffer := s.bufferPool.Get().([]byte)
+    defer s.bufferPool.Put(buffer)
+    for {
+        n, err := pr.Read(buffer)
+        if n > 0 {
+            if _, writeErr := w.Write(buffer[:n]); writeErr != nil {
+                if !isClientClosedError(writeErr) { log.Printf("Error writing zip data: %v", writeErr) }
+                return
+            }
+            if flusher, ok := w.(http.Flusher); ok { flusher.Flush() }
+        }
+        if err == io.EOF { break }
+        if err != nil {
+            if !isClientClosedError(err) { log.Printf("Error reading zip data: %v", err) }
+            return
+        }
+    }
+}
+
+// addFilesToZipOptimized adds files to zip with concurrent processing
+func (s *Server) addFilesToZipOptimized(ctx context.Context, zipWriter *zip.Writer, links []*pb.Link, basePath string) error {
+    sem := make(chan struct{}, maxConcurrentOps)
+    for _, link := range links {
+        select { case <-ctx.Done(): return ctx.Err(); case sem <- struct{}{}: }
+        pathInZip := filepath.Join(basePath, link.Name)
+        if link.Type == "directory" {
+            _, err := zipWriter.Create(pathInZip + "/")
+            if err != nil { <-sem; return fmt.Errorf("failed to create directory in zip: %w", err) }
+            linkHash, err := hasher.HashFromBytes(link.Hash)
+            if err != nil { <-sem; return fmt.Errorf("invalid link hash: %w", err) }
+            dirMetadata, err := s.storage.GetContent(linkHash)
+            if err != nil { <-sem; return fmt.Errorf("could not get metadata for subdirectory %s (%s): %w", link.Name, string(link.Hash), err) }
+            <-sem
+            if err := s.addFilesToZipOptimized(ctx, zipWriter, dirMetadata.Links, pathInZip); err != nil { return err }
+        } else {
+            fileWriter, err := zipWriter.Create(pathInZip)
+            if err != nil { <-sem; return fmt.Errorf("failed to create file in zip: %w", err) }
+            linkHash, err := hasher.HashFromBytes(link.Hash)
+            if err != nil { <-sem; return fmt.Errorf("invalid link hash: %w", err) }
+            fileMetadata, err := s.storage.GetContent(linkHash)
+            if err != nil { <-sem; return fmt.Errorf("could not get metadata for file %s (%s): %w", link.Name, string(link.Hash), err) }
+            if err := s.prefetchChunks(ctx, fileMetadata.Chunks); err != nil { <-sem; return fmt.Errorf("failed to prefetch chunks for file %s: %w", pathInZip, err) }
+            for _, chunkInfo := range fileMetadata.Chunks {
+                chunkHash, err := hasher.HashFromBytes(chunkInfo.Hash)
+                if err != nil { <-sem; return fmt.Errorf("invalid chunk hash: %w", err) }
+                if err := s.fetchAndStreamChunkOptimized(ctx, fileWriter, chunkHash, 0, int(chunkInfo.Size)); err != nil { <-sem; return fmt.Errorf("failed to stream chunk to zip for file %s: %w", pathInZip, err) }
+            }
+            <-sem
+        }
+    }
+    return nil
+}
+
