@@ -1,12 +1,12 @@
 package rest
 
 import (
-	"io"
-	"log"
-	"net/http"
-	"os"
-	"path/filepath"
-	"strings"
+    "io"
+    "log"
+    "net/http"
+    "os"
+    "path/filepath"
+    "strings"
 
 	"openhashdb/core/tmt"
 	"openhashdb/protobuf/pb"
@@ -62,25 +62,37 @@ func (s *Server) uploadFolder(w http.ResponseWriter, r *http.Request) {
 	var firstPartName string
 	var hasFiles bool
 
-	for {
-		part, err := reader.NextPart()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			s.writeError(w, http.StatusInternalServerError, "Failed to read multipart part", err)
-			return
-		}
+    for {
+        part, err := reader.NextPart()
+        if err == io.EOF {
+            break
+        }
+        if err != nil {
+            s.writeError(w, http.StatusInternalServerError, "Failed to read multipart part", err)
+            return
+        }
 
-		if part.FileName() == "" {
-			continue
-		}
-		hasFiles = true
-		if firstPartName == "" {
-			firstPartName = part.FileName()
-		}
+        if part.FileName() == "" {
+            continue
+        }
+        hasFiles = true
+        if firstPartName == "" {
+            firstPartName = part.FileName()
+        }
 
-		filePath := filepath.Join(tempDir, filepath.FromSlash(part.FileName()))
+        // Sanitize and ensure path stays within tempDir
+        cleaned := filepath.Clean(filepath.FromSlash(part.FileName()))
+        // Disallow absolute and parent traversal
+        if strings.HasPrefix(cleaned, string(filepath.Separator)) || strings.Contains(cleaned, "..") {
+            s.writeError(w, http.StatusBadRequest, "Invalid path in upload", nil)
+            return
+        }
+        filePath := filepath.Join(tempDir, cleaned)
+        // Ensure the resulting path is still under tempDir
+        if !strings.HasPrefix(filePath, tempDir+string(filepath.Separator)) && filePath != filepath.Join(tempDir, cleaned) {
+            s.writeError(w, http.StatusBadRequest, "Invalid path in upload", nil)
+            return
+        }
 
 		if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
 			s.writeError(w, http.StatusInternalServerError, "Failed to create directory structure", err)
@@ -93,12 +105,12 @@ func (s *Server) uploadFolder(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		_, err = io.Copy(dst, part)
-		dst.Close()
-		if err != nil {
-			s.writeError(w, http.StatusInternalServerError, "Failed to save file part", err)
-			return
-		}
+        _, err = io.Copy(dst, part)
+        dst.Close()
+        if err != nil {
+            s.writeError(w, http.StatusInternalServerError, "Failed to save file part", err)
+            return
+        }
 	}
 
 	if !hasFiles {

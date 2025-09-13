@@ -1,65 +1,71 @@
 package rest
 
-import "sync"
+import (
+    "container/list"
+    "sync"
+)
 
-// ChunkCache represents an LRU cache for chunks
+// ChunkCache is an LRU cache bounded by total bytes.
 type ChunkCache struct {
-	mu      sync.RWMutex
-	cache   map[string][]byte
-	order   []string
-	maxSize int
+    mu         sync.Mutex
+    maxBytes   int64
+    curBytes   int64
+    ll         *list.List
+    cache      map[string]*list.Element
 }
 
-// NewChunkCache creates a new chunk cache
-func NewChunkCache(size int) *ChunkCache {
-	return &ChunkCache{
-		cache:   make(map[string][]byte),
-		order:   make([]string, 0, size),
-		maxSize: size,
-	}
+type entry struct {
+    key  string
+    data []byte
 }
 
-// Get retrieves a chunk from cache
+func NewChunkCacheBytes(maxBytes int64) *ChunkCache {
+    if maxBytes <= 0 {
+        maxBytes = 64 << 20 // default 64MB
+    }
+    return &ChunkCache{maxBytes: maxBytes, ll: list.New(), cache: make(map[string]*list.Element)}
+}
+
 func (cc *ChunkCache) Get(key string) ([]byte, bool) {
-	cc.mu.RLock()
-	data, exists := cc.cache[key]
-	cc.mu.RUnlock()
-	if exists {
-		// Move to front (most recently used)
-		cc.mu.Lock()
-		cc.moveToFront(key)
-		cc.mu.Unlock()
-	}
-	return data, exists
+    cc.mu.Lock()
+    defer cc.mu.Unlock()
+    if ele, ok := cc.cache[key]; ok {
+        cc.ll.MoveToFront(ele)
+        return ele.Value.(*entry).data, true
+    }
+    return nil, false
 }
 
-// Put adds a chunk to cache
 func (cc *ChunkCache) Put(key string, data []byte) {
-	cc.mu.Lock()
-	defer cc.mu.Unlock()
-
-	if _, exists := cc.cache[key]; exists {
-		cc.moveToFront(key)
-		return
-	}
-
-	if len(cc.cache) >= cc.maxSize {
-		// Evict least recently used
-		oldest := cc.order[len(cc.order)-1]
-		delete(cc.cache, oldest)
-		cc.order = cc.order[:len(cc.order)-1]
-	}
-
-	cc.cache[key] = data
-	cc.order = append([]string{key}, cc.order...)
+    if data == nil {
+        return
+    }
+    cc.mu.Lock()
+    defer cc.mu.Unlock()
+    if ele, ok := cc.cache[key]; ok {
+        // update in place
+        e := ele.Value.(*entry)
+        cc.curBytes -= int64(len(e.data))
+        e.data = data
+        cc.curBytes += int64(len(data))
+        cc.ll.MoveToFront(ele)
+    } else {
+        ele := cc.ll.PushFront(&entry{key: key, data: data})
+        cc.cache[key] = ele
+        cc.curBytes += int64(len(data))
+    }
+    cc.evict()
 }
 
-// moveToFront moves key to front of order slice
-func (cc *ChunkCache) moveToFront(key string) {
-	for i, k := range cc.order {
-		if k == key {
-			cc.order = append([]string{key}, append(cc.order[:i], cc.order[i+1:]...)...)
-			break
-		}
-	}
+func (cc *ChunkCache) evict() {
+    for cc.curBytes > cc.maxBytes {
+        ele := cc.ll.Back()
+        if ele == nil {
+            return
+        }
+        e := ele.Value.(*entry)
+        delete(cc.cache, e.key)
+        cc.curBytes -= int64(len(e.data))
+        cc.ll.Remove(ele)
+    }
 }

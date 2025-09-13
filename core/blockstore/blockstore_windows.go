@@ -4,9 +4,9 @@
 package blockstore
 
 import (
-	"fmt"
+    "fmt"
 
-	"golang.org/x/sys/windows"
+    "golang.org/x/sys/windows"
 )
 
 // GetAvailableSpace returns the available disk space in bytes for Windows
@@ -28,3 +28,6 @@ func (bs *Blockstore) GetAvailableSpace() (int64, error) {
 	blockstoreOperationsTotal.WithLabelValues("get_space", "success").Inc()
 	return int64(freeBytes), nil
 }
+
+// syncDir is a no-op on Windows; the rename is sufficient for durability semantics.
+func (bs *Blockstore) syncDir(dir string) error { return nil }

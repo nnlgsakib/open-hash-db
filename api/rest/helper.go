@@ -13,6 +13,7 @@ import (
 
 	"openhashdb/api/pages"
 	"openhashdb/core/block"
+	"openhashdb/core/chunker"
 	"openhashdb/core/hasher"
 	"openhashdb/core/tmt"
 	"openhashdb/core/tree"
@@ -206,30 +207,66 @@ func (s *Server) storeUploadedFile(filename string, reader io.Reader, useEC bool
 		return treeFile.Root, treeFile.TotalSize, nil
 
 	} else {
-		// Chunking Path (existing logic)
-		treeFile, chunks, err := tree.BuildFileTree(reader, s.chunker)
-		if err != nil {
-			return hasher.Hash{}, 0, fmt.Errorf("failed to build merkle tree: %w", err)
-		}
+		// Streaming chunking path to avoid high memory usage
+		var chunkInfos []chunker.ChunkInfo
+		var leafHashes [][]byte
+		var totalSize int64
 
-		for _, chunk := range chunks {
-			if has, _ := s.storage.Has(chunk.Hash); !has {
-				if err := s.storage.Put(block.NewBlock(chunk.Data)); err != nil {
-					return hasher.Hash{}, 0, fmt.Errorf("failed to store chunk %s: %w", tmt.HashToHex(chunk.Hash), err)
+		err := s.chunker.Stream(reader, func(ch chunker.Chunk) error {
+			// Store block immediately if not present
+			if has, _ := s.storage.Has(ch.Hash); !has {
+				if err := s.storage.Put(block.NewBlock(ch.Data)); err != nil {
+					return fmt.Errorf("failed to store chunk %s: %w", tmt.HashToHex(ch.Hash), err)
 				}
 			}
+			chunkInfos = append(chunkInfos, chunker.ChunkInfo{Hash: ch.Hash, Size: ch.Size})
+			leafHashes = append(leafHashes, ch.Hash[:])
+			totalSize += int64(ch.Size)
+			return nil
+		})
+		if err != nil {
+			return hasher.Hash{}, 0, fmt.Errorf("failed to chunk and store: %w", err)
 		}
 
-		pbChunks := make([]*pb.ChunkInfo, len(treeFile.Chunks))
-		for i, c := range treeFile.Chunks {
+		// Handle empty file
+		if len(leafHashes) == 0 {
+			root := tmt.ComputeHash(nil)
+			metadata := &pb.ContentMetadata{
+				Hash:        root[:],
+				Filename:    filename,
+				MimeType:    utils.GetMimeType(filename),
+				Size:        0,
+				ModTime:     timestamppb.Now(),
+				IsDirectory: false,
+				CreatedAt:   timestamppb.Now(),
+				RefCount:    1,
+				Chunks:      []*pb.ChunkInfo{},
+			}
+			metaBytes, _ := proto.Marshal(metadata)
+			_ = s.storage.Put(block.NewBlockWithHash(root, metaBytes))
+			if err := s.storage.StoreContent(metadata); err != nil {
+				return hasher.Hash{}, 0, err
+			}
+			return root, 0, nil
+		}
+
+		// Build TMT from leaf hashes
+		tree := tmt.NewDefault()
+		if err := tree.Build(leafHashes); err != nil {
+			return hasher.Hash{}, 0, fmt.Errorf("tmt build error: %w", err)
+		}
+		root, _ := tree.RootHash()
+
+		pbChunks := make([]*pb.ChunkInfo, len(chunkInfos))
+		for i, c := range chunkInfos {
 			pbChunks[i] = &pb.ChunkInfo{Hash: c.Hash[:], Size: int64(c.Size)}
 		}
 
 		metadata := &pb.ContentMetadata{
-			Hash:        treeFile.Root[:],
+			Hash:        root[:],
 			Filename:    filename,
 			MimeType:    utils.GetMimeType(filename),
-			Size:        treeFile.TotalSize,
+			Size:        totalSize,
 			ModTime:     timestamppb.Now(),
 			IsDirectory: false,
 			CreatedAt:   timestamppb.Now(),
@@ -242,16 +279,15 @@ func (s *Server) storeUploadedFile(filename string, reader io.Reader, useEC bool
 		if err != nil {
 			return hasher.Hash{}, 0, fmt.Errorf("failed to marshal metadata: %w", err)
 		}
-		if err := s.storage.Put(block.NewBlockWithHash(treeFile.Root, metaBytes)); err != nil {
+		if err := s.storage.Put(block.NewBlockWithHash(root, metaBytes)); err != nil {
 			return hasher.Hash{}, 0, fmt.Errorf("failed to store metadata block: %w", err)
 		}
-
 		if err := s.storage.StoreContent(metadata); err != nil {
 			return hasher.Hash{}, 0, fmt.Errorf("failed to store metadata: %w", err)
 		}
 
-		log.Printf("Successfully stored file %s with TMT root %s", filename, tmt.HashToHex(treeFile.Root))
-		return treeFile.Root, treeFile.TotalSize, nil
+		log.Printf("Successfully stored file %s with TMT root %s", filename, tmt.HashToHex(root))
+		return root, totalSize, nil
 	}
 }
 

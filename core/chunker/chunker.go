@@ -41,7 +41,7 @@ type Chunker struct{}
 
 // NewChunker creates a new chunker
 func NewChunker() *Chunker {
-	return &Chunker{}
+    return &Chunker{}
 }
 
 // ChunkBytes splits byte slice into chunks using FastCDC.
@@ -91,6 +91,40 @@ func (c *Chunker) ChunkReader(r io.Reader) ([]Chunk, error) {
 	}
 
 	return chunks, nil
+}
+
+// Stream reads chunks from r and calls fn for each chunk without retaining them all in memory.
+// The callback receives the chunk, and any returned error stops the stream.
+func (c *Chunker) Stream(r io.Reader, fn func(Chunk) error) error {
+    opts := fastcdc.Options{
+        MinSize:     MinChunkSize,
+        AverageSize: AvgChunkSize,
+        MaxSize:     MaxChunkSize,
+    }
+    chunker, err := fastcdc.NewChunker(r, opts)
+    if err != nil {
+        return fmt.Errorf("failed to create fastcdc chunker: %w", err)
+    }
+    for {
+        cdcChunk, err := chunker.Next()
+        if err == io.EOF {
+            return nil
+        }
+        if err != nil {
+            return fmt.Errorf("failed to read next chunk: %w", err)
+        }
+        // Copy data out of internal buffer
+        chunkData := make([]byte, cdcChunk.Length)
+        copy(chunkData, cdcChunk.Data)
+        ch := Chunk{
+            Hash: hasher.HashBytes(chunkData),
+            Data: chunkData,
+            Size: cdcChunk.Length,
+        }
+        if err := fn(ch); err != nil {
+            return err
+        }
+    }
 }
 
 // CreateChunkedFile creates a ChunkedFile from chunks

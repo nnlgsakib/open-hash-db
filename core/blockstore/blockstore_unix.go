@@ -4,9 +4,9 @@
 package blockstore
 
 import (
-	"fmt"
+    "fmt"
 
-	"syscall"
+    "syscall"
 )
 
 // GetAvailableSpace returns the available disk space in bytes for Unix-like systems
@@ -22,4 +22,14 @@ func (bs *Blockstore) GetAvailableSpace() (int64, error) {
 	blockstoreSpaceAvailable.Set(float64(available))
 	blockstoreOperationsTotal.WithLabelValues("get_space", "success").Inc()
 	return available, nil
+}
+
+// syncDir performs an fsync on the directory to ensure metadata durability.
+func (bs *Blockstore) syncDir(dir string) error {
+    fd, err := syscall.Open(dir, syscall.O_RDONLY, 0)
+    if err != nil {
+        return err
+    }
+    defer syscall.Close(fd)
+    return syscall.Fsync(fd)
 }

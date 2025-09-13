@@ -543,9 +543,9 @@ func (n *Node) connectToBootnodes(bootnodes []string) error {
 		return nil
 	}
 
-    log.Printf("[libp2p] Connecting to %d bootnode(s)...", len(nodesToConnect))
+    log.Printf("[libp2p] Queuing dials to %d bootnode(s)...", len(nodesToConnect))
     var wg sync.WaitGroup
-    connectedCount := 0
+    queuedCount := 0
     var lastErr error
     mu := sync.Mutex{}
 
@@ -565,17 +565,16 @@ func (n *Node) connectToBootnodes(bootnodes []string) error {
                 return
             }
             n.enqueueDial(*info, dial.PriorityRequestedDial)
-            // mark as pending success; actual connect count will update upon connect
-            mu.Lock(); connectedCount++ ; mu.Unlock()
+            mu.Lock(); queuedCount++ ; mu.Unlock()
         }(bootnode)
     }
-	wg.Wait()
+    wg.Wait()
 
-	log.Printf("[libp2p] Connected to %d out of %d bootnodes", connectedCount, len(nodesToConnect))
-	if connectedCount == 0 && len(nodesToConnect) > 0 {
-		return fmt.Errorf("[libp2p] failed to connect to any bootnodes: %w", lastErr)
-	}
-	return nil
+    log.Printf("[libp2p] Queued %d/%d bootnode dials", queuedCount, len(nodesToConnect))
+    if queuedCount == 0 && len(nodesToConnect) > 0 {
+        return fmt.Errorf("[libp2p] failed to connect to any bootnodes: %w", lastErr)
+    }
+    return nil
 }
 
 // Helper functions that were removed

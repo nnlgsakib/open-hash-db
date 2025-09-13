@@ -362,44 +362,62 @@ func addFile(path string) error {
 	}
 	defer file.Close()
 
-	c := chunker.NewChunker()
-	fileTree, chunks, err := tree.BuildFileTree(file, c)
-	if err != nil {
-		return fmt.Errorf("failed to build file tree: %w", err)
-	}
+    c := chunker.NewChunker()
+    var chunkInfos []chunker.ChunkInfo
+    var leafHashes [][]byte
+    var totalSize int64
+    if err := c.Stream(file, func(ch chunker.Chunk) error {
+        if has, _ := bs.Has(ch.Hash); !has {
+            if err := bs.Put(block.NewBlock(ch.Data)); err != nil {
+                return fmt.Errorf("failed to store chunk %s: %w", tmt.HashToHex(ch.Hash), err)
+            }
+        }
+        chunkInfos = append(chunkInfos, chunker.ChunkInfo{Hash: ch.Hash, Size: ch.Size})
+        leafHashes = append(leafHashes, ch.Hash[:])
+        totalSize += int64(ch.Size)
+        return nil
+    }); err != nil {
+        return fmt.Errorf("failed to chunk file: %w", err)
+    }
 
-	for _, chunk := range chunks {
-		if has, _ := bs.Has(chunk.Hash); !has {
-			if err := bs.Put(block.NewBlock(chunk.Data)); err != nil {
-				return fmt.Errorf("failed to store chunk %s: %w", tmt.HashToHex(chunk.Hash), err)
-			}
-		}
-	}
+    fileTree := &tree.File{}
+    if len(leafHashes) == 0 {
+        root := tmt.ComputeHash(nil)
+        fileTree.Root = root
+        fileTree.Chunks = []chunker.ChunkInfo{}
+        fileTree.TotalSize = 0
+    } else {
+        t := tmt.NewDefault()
+        if err := t.Build(leafHashes); err != nil {
+            return fmt.Errorf("tmt build error: %w", err)
+        }
+        root, _ := t.RootHash()
+        fileTree.Root = root
+        fileTree.Chunks = chunkInfos
+        fileTree.TotalSize = totalSize
+    }
 
 	info, err := os.Stat(path)
 	if err != nil {
 		return fmt.Errorf("failed to stat file: %w", err)
 	}
 
-	pbChunks := make([]*pb.ChunkInfo, len(chunks))
-	for i, chunk := range chunks {
-		pbChunks[i] = &pb.ChunkInfo{
-			Hash: chunk.Hash[:],
-			Size: int64(len(chunk.Data)),
-		}
-	}
+    pbChunks := make([]*pb.ChunkInfo, len(fileTree.Chunks))
+    for i, chunk := range fileTree.Chunks {
+        pbChunks[i] = &pb.ChunkInfo{Hash: chunk.Hash[:], Size: int64(chunk.Size)}
+    }
 
-	metadata := &pb.ContentMetadata{
-		Hash:        fileTree.Root[:],
-		Filename:    filepath.Base(path),
-		MimeType:    utils.GetMimeType(path),
-		Size:        fileTree.TotalSize,
-		ModTime:     timestamppb.New(info.ModTime()),
-		IsDirectory: false,
-		CreatedAt:   timestamppb.Now(),
-		RefCount:    1,
-		Chunks:      pbChunks,
-	}
+    metadata := &pb.ContentMetadata{
+        Hash:        fileTree.Root[:],
+        Filename:    filepath.Base(path),
+        MimeType:    utils.GetMimeType(path),
+        Size:        fileTree.TotalSize,
+        ModTime:     timestamppb.New(info.ModTime()),
+        IsDirectory: false,
+        CreatedAt:   timestamppb.Now(),
+        RefCount:    1,
+        Chunks:      pbChunks,
+    }
 
 	if err := bs.StoreContent(metadata); err != nil {
 		return fmt.Errorf("failed to store metadata: %w", err)

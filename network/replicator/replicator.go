@@ -79,11 +79,21 @@ func NewReplicator(bs *blockstore.Blockstore, node *libp2p.Node, bitswap *bitswa
 		cancel:            cancel,
 	}
 
-	node.GossipHandler = r.handleGossipMessage
-	go r.announceContentPeriodically()
-	go r.runGC()
+    node.GossipHandler = r.handleGossipMessage
+    go r.announceContentPeriodically()
+    go r.runGC()
 
-	return r
+    // Load persisted pins
+    if pins, err := bs.ListPins(); err == nil {
+        for _, h := range pins {
+            r.pinnedContent[h.String()] = struct{}{}
+        }
+        if len(pins) > 0 {
+            log.Printf("[Replicator] Loaded %d persisted pins", len(pins))
+        }
+    }
+
+    return r
 }
 
 // Close shuts down the replicator
@@ -119,9 +129,14 @@ func (r *Replicator) AnnounceContent(hash hasher.Hash, size int64) error {
 
 // PinContent pins content
 func (r *Replicator) PinContent(hash hasher.Hash) error {
-	r.mu.Lock()
-	r.pinnedContent[hash.String()] = struct{}{}
-	r.mu.Unlock()
+    r.mu.Lock()
+    r.pinnedContent[hash.String()] = struct{}{}
+    r.mu.Unlock()
+
+    // Persist pin
+    if err := r.blockstore.PutPin(hash); err != nil {
+        log.Printf("[Replicator] Failed to persist pin %s: %v", hash.String(), err)
+    }
 
 	if r.blockstore.HasContent(hash) {
 		return nil
@@ -133,10 +148,13 @@ func (r *Replicator) PinContent(hash hasher.Hash) error {
 
 // UnpinContent unpins content
 func (r *Replicator) UnpinContent(hash hasher.Hash) error {
-	r.mu.Lock()
-	delete(r.pinnedContent, hash.String())
-	r.mu.Unlock()
-	return nil
+    r.mu.Lock()
+    delete(r.pinnedContent, hash.String())
+    r.mu.Unlock()
+    if err := r.blockstore.DeletePin(hash); err != nil {
+        log.Printf("[Replicator] Failed to remove persisted pin %s: %v", hash.String(), err)
+    }
+    return nil
 }
 
 // IsPinned checks if content is pinned

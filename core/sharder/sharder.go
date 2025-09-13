@@ -17,11 +17,12 @@ const (
 
 // ErasureCoder defines the interface for erasure coding.
 type ErasureCoder interface {
-	Encode(data []byte) ([][]byte, error)
-	Reconstruct(shards [][]byte) ([]byte, error)
-	ShardCount() int
-	DataShardCount() int
-	ParityShardCount() int
+    Encode(data []byte) ([][]byte, error)
+    Reconstruct(shards [][]byte) ([]byte, error)
+    ReconstructToWriter(shards [][]byte, w io.Writer, size int) error
+    ShardCount() int
+    DataShardCount() int
+    ParityShardCount() int
 }
 
 // ReedSolomon implements ErasureCoder using Reed-Solomon codes.
@@ -83,6 +84,21 @@ func (rs *ReedSolomon) Reconstruct(shards [][]byte) ([]byte, error) {
 	}
 
 	return buf.Bytes(), nil
+}
+
+// ReconstructToWriter reconstructs the original data and writes directly to w,
+// avoiding a large in-memory buffer. Size is the original file size for trimming.
+func (rs *ReedSolomon) ReconstructToWriter(shards [][]byte, w io.Writer, size int) error {
+    ok, err := rs.enc.Verify(shards)
+    if !ok {
+        if err := rs.enc.Reconstruct(shards); err != nil {
+            return fmt.Errorf("failed to reconstruct data: %w", err)
+        }
+    } else if err != nil {
+        return fmt.Errorf("failed to verify shards: %w", err)
+    }
+    // Write exactly size bytes
+    return rs.enc.Join(w, shards, size)
 }
 
 func (rs *ReedSolomon) ShardCount() int {

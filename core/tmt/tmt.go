@@ -161,19 +161,33 @@ func (t *TernaryMeshTree) Build(dataBlocks [][]byte) error {
 	t.leafCount = len(dataBlocks)
 	t.rootID = nil
 
-	// leaves
-	current := make([]NodeID, 0, nextMultipleOf(len(dataBlocks), 3))
-	for i, d := range dataBlocks {
-		h := t.getCachedHashLocked(d)
-		t.nodes = append(t.nodes, internalNode{
-			hash:     h,
-			children: nil,
-			isLeaf:   true,
-			parent:   nil,
-		})
-		t.leafData = append(t.leafData, append([]byte(nil), d...))
-		current = append(current, NodeID(i))
-	}
+    // leaves
+    current := make([]NodeID, 0, nextMultipleOf(len(dataBlocks), 3))
+    for i, d := range dataBlocks {
+        // Optimization: if leaf length is 32 bytes, treat it as an already-computed hash
+        var h Hash
+        if len(d) == 32 {
+            copy(h[:], d)
+        } else {
+            h = t.getCachedHashLocked(d)
+        }
+        t.nodes = append(t.nodes, internalNode{
+            hash:     h,
+            children: nil,
+            isLeaf:   true,
+            parent:   nil,
+        })
+        // Avoid storing large leaf data when not needed
+        if len(d) == 0 {
+            t.leafData = append(t.leafData, nil)
+        } else if len(d) == 32 {
+            // do not retain a copy for hash-leaves; store nil to keep indices aligned
+            t.leafData = append(t.leafData, nil)
+        } else {
+            t.leafData = append(t.leafData, append([]byte(nil), d...))
+        }
+        current = append(current, NodeID(i))
+    }
 
 	// pad to divisible by 3
 	for len(current)%3 != 0 {

@@ -125,35 +125,35 @@ func (s *Server) streamErasureCodedContent(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// 4. Reconstruct the data
-	reconstructedData, err := s.sharder.Reconstruct(availableShards)
-	if err != nil {
-		s.writeError(w, http.StatusInternalServerError, "Failed to reconstruct file from shards", err)
-		return
-	}
-
-	// Trim padding to original file size
-	if int64(len(reconstructedData)) > metadata.Size {
-		reconstructedData = reconstructedData[:metadata.Size]
-	}
-
-	// 5. Handle range request and stream
-	rangeHeader := r.Header.Get("Range")
-	if rangeHeader != "" {
-		start, end, err := parseRangeHeader(rangeHeader, metadata.Size)
-		if err != nil {
-		s.writeError(w, http.StatusBadRequest, "Invalid range header", err)
-			return
-		}
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, metadata.Size))
-		w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
-		w.WriteHeader(http.StatusPartialContent)
-		_, _ = w.Write(reconstructedData[start : end+1])
-	} else {
-		w.Header().Set("Content-Length", strconv.FormatInt(metadata.Size, 10))
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(reconstructedData)
-	}
+    // 4/5. Handle range request and stream
+    rangeHeader := r.Header.Get("Range")
+    if rangeHeader != "" {
+        start, end, err := parseRangeHeader(rangeHeader, metadata.Size)
+        if err != nil {
+        s.writeError(w, http.StatusBadRequest, "Invalid range header", err)
+            return
+        }
+        // Reconstruct fully then slice range (TODO: stream ranged reconstruction)
+        reconstructedData, err := s.sharder.Reconstruct(availableShards)
+        if err != nil {
+            s.writeError(w, http.StatusInternalServerError, "Failed to reconstruct file from shards", err)
+            return
+        }
+        if int64(len(reconstructedData)) > metadata.Size {
+            reconstructedData = reconstructedData[:metadata.Size]
+        }
+        w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, metadata.Size))
+        w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+        w.WriteHeader(http.StatusPartialContent)
+        _, _ = w.Write(reconstructedData[start : end+1])
+    } else {
+        w.Header().Set("Content-Length", strconv.FormatInt(metadata.Size, 10))
+        w.WriteHeader(http.StatusOK)
+        // Stream reconstruction directly to client
+        if err := s.sharder.ReconstructToWriter(availableShards, w, int(metadata.Size)); err != nil {
+            log.Printf("Failed to stream erasure reconstruction: %v", err)
+        }
+    }
 }
 
 // getChunksForRange returns chunks needed for a specific byte range
